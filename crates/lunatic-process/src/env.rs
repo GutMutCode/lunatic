@@ -43,6 +43,12 @@ impl LunaticEnvironment {
             next_process_id: Arc::new(AtomicU64::new(1)),
         }
     }
+
+    pub fn kill_all_processes(&self) {
+        for entry in self.processes.iter() {
+            entry.value().send(Signal::Kill);
+        }
+    }
 }
 
 #[async_trait]

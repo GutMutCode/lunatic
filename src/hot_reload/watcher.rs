@@ -4,8 +4,10 @@ use notify::{
     event::{EventKind, ModifyKind},
     Config, Event, RecommendedWatcher, RecursiveMode, Watcher,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 pub struct FileWatcher {
@@ -24,15 +26,30 @@ impl FileWatcher {
         let watched_path = path.clone();
 
         let tx = Arc::new(tx);
+        let last_event_times: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let debounce_duration = Duration::from_millis(300);
+
         let watcher = RecommendedWatcher::new(
             move |res: Result<Event, notify::Error>| match res {
                 Ok(event) => {
                     if should_trigger_reload(&event) {
-                        info!("File changed: {:?}", event.paths);
-                        for path in event.paths {
-                            if path.extension().and_then(|s| s.to_str()) == Some("wasm") {
-                                let _ = tx.send(FileChangeEvent { path });
+                        let mut last_times = last_event_times.lock().unwrap();
+                        let now = Instant::now();
+                        
+                        for path in &event.paths {
+                            if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
+                                continue;
                             }
+                            
+                            if let Some(last_time) = last_times.get(path) {
+                                if now.duration_since(*last_time) < debounce_duration {
+                                    continue;
+                                }
+                            }
+                            
+                            last_times.insert(path.clone(), now);
+                            info!("File changed: {:?}", path);
+                            let _ = tx.send(FileChangeEvent { path: path.clone() });
                         }
                     }
                 }

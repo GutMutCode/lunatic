@@ -90,7 +90,15 @@ async fn run_with_watch(
     let wasm_args = args.wasm_args.clone();
     let dir = args.dir.clone();
 
-    let mut process_handle = None;
+    struct ProcessInfo {
+        handle: tokio::task::JoinHandle<Result<()>>,
+        env_id: u64,
+    }
+
+    let mut process_info: Option<ProcessInfo> = None;
+    let mut next_env_id = 1u64;
+    let mut last_reload_time = tokio::time::Instant::now();
+    let reload_debounce = tokio::time::Duration::from_millis(500);
 
     async fn start_process(
         envs: &Arc<LunaticEnvironments>,
@@ -98,8 +106,9 @@ async fn run_with_watch(
         path: &PathBuf,
         wasm_args: &[String],
         dir: &[PathBuf],
-    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-        let new_env = envs.create(1).await?;
+        env_id: u64,
+    ) -> Result<ProcessInfo> {
+        let new_env = envs.create(env_id).await?;
         let runtime_clone = runtime.clone();
         let path_clone = path.clone();
         let wasm_args_clone = wasm_args.to_vec();
@@ -118,25 +127,42 @@ async fn run_with_watch(
             })
             .await
         });
-        Ok(handle)
+        Ok(ProcessInfo { handle, env_id })
     }
 
-    process_handle = Some(start_process(&envs, &runtime, &path, &wasm_args, &dir).await?);
+    process_info = Some(start_process(&envs, &runtime, &path, &wasm_args, &dir, next_env_id).await?);
+    next_env_id += 1;
     info!("Initial process started");
 
     loop {
         tokio::select! {
             Some(event) = rx.recv() => {
+                let now = tokio::time::Instant::now();
+                if now.duration_since(last_reload_time) < reload_debounce {
+                    info!("Ignoring rapid file change (debounced)");
+                    continue;
+                }
+                last_reload_time = now;
+
                 info!("File change detected: {:?}", event.path);
+                println!("\n🔄 Hot reloading...");
                 info!("Restarting process...");
 
-                if let Some(handle) = process_handle.take() {
-                    handle.abort();
+                if let Some(info) = process_info.take() {
+                    if let Some(env) = envs.get(info.env_id).await {
+                        env.kill_all_processes();
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    }
+                    info.handle.abort();
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
+                
+                println!("✅ Reloaded successfully\n");
 
-                match start_process(&envs, &runtime, &path, &wasm_args, &dir).await {
-                    Ok(handle) => {
-                        process_handle = Some(handle);
+                match start_process(&envs, &runtime, &path, &wasm_args, &dir, next_env_id).await {
+                    Ok(info) => {
+                        next_env_id += 1;
+                        process_info = Some(info);
                         info!("Process restarted successfully");
                     }
                     Err(e) => {
@@ -145,12 +171,12 @@ async fn run_with_watch(
                 }
             }
             result = async {
-                if let Some(ref mut handle) = process_handle {
-                    handle.await
-                } else {
-                    std::future::pending().await
+                match &mut process_info {
+                    Some(info) => (&mut info.handle).await,
+                    None => std::future::pending().await
                 }
             } => {
+                process_info = None;
                 match result {
                     Ok(Ok(_)) => {
                         info!("Process finished successfully");
@@ -159,7 +185,6 @@ async fn run_with_watch(
                     Ok(Err(e)) => {
                         error!("Process error: {}", e);
                         info!("Waiting for file changes...");
-                        process_handle = None;
                     }
                     Err(e) => {
                         error!("Process panicked: {}", e);
