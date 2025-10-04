@@ -2,6 +2,7 @@ pub mod config;
 pub mod env;
 pub mod mailbox;
 pub mod message;
+pub mod module_registry;
 pub mod runtimes;
 pub mod state;
 pub mod wasm;
@@ -141,6 +142,8 @@ pub enum Signal {
     Monitor(Arc<dyn Process>),
     StopMonitoring { process_id: u64 },
     ProcessDied(u64),
+    // Hot reload signal: request to reload process with new module version
+    HotReload { module_id: u64, new_version: u32 },
 }
 
 impl Debug for Signal {
@@ -155,6 +158,9 @@ impl Debug for Signal {
             Self::Monitor(p) => write!(f, "Monitor {}", p.id()),
             Self::StopMonitoring { process_id } => write!(f, "UnMonitor {process_id}"),
             Self::ProcessDied(_) => write!(f, "ProcessDied"),
+            Self::HotReload { module_id, new_version } => {
+                write!(f, "HotReload {{ module_id: {}, new_version: {} }}", module_id, new_version)
+            }
         }
     }
 }
@@ -386,6 +392,10 @@ where
                     // Notify process that a monitored process died
                     Ok(Signal::ProcessDied(id)) => {
                         message_mailbox.push(Message::ProcessDied(id));
+                    }
+                    // Hot reload signal - currently just logged, full implementation in later phases
+                    Ok(Signal::HotReload { module_id, new_version }) => {
+                        log::info!("HotReload signal received for module {} version {}", module_id, new_version);
                     }
                     Err(_) => {
                         debug_assert!(has_sender);
