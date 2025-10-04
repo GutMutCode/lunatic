@@ -1,5 +1,6 @@
 pub mod config;
 pub mod env;
+pub mod hot_reload;
 pub mod mailbox;
 pub mod message;
 pub mod module_registry;
