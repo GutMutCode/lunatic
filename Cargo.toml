@@ -76,6 +76,7 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 walkdir = "2.3.3"
 zip = "0.6.6"
+notify = "6.1"
 
 [dev-dependencies]
 criterion = { version = "0.4", features = ["async_tokio"] }

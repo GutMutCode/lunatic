@@ -1,3 +1,4 @@
+mod hot_reload;
 mod mode;
 
 use mode::{cargo_test, execution};

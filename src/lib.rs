@@ -31,6 +31,7 @@ TODO
 */
 
 mod config;
+pub mod hot_reload;
 pub mod state;
 
 pub use config::DefaultProcessConfig;

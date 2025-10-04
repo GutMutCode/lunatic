@@ -29,7 +29,7 @@ If you would like to see other languages supported or just follow the discussion
 - [x] TCP networking
 - [x] Filesystem access
 - [x] Distributed nodes
-- [ ] Hot reloading
+- [x] Hot reloading (MVP)
 
 ## Installation
 
