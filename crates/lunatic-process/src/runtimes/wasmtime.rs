@@ -155,6 +155,41 @@ where
             },
         }
     }
+
+    pub fn snapshot_memory(&mut self) -> Result<Vec<u8>> {
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
+        
+        let data = memory.data(&self.store);
+        Ok(data.to_vec())
+    }
+
+    pub fn restore_memory(&mut self, snapshot: &[u8]) -> Result<()> {
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
+        
+        let data = memory.data_mut(&mut self.store);
+        let copy_len = snapshot.len().min(data.len());
+        data[..copy_len].copy_from_slice(&snapshot[..copy_len]);
+        
+        Ok(())
+    }
+
+    pub fn store(&self) -> &wasmtime::Store<T> {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut wasmtime::Store<T> {
+        &mut self.store
+    }
+
+    pub fn instance(&self) -> &wasmtime::Instance {
+        &self.instance
+    }
 }
 
 pub fn default_config() -> wasmtime::Config {
