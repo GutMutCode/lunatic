@@ -152,6 +152,39 @@ impl MessageMailbox {
 
         mailbox.messages.is_empty()
     }
+
+    /// Snapshot all pending messages for hot reload preservation
+    /// 
+    /// Note: This captures a snapshot of messages at the current moment.
+    /// Messages with resources (DataMessage) may not be fully cloneable,
+    /// so we take ownership and will need to restore them properly.
+    pub fn snapshot(&self) -> Vec<Message> {
+        let mut mailbox = self.inner.lock().expect("only accessed by one process");
+        
+        let mut messages = Vec::new();
+        
+        if let Some(found) = mailbox.found.take() {
+            messages.push(found);
+        }
+        
+        while let Some(message) = mailbox.messages.pop_front() {
+            messages.push(message);
+        }
+        
+        messages
+    }
+
+    /// Restore messages from snapshot after hot reload
+    pub fn restore(&self, messages: Vec<Message>) {
+        let mut mailbox = self.inner.lock().expect("only accessed by one process");
+        
+        mailbox.messages.clear();
+        mailbox.found = None;
+        
+        for message in messages {
+            mailbox.messages.push_back(message);
+        }
+    }
 }
 
 impl Future for &MessageMailbox {

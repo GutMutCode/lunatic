@@ -281,10 +281,7 @@ fn load_private_key(file: &[u8]) -> io::Result<rustls::PrivateKey> {
     // Load and return a single private key.
     let keys = rustls_pemfile::pkcs8_private_keys(&mut reader)?;
     if keys.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "expected a single private key",
-        ));
+        return Err(io::Error::other("expected a single private key"));
     }
 
     Ok(rustls::PrivateKey(keys[0].clone()))
@@ -294,10 +291,7 @@ fn load_certs(file: &[u8]) -> io::Result<rustls::Certificate> {
     let mut reader = io::BufReader::new(file);
     let certs = rustls_pemfile::certs(&mut reader)?;
     if certs.len() != 1 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "expected a single private key",
-        ));
+        return Err(io::Error::other("expected a single private key"));
     }
 
     Ok(rustls::Certificate(certs[0].clone()))

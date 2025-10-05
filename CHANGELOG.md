@@ -1,5 +1,29 @@
 # Lunatic Changelog
 
+## Unreleased
+
+### Added
+
+- Hot reload Phase 4: True Erlang-style hot code reloading
+  - `ReloadableState` trait for custom state serialization/migration
+  - Enhanced memory snapshots with stack/heap pointer preservation
+  - Mailbox message preservation across reloads
+  - In-place WASM instance swapping with atomic operations
+  - Process ID stability across hot reloads
+  - Zero downtime code updates for local processes
+  - Complete test coverage with 20+ tests
+
+### Changed
+
+- Memory snapshot now captures stack pointer (`__stack_pointer`) and heap pointer (`__heap_base`)
+- `MessageMailbox` now supports snapshot/restore for hot reload
+- `WasmtimeInstance` supports atomic instance swapping via `Arc<RwLock<>>`
+
+### Fixed
+
+- Clippy warnings in `lunatic-trap-api` and `lunatic-networking-api`
+- Dead code warnings in hot reload coordinator
+
 ## v0.13.0
 
 Released 2023-05-03.

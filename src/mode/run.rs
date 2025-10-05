@@ -146,7 +146,8 @@ async fn run_with_watch(
 
                 info!("File change detected: {:?}", event.path);
                 println!("\n🔄 Hot reloading...");
-                info!("Restarting process...");
+
+                info!("Restarting process (hot reload infrastructure not fully integrated yet)...");
 
                 if let Some(info) = process_info.take() {
                     if let Some(env) = envs.get(info.env_id).await {

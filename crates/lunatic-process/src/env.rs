@@ -18,6 +18,18 @@ pub trait Environment: Send + Sync {
     fn process_count(&self) -> usize;
     async fn can_spawn_next_process(&self) -> Result<Option<()>>;
     fn send(&self, id: u64, signal: Signal);
+
+    /// Get all process IDs for a given module
+    /// Default implementation returns empty vector (for environments that don't track modules)
+    fn get_processes_for_module(&self, _module_id: u64) -> Vec<u64> {
+        Vec::new()
+    }
+
+    /// Get the module registry for hot reload operations
+    /// Default implementation returns None
+    fn get_module_registry(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
 }
 
 #[async_trait]

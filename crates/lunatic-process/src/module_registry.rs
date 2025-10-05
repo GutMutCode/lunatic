@@ -42,6 +42,8 @@ impl<S: ProcessState> ModuleVersion<S> {
 pub struct ModuleRegistry<S: ProcessState> {
     modules: DashMap<u64, Vec<ModuleVersion<S>>>,
     max_versions: usize,
+    /// Dependencies: module_id -> list of modules that depend on it
+    dependencies: DashMap<u64, Vec<u64>>,
 }
 
 impl<S: ProcessState> ModuleRegistry<S> {
@@ -49,6 +51,7 @@ impl<S: ProcessState> ModuleRegistry<S> {
         Self {
             modules: DashMap::new(),
             max_versions: 2,
+            dependencies: DashMap::new(),
         }
     }
 
@@ -56,11 +59,12 @@ impl<S: ProcessState> ModuleRegistry<S> {
         Self {
             modules: DashMap::new(),
             max_versions,
+            dependencies: DashMap::new(),
         }
     }
 
     pub fn add_version(&self, id: u64, module: WasmtimeCompiledModule<S>) -> u32 {
-        let mut entry = self.modules.entry(id).or_insert_with(Vec::new);
+        let mut entry = self.modules.entry(id).or_default();
         let version = entry.len() as u32;
         let module_version = ModuleVersion::new(id, version, Arc::new(module));
         entry.push(module_version);
@@ -125,6 +129,51 @@ impl<S: ProcessState> ModuleRegistry<S> {
             .map(|versions| versions.len())
             .unwrap_or(0)
     }
+
+    /// Add a dependency: dependent_module depends on dependency_module
+    pub fn add_dependency(&self, dependent_module: u64, dependency_module: u64) {
+        let mut deps = self.dependencies.entry(dependency_module).or_default();
+        if !deps.contains(&dependent_module) {
+            deps.push(dependent_module);
+        }
+    }
+
+    /// Get modules that depend on the given module
+    pub fn get_dependents(&self, module_id: u64) -> Vec<u64> {
+        self.dependencies
+            .get(&module_id)
+            .map(|deps| deps.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get the reload order for a module and its dependents
+    pub fn get_reload_order(&self, module_id: u64) -> Vec<u64> {
+        let mut order = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+
+        fn visit_module(
+            registry: &ModuleRegistry<impl ProcessState>,
+            module_id: u64,
+            order: &mut Vec<u64>,
+            visited: &mut std::collections::HashSet<u64>,
+        ) {
+            if visited.contains(&module_id) {
+                return;
+            }
+            visited.insert(module_id);
+
+            // First reload dependents
+            for dependent in registry.get_dependents(module_id) {
+                visit_module(registry, dependent, order, visited);
+            }
+
+            // Then reload this module
+            order.push(module_id);
+        }
+
+        visit_module(self, module_id, &mut order, &mut visited);
+        order
+    }
 }
 
 impl<S: ProcessState> Default for ModuleRegistry<S> {
@@ -135,8 +184,6 @@ impl<S: ProcessState> Default for ModuleRegistry<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn test_module_registry_structure() {
         assert_eq!(2, 2);

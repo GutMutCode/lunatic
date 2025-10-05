@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use wasmtime::ResourceLimiter;
@@ -69,6 +69,13 @@ impl WasmtimeRuntime {
     }
 }
 
+pub struct MemorySnapshot {
+    pub memory: Vec<u8>,
+    pub stack_ptr: Option<u32>,
+    pub heap_ptr: Option<u32>,
+    pub metadata: HashMap<String, Vec<u8>>,
+}
+
 pub struct WasmtimeCompiledModule<T> {
     inner: Arc<WasmtimeCompiledModuleInner<T>>,
 }
@@ -104,6 +111,11 @@ impl<T> WasmtimeCompiledModule<T> {
     pub fn instantiator(&self) -> &wasmtime::InstancePre<T> {
         &self.inner.instance_pre
     }
+
+    /// Get the underlying wasmtime Module for compatibility checking
+    pub fn module(&self) -> &wasmtime::Module {
+        &self.inner.module
+    }
 }
 
 impl<T> Clone for WasmtimeCompiledModule<T> {
@@ -126,6 +138,16 @@ impl<T> WasmtimeInstance<T>
 where
     T: Send,
 {
+    /// Get the current process state from the instance
+    pub fn state(&self) -> &T {
+        self.store.data()
+    }
+
+    /// Get mutable access to the current process state
+    pub fn state_mut(&mut self) -> &mut T {
+        self.store.data_mut()
+    }
+
     pub async fn call(mut self, function: &str, params: Vec<wasmtime::Val>) -> ExecutionResult<T> {
         let entry = self.instance.get_func(&mut self.store, function);
 
@@ -156,25 +178,66 @@ where
         }
     }
 
-    pub fn snapshot_memory(&mut self) -> Result<Vec<u8>> {
+    /// Call a function without consuming the instance (for hot reload compatibility)
+    pub async fn call_ref(&mut self, function: &str, params: Vec<wasmtime::Val>) -> Result<()> {
+        let entry = self.instance.get_func(&mut self.store, function);
+
+        if let Some(func) = entry {
+            func.call_async(&mut self.store, &params, &mut []).await?;
+        } else {
+            return Err(anyhow::anyhow!("Function '{function}' not found"));
+        }
+
+        Ok(())
+    }
+
+    pub fn snapshot_memory(&mut self) -> Result<MemorySnapshot> {
         let memory = self
             .instance
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
         
-        let data = memory.data(&self.store);
-        Ok(data.to_vec())
+        let memory_data = memory.data(&self.store).to_vec();
+        
+        let stack_ptr = self.instance
+            .get_global(&mut self.store, "__stack_pointer")
+            .and_then(|g| g.get(&mut self.store).i32())
+            .map(|v| v as u32);
+        
+        let heap_ptr = self.instance
+            .get_global(&mut self.store, "__heap_base")
+            .and_then(|g| g.get(&mut self.store).i32())
+            .map(|v| v as u32);
+        
+        Ok(MemorySnapshot {
+            memory: memory_data,
+            stack_ptr,
+            heap_ptr,
+            metadata: HashMap::new(),
+        })
     }
 
-    pub fn restore_memory(&mut self, snapshot: &[u8]) -> Result<()> {
+    pub fn restore_memory(&mut self, snapshot: &MemorySnapshot) -> Result<()> {
         let memory = self
             .instance
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
         
         let data = memory.data_mut(&mut self.store);
-        let copy_len = snapshot.len().min(data.len());
-        data[..copy_len].copy_from_slice(&snapshot[..copy_len]);
+        let copy_len = snapshot.memory.len().min(data.len());
+        data[..copy_len].copy_from_slice(&snapshot.memory[..copy_len]);
+        
+        if let Some(stack_ptr) = snapshot.stack_ptr {
+            if let Some(global) = self.instance.get_global(&mut self.store, "__stack_pointer") {
+                global.set(&mut self.store, wasmtime::Val::I32(stack_ptr as i32))?;
+            }
+        }
+        
+        if let Some(heap_ptr) = snapshot.heap_ptr {
+            if let Some(global) = self.instance.get_global(&mut self.store, "__heap_base") {
+                global.set(&mut self.store, wasmtime::Val::I32(heap_ptr as i32))?;
+            }
+        }
         
         Ok(())
     }

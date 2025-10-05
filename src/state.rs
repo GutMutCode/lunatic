@@ -482,7 +482,7 @@ mod tests {
         use tokio::sync::RwLock;
 
         use crate::state::DefaultProcessState;
-        use crate::DefaultProcessConfig;
+use crate::DefaultProcessConfig;
         use lunatic_process::env::Environment;
         use lunatic_process::runtimes::wasmtime::WasmtimeRuntime;
         use lunatic_process::wasm::spawn_wasm;
@@ -515,5 +515,34 @@ mod tests {
         spawn_wasm(env, runtime, &module, state, "hello", Vec::new(), None)
             .await
             .unwrap();
+    }
+}
+
+impl lunatic_process::reloadable_state::ReloadableState for DefaultProcessState {
+    fn serialize_state(&self) -> anyhow::Result<Vec<u8>> {
+        let snapshot = self.message_mailbox.snapshot();
+        let message_count = snapshot.len() as u64;
+        
+        let mut result = Vec::new();
+        result.extend_from_slice(&self.id.to_le_bytes());
+        result.extend_from_slice(&message_count.to_le_bytes());
+        
+        Ok(result)
+    }
+
+    fn deserialize_state(_bytes: &[u8]) -> anyhow::Result<Self> {
+        Err(anyhow::anyhow!(
+            "DefaultProcessState deserialization is handled by hot reload infrastructure, not directly callable"
+        ))
+    }
+
+    fn code_change(&mut self, old_version: u32, new_version: u32) -> anyhow::Result<()> {
+        log::info!(
+            "DefaultProcessState code_change: {} -> {} for process {}",
+            old_version,
+            new_version,
+            self.id
+        );
+        Ok(())
     }
 }
