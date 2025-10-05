@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     module_registry::ModuleRegistry,
+    resource_migration::ResourceMigrationSnapshot,
     runtimes::wasmtime::{MemorySnapshot, WasmtimeCompiledModule, WasmtimeInstance, WasmtimeRuntime},
     state::ProcessState,
     Signal,
@@ -16,6 +17,7 @@ pub struct HotReloadContext<S: ProcessState + Send> {
     pub old_version: u32,
     pub new_version: u32,
     pub memory_snapshot: MemorySnapshot,
+    pub resource_snapshot: Option<ResourceMigrationSnapshot>,
     _phantom: std::marker::PhantomData<S>,
 }
 
@@ -312,6 +314,7 @@ impl<S: ProcessState + Send> HotReloadContext<S> {
                 heap_ptr: None,
                 metadata: std::collections::HashMap::new(),
             },
+            resource_snapshot: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -332,6 +335,20 @@ impl<S: ProcessState + Send> HotReloadContext<S> {
             self.memory_snapshot.memory.len()
         );
         Ok(())
+    }
+
+    pub fn set_resource_snapshot(&mut self, snapshot: ResourceMigrationSnapshot) {
+        if !snapshot.is_empty() {
+            info!(
+                "Captured {} resources for migration",
+                snapshot.count()
+            );
+            self.resource_snapshot = Some(snapshot);
+        }
+    }
+
+    pub fn get_resource_snapshot(&self) -> Option<&ResourceMigrationSnapshot> {
+        self.resource_snapshot.as_ref()
     }
 }
 

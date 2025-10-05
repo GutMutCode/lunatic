@@ -1860,6 +1860,7 @@ version = "0.13.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "dashmap",
  "hash-map-id",
  "log",

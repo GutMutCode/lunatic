@@ -5,6 +5,7 @@ pub mod mailbox;
 pub mod message;
 pub mod module_registry;
 pub mod reloadable_state;
+pub mod resource_migration;
 pub mod runtimes;
 pub mod signature_validation;
 pub mod state;
