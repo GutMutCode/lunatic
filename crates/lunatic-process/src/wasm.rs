@@ -40,6 +40,10 @@ where
     let function = function.to_string();
     let context = crate::ProcessContext::new(instance);
     let context_clone = context.instance.clone();
+    
+    // Note: Epoch ticker is now global (started in WasmtimeRuntime::new())
+    // No need for per-process ticker - all processes share the global ticker
+    
     let fut = async move {
         if let Some(instance) = context_clone.write().await.take() {
             instance.call(&function, params).await

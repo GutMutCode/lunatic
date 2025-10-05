@@ -1,4 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use wasmtime::ResourceLimiter;
@@ -11,6 +12,9 @@ use crate::{
 
 use super::RawWasm;
 
+/// Global flag to control the epoch ticker
+static EPOCH_TICKER_STARTED: AtomicBool = AtomicBool::new(false);
+
 #[derive(Clone)]
 pub struct WasmtimeRuntime {
     engine: wasmtime::Engine,
@@ -19,7 +23,32 @@ pub struct WasmtimeRuntime {
 impl WasmtimeRuntime {
     pub fn new(config: &wasmtime::Config) -> Result<Self> {
         let engine = wasmtime::Engine::new(config)?;
+        
+        // Start global epoch ticker once
+        if !EPOCH_TICKER_STARTED.swap(true, Ordering::SeqCst) {
+            Self::start_global_epoch_ticker(engine.clone());
+        }
+        
         Ok(Self { engine })
+    }
+
+    pub fn engine_handle(&self) -> wasmtime::Engine {
+        self.engine.clone()
+    }
+
+    /// Starts a single global epoch ticker for all processes in the runtime.
+    /// This replaces the per-process epoch ticker approach to reduce overhead.
+    fn start_global_epoch_ticker(engine: wasmtime::Engine) {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            log::debug!("Global epoch ticker started (10ms interval)");
+            
+            loop {
+                interval.tick().await;
+                // Increment epoch to trigger interruption points in all WASM instances
+                engine.increment_epoch();
+            }
+        });
     }
 
     /// Compiles a wasm module to machine code and performs type-checking on host functions.
@@ -58,6 +87,12 @@ impl WasmtimeRuntime {
             // If no limit is specified use maximum
             None => store.out_of_fuel_async_yield(u64::MAX, UNIT_OF_COMPUTE_IN_INSTRUCTIONS),
         };
+        // Set epoch deadline for preemptive hot reload (every 1 epoch tick)
+        store.set_epoch_deadline(1);
+        
+        // Set epoch interruption callback to yield for hot reload checks
+        store.epoch_deadline_async_yield_and_update(1);
+        
         // Create instance
         let instance = compiled_module
             .instantiator()
@@ -262,6 +297,8 @@ pub fn default_config() -> wasmtime::Config {
         .debug_info(false)
         // The behavior of fuel running out is defined on the Store
         .consume_fuel(true)
+        // Enable epoch interruption for preemptive hot reload
+        .epoch_interruption(true)
         .wasm_reference_types(true)
         .wasm_bulk_memory(true)
         .wasm_multi_value(true)

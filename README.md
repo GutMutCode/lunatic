@@ -29,7 +29,13 @@ If you would like to see other languages supported or just follow the discussion
 - [x] TCP networking
 - [x] Filesystem access
 - [x] Distributed nodes
-- [x] Hot reloading (MVP)
+- [x] Hot reloading (preemptive, all processes)
+
+## Documentation
+
+- [**CORE_VALUES.md**](CORE_VALUES.md) - Design principles and Erlang inspiration
+- [**HOT_RELOAD_ARCHITECTURE.md**](HOT_RELOAD_ARCHITECTURE.md) - Hot reload system design
+- [**docs/HOT_RELOAD_PREEMPTIVE.md**](docs/HOT_RELOAD_PREEMPTIVE.md) - Preemptive hot reload implementation
 
 ## Installation
 
