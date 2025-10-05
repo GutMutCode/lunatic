@@ -13,16 +13,27 @@
   - Zero downtime code updates for local processes
   - Complete test coverage with 20+ tests
 
+- Hot reload Phase 5: Production readiness features
+  - Signature validation system for module compatibility checking
+  - `Environment::send_to_all()` for broadcasting signals to all processes
+  - Automatic compatibility validation before hot reload
+  - Type-safe signal broadcasting (HotReload, Kill, DieWhenLinkDies)
+  - Detailed error reporting for incompatible module changes
+  - Function signature, memory size, and export validation
+
 ### Changed
 
 - Memory snapshot now captures stack pointer (`__stack_pointer`) and heap pointer (`__heap_base`)
 - `MessageMailbox` now supports snapshot/restore for hot reload
 - `WasmtimeInstance` supports atomic instance swapping via `Arc<RwLock<>>`
+- `Environment` trait now includes `send_to_all()` for broadcast operations
+- Hot reload now validates module signatures before attempting reload
 
 ### Fixed
 
 - Clippy warnings in `lunatic-trap-api` and `lunatic-networking-api`
 - Dead code warnings in hot reload coordinator
+- Missing `ReloadableState` import in hot_reload tests
 
 ## v0.13.0
 

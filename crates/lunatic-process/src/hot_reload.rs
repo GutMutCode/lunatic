@@ -568,6 +568,7 @@ pub fn send_hot_reload_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reloadable_state::ReloadableState;
 
     #[tokio::test]
     async fn test_reload_coordinator_basic() {

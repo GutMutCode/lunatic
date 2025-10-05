@@ -6,6 +6,7 @@ pub mod message;
 pub mod module_registry;
 pub mod reloadable_state;
 pub mod runtimes;
+pub mod signature_validation;
 pub mod state;
 pub mod wasm;
 
@@ -55,6 +56,27 @@ where
     let new_module = module_registry
         .get_version(module_id, new_version)
         .ok_or_else(|| anyhow!("Module version {} not found", new_version))?;
+    
+    let old_module = module_registry
+        .get_version(module_id, old_version)
+        .ok_or_else(|| anyhow!("Old module version {} not found", old_version))?;
+
+    // Validate signature compatibility
+    log::info!("Validating module compatibility...");
+    let validation_errors = signature_validation::SignatureValidator::validate_compatibility(
+        &old_module,
+        &new_module,
+    )?;
+    
+    if !validation_errors.is_empty() {
+        log::error!("Module incompatibility detected:");
+        for error in &validation_errors {
+            log::error!("  - {}", error);
+        }
+        return Err(anyhow!("Module signature validation failed: {} incompatibilities found", validation_errors.len()));
+    }
+    
+    log::info!("Module signatures are compatible");
 
     let mut instance_guard = context.instance.write().await;
     let mut old_instance = instance_guard.take()

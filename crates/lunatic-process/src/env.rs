@@ -18,6 +18,9 @@ pub trait Environment: Send + Sync {
     fn process_count(&self) -> usize;
     async fn can_spawn_next_process(&self) -> Result<Option<()>>;
     fn send(&self, id: u64, signal: Signal);
+    
+    /// Send a signal to all processes in this environment
+    fn send_to_all(&self, signal: Signal);
 
     /// Get all process IDs for a given module
     /// Default implementation returns empty vector (for environments that don't track modules)
@@ -104,6 +107,30 @@ impl Environment for LunaticEnvironment {
     fn send(&self, id: u64, signal: Signal) {
         if let Some(proc) = self.processes.get(&id) {
             proc.send(signal);
+        }
+    }
+    
+    fn send_to_all(&self, signal: Signal) {
+        match signal {
+            Signal::Kill => {
+                for entry in self.processes.iter() {
+                    entry.value().send(Signal::Kill);
+                }
+            }
+            Signal::HotReload { module_id, new_version } => {
+                for entry in self.processes.iter() {
+                    entry.value().send(Signal::HotReload { module_id, new_version });
+                }
+            }
+            Signal::DieWhenLinkDies(flag) => {
+                for entry in self.processes.iter() {
+                    entry.value().send(Signal::DieWhenLinkDies(flag));
+                }
+            }
+            _ => {
+                // Other signals don't make sense to broadcast
+                log::warn!("Attempted to broadcast non-broadcastable signal");
+            }
         }
     }
 
