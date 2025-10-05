@@ -87,6 +87,10 @@ wat = "1.0"
 harness = false
 name = "benchmark"
 
+[[bench]]
+harness = false
+name = "mailbox"
+
 [workspace]
 members = [
     "crates/hash-map-id",
