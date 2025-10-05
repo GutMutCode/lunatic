@@ -3,9 +3,12 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::Result;
 use clap::Parser;
 use lunatic_process::{
-    env::{Environments, LunaticEnvironments},
+    env::{Environment, Environments, LunaticEnvironment, LunaticEnvironments},
+    module_registry::ModuleRegistry,
     runtimes::{self},
+    Signal,
 };
+use lunatic_runtime::DefaultProcessState;
 
 use super::common::{run_wasm, RunWasm};
 
@@ -73,14 +76,26 @@ async fn run_with_watch(
     args: Args,
     runtime: runtimes::wasmtime::WasmtimeRuntime,
     envs: Arc<LunaticEnvironments>,
-    _env: Arc<impl lunatic_process::env::Environment + 'static>,
+    env: Arc<impl lunatic_process::env::Environment + 'static>,
 ) -> Result<()> {
     use crate::hot_reload::{FileChangeEvent, FileWatcher};
     use log::{error, info};
     use tokio::sync::mpsc;
 
-    info!("Starting lunatic in watch mode...");
+    info!("Starting lunatic in watch mode with hot reload support...");
     info!("Watching file: {:?}", args.path);
+
+    let module_registry = Arc::new(ModuleRegistry::<DefaultProcessState>::new());
+    
+    let initial_bytes = std::fs::read(&args.path)?;
+    let initial_module = runtime.compile_module(initial_bytes.into())?;
+    let module_id = 0u64;
+    let _initial_version = module_registry.add_version(module_id, initial_module);
+    
+    info!("Module registry initialized with version 0");
+
+    drop(env);
+    let env = envs.create_with_registry(1, module_registry.clone() as Arc<dyn std::any::Any + Send + Sync>).await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<FileChangeEvent>();
     let mut watcher = FileWatcher::new(&args.path, tx)?;
@@ -101,19 +116,17 @@ async fn run_with_watch(
     let reload_debounce = tokio::time::Duration::from_millis(500);
 
     async fn start_process(
-        envs: &Arc<LunaticEnvironments>,
         runtime: &runtimes::wasmtime::WasmtimeRuntime,
         path: &PathBuf,
         wasm_args: &[String],
         dir: &[PathBuf],
-        env_id: u64,
-    ) -> Result<ProcessInfo> {
-        let new_env = envs.create(env_id).await?;
+        envs: Arc<LunaticEnvironments>,
+        env: Arc<LunaticEnvironment>,
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
         let runtime_clone = runtime.clone();
         let path_clone = path.clone();
         let wasm_args_clone = wasm_args.to_vec();
         let dir_clone = dir.to_vec();
-        let envs_clone = envs.clone();
 
         let handle = tokio::spawn(async move {
             run_wasm(RunWasm {
@@ -121,18 +134,18 @@ async fn run_with_watch(
                 wasm_args: wasm_args_clone,
                 dir: dir_clone,
                 runtime: runtime_clone,
-                envs: envs_clone,
-                env: new_env,
+                envs,
+                env,
                 distributed: None,
             })
             .await
         });
-        Ok(ProcessInfo { handle, env_id })
+        Ok(handle)
     }
 
-    process_info = Some(start_process(&envs, &runtime, &path, &wasm_args, &dir, next_env_id).await?);
-    next_env_id += 1;
-    info!("Initial process started");
+    let handle = start_process(&runtime, &path, &wasm_args, &dir, envs.clone(), env.clone()).await?;
+    process_info = Some(ProcessInfo { handle, env_id: 1 });
+    info!("Initial process started with hot reload support");
 
     loop {
         tokio::select! {
@@ -147,27 +160,30 @@ async fn run_with_watch(
                 info!("File change detected: {:?}", event.path);
                 println!("\n🔄 Hot reloading...");
 
-                info!("Restarting process (hot reload infrastructure not fully integrated yet)...");
-
-                if let Some(info) = process_info.take() {
-                    if let Some(env) = envs.get(info.env_id).await {
-                        env.kill_all_processes();
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
-                    info.handle.abort();
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                }
-                
-                println!("✅ Reloaded successfully\n");
-
-                match start_process(&envs, &runtime, &path, &wasm_args, &dir, next_env_id).await {
-                    Ok(info) => {
-                        next_env_id += 1;
-                        process_info = Some(info);
-                        info!("Process restarted successfully");
+                match std::fs::read(&path) {
+                    Ok(new_bytes) => {
+                        match runtime.compile_module(new_bytes.into()) {
+                            Ok(new_module) => {
+                                let new_version = module_registry.add_version(module_id, new_module);
+                                info!("Compiled new module version: {}", new_version);
+                                
+                                env.send_to_all(Signal::HotReload {
+                                    module_id,
+                                    new_version,
+                                });
+                                
+                                println!("✅ Hot reload signal sent (version {})\n", new_version);
+                                info!("Hot reload completed successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to compile new module: {}", e);
+                                println!("❌ Compilation failed: {}\n", e);
+                            }
+                        }
                     }
                     Err(e) => {
-                        error!("Failed to restart process: {}", e);
+                        error!("Failed to read file: {}", e);
+                        println!("❌ Failed to read file: {}\n", e);
                     }
                 }
             }
@@ -177,18 +193,23 @@ async fn run_with_watch(
                     None => std::future::pending().await
                 }
             } => {
-                process_info = None;
                 match result {
                     Ok(Ok(_)) => {
                         info!("Process finished successfully");
+                        process_info = None;
                         break;
                     }
                     Ok(Err(e)) => {
                         error!("Process error: {}", e);
-                        info!("Waiting for file changes...");
+                        info!("Restarting process...");
+                        
+                        let new_handle = start_process(&runtime, &path, &wasm_args, &dir, envs.clone(), env.clone()).await?;
+                        process_info = Some(ProcessInfo { handle: new_handle, env_id: 1 });
+                        info!("Process restarted");
                     }
                     Err(e) => {
                         error!("Process panicked: {}", e);
+                        process_info = None;
                         break;
                     }
                 }

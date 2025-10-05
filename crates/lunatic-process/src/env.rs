@@ -41,6 +41,7 @@ pub trait Environments: Send + Sync {
 
     async fn create(&self, id: u64) -> Result<Arc<Self::Env>>;
     async fn get(&self, id: u64) -> Option<Arc<Self::Env>>;
+    async fn create_with_registry(&self, id: u64, registry: Arc<dyn std::any::Any + Send + Sync>) -> Result<Arc<Self::Env>>;
 }
 
 #[derive(Clone)]
@@ -48,6 +49,7 @@ pub struct LunaticEnvironment {
     environment_id: u64,
     next_process_id: Arc<AtomicU64>,
     processes: Arc<DashMap<u64, Arc<dyn Process>>>,
+    module_registry: Option<Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl LunaticEnvironment {
@@ -56,7 +58,21 @@ impl LunaticEnvironment {
             environment_id: id,
             processes: Arc::new(DashMap::new()),
             next_process_id: Arc::new(AtomicU64::new(1)),
+            module_registry: None,
         }
+    }
+
+    pub fn with_module_registry(id: u64, registry: Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        Self {
+            environment_id: id,
+            processes: Arc::new(DashMap::new()),
+            next_process_id: Arc::new(AtomicU64::new(1)),
+            module_registry: Some(registry),
+        }
+    }
+
+    pub fn set_module_registry(&mut self, registry: Arc<dyn std::any::Any + Send + Sync>) {
+        self.module_registry = Some(registry);
     }
 
     pub fn kill_all_processes(&self) {
@@ -146,6 +162,10 @@ impl Environment for LunaticEnvironment {
         // Don't impose any limits to process spawning
         Ok(Some(()))
     }
+
+    fn get_module_registry(&self) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        self.module_registry.clone()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -158,6 +178,14 @@ impl Environments for LunaticEnvironments {
     type Env = LunaticEnvironment;
     async fn create(&self, id: u64) -> Result<Arc<Self::Env>> {
         let env = Arc::new(LunaticEnvironment::new(id));
+        self.envs.insert(id, env.clone());
+        #[cfg(feature = "metrics")]
+        metrics::gauge!("lunatic.process.environment.count", self.envs.len() as f64);
+        Ok(env)
+    }
+
+    async fn create_with_registry(&self, id: u64, registry: Arc<dyn std::any::Any + Send + Sync>) -> Result<Arc<Self::Env>> {
+        let env = Arc::new(LunaticEnvironment::with_module_registry(id, registry));
         self.envs.insert(id, env.clone());
         #[cfg(feature = "metrics")]
         metrics::gauge!("lunatic.process.environment.count", self.envs.len() as f64);

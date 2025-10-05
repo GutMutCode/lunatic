@@ -50,7 +50,7 @@ where
         .ok_or_else(|| anyhow!("ModuleRegistry not available in environment"))?;
     
     let module_registry = module_registry
-        .downcast::<Arc<module_registry::ModuleRegistry<S>>>()
+        .downcast::<module_registry::ModuleRegistry<S>>()
         .map_err(|_| anyhow!("Failed to downcast ModuleRegistry"))?;
     
     let new_module = module_registry
