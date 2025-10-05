@@ -365,6 +365,14 @@ impl NetworkingCtx for DefaultProcessState {
     fn dns_resources_mut(&mut self) -> &mut lunatic_networking_api::DnsResources {
         &mut self.resources.dns_iterators
     }
+
+    fn can_open_network_connection(&mut self) -> anyhow::Result<()> {
+        Self::can_open_network_connection(self)
+    }
+
+    fn close_network_connection(&mut self) {
+        Self::close_network_connection(self)
+    }
 }
 
 impl TimerCtx for DefaultProcessState {

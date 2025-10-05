@@ -100,6 +100,12 @@ pub trait NetworkingCtx {
     fn udp_resources_mut(&mut self) -> &mut UdpResources;
     fn dns_resources(&self) -> &DnsResources;
     fn dns_resources_mut(&mut self) -> &mut DnsResources;
+    
+    fn can_open_network_connection(&mut self) -> Result<()> {
+        Ok(())
+    }
+    
+    fn close_network_connection(&mut self) {}
 }
 
 // Register the networking APIs to the linker

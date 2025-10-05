@@ -190,15 +190,24 @@ fn tcp_accept<T: NetworkingCtx + ErrorCtx + Send>(
 
         let (tcp_stream_or_error_id, peer_addr_iter, result) = match tcp_listener.accept().await {
             Ok((stream, socket_addr)) => {
-                let stream_id = caller
-                    .data_mut()
-                    .tcp_stream_resources_mut()
-                    .add(Arc::new(TcpConnection::new(stream)));
-                let dns_iter_id = caller
-                    .data_mut()
-                    .dns_resources_mut()
-                    .add(DnsIterator::new(vec![socket_addr].into_iter()));
-                (stream_id, dns_iter_id, 0)
+                match caller.data_mut().can_open_network_connection() {
+                    Ok(()) => {
+                        let stream_id = caller
+                            .data_mut()
+                            .tcp_stream_resources_mut()
+                            .add(Arc::new(TcpConnection::new(stream)));
+                        let dns_iter_id = caller
+                            .data_mut()
+                            .dns_resources_mut()
+                            .add(DnsIterator::new(vec![socket_addr].into_iter()));
+                        (stream_id, dns_iter_id, 0)
+                    }
+                    Err(error) => (
+                        caller.data_mut().error_resources_mut().add(error),
+                        0,
+                        1,
+                    ),
+                }
             }
             Err(error) => (
                 caller.data_mut().error_resources_mut().add(error.into()),
@@ -268,13 +277,18 @@ fn tcp_connect<T: NetworkingCtx + ErrorCtx + Send>(
             t => timeout(Duration::from_millis(t), connect).await,
         } {
             let (stream_or_error_id, result) = match result {
-                Ok(stream) => (
-                    caller
-                        .data_mut()
-                        .tcp_stream_resources_mut()
-                        .add(Arc::new(TcpConnection::new(stream))),
-                    0,
-                ),
+                Ok(stream) => {
+                    match caller.data_mut().can_open_network_connection() {
+                        Ok(()) => (
+                            caller
+                                .data_mut()
+                                .tcp_stream_resources_mut()
+                                .add(Arc::new(TcpConnection::new(stream))),
+                            0,
+                        ),
+                        Err(error) => (caller.data_mut().error_resources_mut().add(error), 1),
+                    }
+                },
                 Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
             };
 
@@ -303,6 +317,7 @@ fn drop_tcp_stream<T: NetworkingCtx>(mut caller: Caller<T>, tcp_stream_id: u64) 
         .tcp_stream_resources_mut()
         .remove(tcp_stream_id)
         .or_trap("lunatic::networking::drop_tcp_stream")?;
+    caller.data_mut().close_network_connection();
     Ok(())
 }
 

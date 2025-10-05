@@ -440,9 +440,10 @@ fn test_network_connection_limit() {
 - [x] Per-process configuration verified
 - [x] All tests pass, no regressions
 
-**Optional Integration** (~2 hours when needed):
-- [ ] `crates/lunatic-networking-api/src/tcp.rs` - Call tracking methods
-- [ ] `crates/lunatic-wasi-api/src/lib.rs` - Call tracking methods
+**Integration Complete** (October 5, 2025):
+- [x] `crates/lunatic-networking-api/src/tcp.rs` - TCP connection tracking
+- [x] `tests/resource_limits.rs` - Network limit test added
+- [ ] `crates/lunatic-wasi-api/src/lib.rs` - Deferred (WASI internal limitation)
 
 ---
 
@@ -455,10 +456,10 @@ fn test_network_connection_limit() {
 
 ### Security (Priority 3)
 - [x] Table element limits enforced (was hardcoded, now per-process)
-- [x] File descriptor tracking infrastructure ready
-- [x] Network connection tracking infrastructure ready
+- [x] Network connection limits **fully enforced** (tcp_connect, tcp_accept, drop)
+- [x] DoS prevention via connection flooding **active**
 - [x] Per-process limits configurable
-- [ ] Full API integration (optional, ~2 hours)
+- [ ] File descriptor tracking deferred (WASI internal limitation)
 
 ### CORE_VALUES.md Alignment
 - [x] **Fast**: 5-500x performance improvements
