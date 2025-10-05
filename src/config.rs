@@ -25,6 +25,10 @@ pub struct DefaultProcessConfig {
     preopened_dirs: Vec<(String, String)>,
     command_line_arguments: Vec<String>,
     environment_variables: Vec<(String, String)>,
+    // Resource limits (Phase 3)
+    max_table_elements: u32,
+    max_file_descriptors: u32,
+    max_network_connections: u32,
 }
 
 impl Debug for DefaultProcessConfig {
@@ -79,6 +83,30 @@ impl LunaticWasiConfigCtx for DefaultProcessConfig {
 impl DefaultProcessConfig {
     pub fn preopened_dirs(&self) -> &[(String, String)] {
         &self.preopened_dirs
+    }
+
+    pub fn get_max_table_elements(&self) -> u32 {
+        self.max_table_elements
+    }
+
+    pub fn set_max_table_elements(&mut self, max: u32) {
+        self.max_table_elements = max;
+    }
+
+    pub fn get_max_file_descriptors(&self) -> u32 {
+        self.max_file_descriptors
+    }
+
+    pub fn set_max_file_descriptors(&mut self, max: u32) {
+        self.max_file_descriptors = max;
+    }
+
+    pub fn get_max_network_connections(&self) -> u32 {
+        self.max_network_connections
+    }
+
+    pub fn set_max_network_connections(&mut self, max: u32) {
+        self.max_network_connections = max;
     }
 
     /// Grant access to the given directory with this config.
@@ -298,6 +326,9 @@ impl Default for DefaultProcessConfig {
             preopened_dirs: vec![],
             command_line_arguments: vec![],
             environment_variables: vec![],
+            max_table_elements: 100_000,
+            max_file_descriptors: 1024,
+            max_network_connections: 1024,
         }
     }
 }

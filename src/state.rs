@@ -37,6 +37,12 @@ pub struct DbResources {
     sqlite_guest_allocator: SQLiteGuestAllocators,
 }
 
+#[derive(Debug, Default)]
+pub struct ResourceStats {
+    pub open_file_descriptors: u32,
+    pub open_network_connections: u32,
+}
+
 pub struct DefaultProcessState {
     // Process id
     pub(crate) id: u64,
@@ -71,9 +77,39 @@ pub struct DefaultProcessState {
     // database resources
     db_resources: DbResources,
     registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
+    // Resource usage stats (Phase 3)
+    resource_stats: ResourceStats,
 }
 
 impl DefaultProcessState {
+    pub fn can_open_file_descriptor(&mut self) -> anyhow::Result<()> {
+        if self.resource_stats.open_file_descriptors >= self.config.get_max_file_descriptors() {
+            anyhow::bail!("Max file descriptors ({}) reached", self.config.get_max_file_descriptors());
+        }
+        self.resource_stats.open_file_descriptors += 1;
+        Ok(())
+    }
+
+    pub fn close_file_descriptor(&mut self) {
+        if self.resource_stats.open_file_descriptors > 0 {
+            self.resource_stats.open_file_descriptors -= 1;
+        }
+    }
+
+    pub fn can_open_network_connection(&mut self) -> anyhow::Result<()> {
+        if self.resource_stats.open_network_connections >= self.config.get_max_network_connections() {
+            anyhow::bail!("Max network connections ({}) reached", self.config.get_max_network_connections());
+        }
+        self.resource_stats.open_network_connections += 1;
+        Ok(())
+    }
+
+    pub fn close_network_connection(&mut self) {
+        if self.resource_stats.open_network_connections > 0 {
+            self.resource_stats.open_network_connections -= 1;
+        }
+    }
+
     pub fn new(
         environment: Arc<LunaticEnvironment>,
         distributed: Option<DistributedProcessState>,
@@ -106,6 +142,7 @@ impl DefaultProcessState {
             initialized: false,
             registry,
             db_resources: DbResources::default(),
+            resource_stats: ResourceStats::default(),
         };
         Ok(state)
     }
@@ -143,6 +180,7 @@ impl ProcessState for DefaultProcessState {
             initialized: false,
             registry: self.registry.clone(),
             db_resources: DbResources::default(),
+            resource_stats: ResourceStats::default(),
         };
         Ok(state)
     }
@@ -226,7 +264,7 @@ impl ResourceLimiter for DefaultProcessState {
     }
 
     fn table_growing(&mut self, _current: u32, desired: u32, _maximum: Option<u32>) -> bool {
-        desired < 100_000
+        desired <= self.config().get_max_table_elements()
     }
 
     // Allow one instance per store
@@ -469,6 +507,7 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             initialized: false,
             registry: Default::default(), // TODO move registry into env?
             db_resources: DbResources::default(),
+            resource_stats: ResourceStats::default(),
         };
         Ok(state)
     }
