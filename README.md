@@ -30,6 +30,7 @@ If you would like to see other languages supported or just follow the discussion
 - [x] Filesystem access
 - [x] Distributed nodes
 - [x] Hot reloading (preemptive, all processes)
+- [x] OTP patterns (GenServer, Supervisor, GenStatem)
 
 ## Documentation
 

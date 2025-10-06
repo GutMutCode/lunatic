@@ -121,6 +121,7 @@ members = [
     "crates/lunatic-distributed",
     "crates/lunatic-error-api",
     "crates/lunatic-messaging-api",
+    "crates/lunatic-otp-patterns",
     "crates/lunatic-process-api",
     "crates/lunatic-process",
     "crates/lunatic-registry-api",

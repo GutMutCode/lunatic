@@ -3,6 +3,9 @@ name = "lunatic-rust-examples"
 version = "0.1.0"
 edition = "2021"
 
+[workspace]
+# Keep this package separate from the main workspace
+
 [[bin]]
 name = "counter"
 path = "src/counter.rs"
@@ -11,9 +14,14 @@ path = "src/counter.rs"
 name = "echo_server"
 path = "src/echo_server.rs"
 
+[[bin]]
+name = "gen_server_example"
+path = "src/gen_server_example.rs"
+
 [dependencies]
-# Note: lunatic crate would be used in production
-# For these examples, we demonstrate the concepts without requiring the full crate
+# Add lunatic-otp-patterns for the GenServer example
+lunatic-otp-patterns = { path = "../../crates/lunatic-otp-patterns" }
+serde = { version = "1.0", features = ["derive"] }
 
 [profile.release]
 opt-level = "z"  # Optimize for size
