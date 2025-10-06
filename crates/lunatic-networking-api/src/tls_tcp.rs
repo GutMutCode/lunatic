@@ -12,7 +12,7 @@ use tokio::{
 };
 use wasmtime::{Caller, Linker};
 
-use lunatic_common_api::{get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap};
 use lunatic_error_api::ErrorCtx;
 use webpki::TrustAnchor;
 
@@ -162,17 +162,20 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
             scope_id,
         )?;
         let (tls_listener_or_error_id, result) = match TcpListener::bind(socket_addr).await {
-            Ok(listener) => (
-                caller
-                    .data_mut()
-                    .tls_listener_resources_mut()
-                    .add(TlsListener {
-                        listener,
-                        keys,
-                        certs,
-                    }),
-                0,
-            ),
+            Ok(listener) => {
+                audit_log("tls_bind", format!("address={}", socket_addr));
+                (
+                    caller
+                        .data_mut()
+                        .tls_listener_resources_mut()
+                        .add(TlsListener {
+                            listener,
+                            keys,
+                            certs,
+                        }),
+                    0,
+                )
+            }
             Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
         };
         memory
@@ -246,6 +249,7 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
                         .data_mut()
                         .dns_resources_mut()
                         .add(DnsIterator::new(vec![socket_addr].into_iter()));
+                    audit_log("tls_accept", format!("peer={}", socket_addr));
                     (stream_id, dns_iter_id, 0)
                 }
                 Err(error) => (
@@ -415,13 +419,12 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                         .connect(domain, stream)
                         .await
                         .or_trap("lunatic::networking::tls_connect::connect failed")?;
-                    (
-                        caller
-                            .data_mut()
-                            .tls_stream_resources_mut()
-                            .add(Arc::new(TlsConnection::new(TlsStream::Client(stream)))),
-                        0,
-                    )
+                    let id = caller
+                        .data_mut()
+                        .tls_stream_resources_mut()
+                        .add(Arc::new(TlsConnection::new(TlsStream::Client(stream))));
+                    audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));
+                    (id, 0)
                 }
                 Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
             };

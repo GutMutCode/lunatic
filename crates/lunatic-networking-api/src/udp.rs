@@ -10,7 +10,7 @@ use wasmtime::{Caller, Linker};
 
 use crate::dns::DnsIterator;
 use crate::{socket_address, NetworkingCtx};
-use lunatic_common_api::{get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap};
 use lunatic_error_api::ErrorCtx;
 
 // Register UDP networking APIs to the linker
@@ -84,13 +84,16 @@ fn udp_bind<T: NetworkingCtx + ErrorCtx + Send>(
             scope_id,
         )?;
         let (udp_listener_or_error_id, result) = match UdpSocket::bind(socket_addr).await {
-            Ok(listener) => (
-                caller
-                    .data_mut()
-                    .udp_resources_mut()
-                    .add(Arc::new(listener)),
-                0,
-            ),
+            Ok(listener) => {
+                audit_log("udp_bind", format!("address={}", socket_addr));
+                (
+                    caller
+                        .data_mut()
+                        .udp_resources_mut()
+                        .add(Arc::new(listener)),
+                    0,
+                )
+            }
             Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
         };
         memory
@@ -275,7 +278,10 @@ fn udp_connect<T: NetworkingCtx + ErrorCtx + Send>(
             t => timeout(Duration::from_millis(t), connect).await,
         } {
             let (opaque, return_) = match result {
-                Ok(()) => (0, 0),
+                Ok(()) => {
+                    audit_log("udp_connect", format!("peer={}", socket_addr));
+                    (0, 0)
+                }
                 Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
             };
 

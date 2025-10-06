@@ -12,7 +12,7 @@ use tokio::{
 };
 use wasmtime::{Caller, Linker};
 
-use lunatic_common_api::{get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap};
 use lunatic_error_api::ErrorCtx;
 
 use crate::dns::DnsIterator;
@@ -92,10 +92,13 @@ fn tcp_bind<T: NetworkingCtx + ErrorCtx + Send>(
             scope_id,
         )?;
         let (tcp_listener_or_error_id, result) = match TcpListener::bind(socket_addr).await {
-            Ok(listener) => (
-                caller.data_mut().tcp_listener_resources_mut().add(listener),
-                0,
-            ),
+            Ok(listener) => {
+                audit_log("tcp_bind", format!("address={}", socket_addr));
+                (
+                    caller.data_mut().tcp_listener_resources_mut().add(listener),
+                    0,
+                )
+            }
             Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
         };
         memory
@@ -189,26 +192,21 @@ fn tcp_accept<T: NetworkingCtx + ErrorCtx + Send>(
             .or_trap("lunatic::network::tcp_accept")?;
 
         let (tcp_stream_or_error_id, peer_addr_iter, result) = match tcp_listener.accept().await {
-            Ok((stream, socket_addr)) => {
-                match caller.data_mut().can_open_network_connection() {
-                    Ok(()) => {
-                        let stream_id = caller
-                            .data_mut()
-                            .tcp_stream_resources_mut()
-                            .add(Arc::new(TcpConnection::new(stream)));
-                        let dns_iter_id = caller
-                            .data_mut()
-                            .dns_resources_mut()
-                            .add(DnsIterator::new(vec![socket_addr].into_iter()));
-                        (stream_id, dns_iter_id, 0)
-                    }
-                    Err(error) => (
-                        caller.data_mut().error_resources_mut().add(error),
-                        0,
-                        1,
-                    ),
+            Ok((stream, socket_addr)) => match caller.data_mut().can_open_network_connection() {
+                Ok(()) => {
+                    let stream_id = caller
+                        .data_mut()
+                        .tcp_stream_resources_mut()
+                        .add(Arc::new(TcpConnection::new(stream)));
+                    let dns_iter_id = caller
+                        .data_mut()
+                        .dns_resources_mut()
+                        .add(DnsIterator::new(vec![socket_addr].into_iter()));
+                    audit_log("tcp_accept", format!("peer={}", socket_addr));
+                    (stream_id, dns_iter_id, 0)
                 }
-            }
+                Err(error) => (caller.data_mut().error_resources_mut().add(error), 0, 1),
+            },
             Err(error) => (
                 caller.data_mut().error_resources_mut().add(error.into()),
                 0,
@@ -277,17 +275,16 @@ fn tcp_connect<T: NetworkingCtx + ErrorCtx + Send>(
             t => timeout(Duration::from_millis(t), connect).await,
         } {
             let (stream_or_error_id, result) = match result {
-                Ok(stream) => {
-                    match caller.data_mut().can_open_network_connection() {
-                        Ok(()) => (
-                            caller
-                                .data_mut()
-                                .tcp_stream_resources_mut()
-                                .add(Arc::new(TcpConnection::new(stream))),
-                            0,
-                        ),
-                        Err(error) => (caller.data_mut().error_resources_mut().add(error), 1),
+                Ok(stream) => match caller.data_mut().can_open_network_connection() {
+                    Ok(()) => {
+                        let id = caller
+                            .data_mut()
+                            .tcp_stream_resources_mut()
+                            .add(Arc::new(TcpConnection::new(stream)));
+                        audit_log("tcp_connect", format!("peer={}", socket_addr));
+                        (id, 0)
                     }
+                    Err(error) => (caller.data_mut().error_resources_mut().add(error), 1),
                 },
                 Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
             };

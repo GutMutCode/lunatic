@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use log::info;
 use std::{fmt::Display, future::Future, io::Write, pin::Pin};
 use wasmtime::{Caller, Memory, Val};
 
@@ -106,4 +107,9 @@ impl<T> IntoTrap<T> for Option<T> {
             )),
         }
     }
+}
+
+/// Emit an audit log entry with `target = "audit"` so operators can route it separately.
+pub fn audit_log(event: &str, details: impl AsRef<str>) {
+    info!(target: "audit", "{} {}", event, details.as_ref());
 }

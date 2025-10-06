@@ -9,4 +9,5 @@ license = "Apache-2.0 OR MIT"
 
 [dependencies]
 anyhow = { workspace = true }
+log = { workspace = true }
 wasmtime = { workspace = true }

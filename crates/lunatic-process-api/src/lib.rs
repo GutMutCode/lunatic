@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use hash_map_id::HashMapId;
-use lunatic_common_api::{get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap};
 use lunatic_distributed::DistributedCtx;
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::{
@@ -664,6 +664,8 @@ where
             }
         }
 
+        let parent_id = caller.data().id();
+
         // set state instead of config TODO
         let env = caller.data().environment();
         let (proc_or_error_id, result) = match lunatic_process::wasm::spawn_wasm(
@@ -671,7 +673,13 @@ where
         )
         .await
         {
-            Ok((_, process)) => (process.id(), 0),
+            Ok((_, process)) => {
+                audit_log(
+                    "process_spawn",
+                    format!("parent={} child={}", parent_id, process.id()),
+                );
+                (process.id(), 0)
+            }
             Err(error) => (caller.data_mut().error_resources_mut().add(error), 1),
         };
 

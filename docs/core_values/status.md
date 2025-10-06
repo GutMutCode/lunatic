@@ -53,7 +53,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: networking host calls enforce per-process quotas before creating sockets (`crates/lunatic-networking-api/src/tcp.rs:192`).
 - Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
 - Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
-- Gap: TLS assets and active streams remain non-migratable, and audit logging referenced in `CORE_VALUES.md` is still absent.
+- Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:80`).
+- Gap: TLS assets and active streams remain non-migratable, and audit logging still needs persistence/aggregation guidance.
 
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).

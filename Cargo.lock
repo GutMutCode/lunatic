@@ -1725,6 +1725,7 @@ name = "lunatic-common-api"
 version = "0.13.2"
 dependencies = [
  "anyhow",
+ "log",
  "wasmtime",
 ]
 
