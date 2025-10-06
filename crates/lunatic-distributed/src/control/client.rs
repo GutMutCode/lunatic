@@ -207,8 +207,7 @@ impl Client {
             .await
             .with_context(|| format!("Error sending HTTP POST request: {}.", &url))?
             .error_for_status()
-            .with_context(|| format!("HTTP POST request returned an error response: {}", &url))
-            .map_err(|e| dbg!(e))?
+            .with_context(|| format!("HTTP POST request returned an error response: {}", &url))?
             .json()
             .await
             .with_context(|| format!("Error parsing the HTTP POST request JSON: {}", &url))?;

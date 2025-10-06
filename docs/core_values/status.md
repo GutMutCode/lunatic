@@ -1,7 +1,7 @@
 # Core Values Compliance Status
 
 Generated: 2025-10-06  
-Commit: 1a03cf00bd6c0b56fb27299d61309e547453dc32
+Commit: 64c68a3666be29fa9f165a8701f714c07bf6cfee
 
 This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
 
@@ -9,7 +9,7 @@ This document supersedes ad-hoc phase reports and consolidates how the current c
 
 | Focus | Status | Highlights |
 | --- | --- | --- |
-| Fast | Partial | Global epoch preemption and hot-reload snapshots implemented, but process spawn and messaging targets lack repeatable benchmarks. |
+| Fast | Partial | Global epoch preemption and hot-reload snapshots implemented, distributed encode/decode bench lands; cross-node latency still pending. |
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
@@ -28,7 +28,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `MessageMailbox` async future prevents busy waiting and supports selective receive (`crates/lunatic-process/src/mailbox.rs:32`).
 - Evidence: `InstancePool` reports hit/miss counters (`stats()` and `lunatic.instance_pool.*` metrics) and the `instance_pool_hit_rate` Criterion bench runs in CI to guard pooled spawn latency (`crates/lunatic-process/src/instance_pool.rs:71`, `.github/workflows/ci.yml:63`).
 - Evidence: Messaging round-trip benches execute in CI to monitor mailbox latency (`benches/messaging.rs:1`, `.github/workflows/ci.yml:64`).
-- Gap: add distributed messaging benchmarks and compare against multi-node targets.
+- Evidence: Distributed encode/decode costs are tracked via the new Criterion suite (`benches/distributed_messaging.rs:1`, `scripts/check_bench_thresholds.py:45`).
+- Gap: extend coverage from serialization costs to end-to-end multi-node latency measurements.
 
 ### Robust
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
@@ -40,7 +41,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: environment registry uses `DashMap` and exposes broadcast APIs (`crates/lunatic-process/src/env.rs:66`).
 - Evidence: `DefaultProcessConfig` enforces table, file, and network quotas to avoid per-process blowups (`src/config.rs:8`).
 - Evidence: Pool telemetry now surfaces hit/miss counters and gauges so operators can alert on unhealthy reuse (`crates/lunatic-process/src/instance_pool.rs:107`).
-- Gap: distributed control client triggers future-incompat warning until `notify_node_stopped` type is annotated (`crates/lunatic-distributed/src/control/client.rs:235`).
+- Evidence: Control client HTTP wrappers propagate structured errors without leaking debug output (`crates/lunatic-distributed/src/control/client.rs:209`).
+- Gap: distributed scheduler still lacks automated stress runs to validate cluster-wide quotas across nodes.
 
 ## 2. Language Independence via WebAssembly
 - Evidence: host registration for all subsystems lives behind traits and is language-neutral (`src/state.rs:195`).

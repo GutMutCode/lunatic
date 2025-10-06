@@ -42,6 +42,19 @@ BENCHES: Dict[str, BenchConfig] = {
             "message_round_trip_selective": BenchTarget(threshold_us=15.0, warn_us=8.0),
         },
     ),
+    "distributed_messaging": BenchConfig(
+        cli_args=("--sample-size", "40"),
+        targets={
+            "distributed_request_encode_1kb": BenchTarget(
+                threshold_us=500.0,
+                warn_us=250.0,
+            ),
+            "distributed_request_decode_1kb": BenchTarget(
+                threshold_us=400.0,
+                warn_us=200.0,
+            ),
+        },
+    ),
 }
 
 # Regex lines look like:

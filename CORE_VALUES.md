@@ -1,7 +1,7 @@
 # Lunatic Core Values & Design Principles
 
 **Last Updated**: October 6, 2025  
-**Performance Analysis**: See [docs/PERFORMANCE_ANALYSIS.md](docs/PERFORMANCE_ANALYSIS.md)  
+**Performance Analysis**: See [docs/benchmarks/PERFORMANCE_ANALYSIS.md](docs/benchmarks/PERFORMANCE_ANALYSIS.md)  
 **Current Compliance Status**: See [docs/core_values/status.md](docs/core_values/status.md)
 
 ## Executive Summary
