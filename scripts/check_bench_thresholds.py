@@ -55,6 +55,15 @@ BENCHES: Dict[str, BenchConfig] = {
             ),
         },
     ),
+    "distributed_latency": BenchConfig(
+        cli_args=("--sample-size", "20"),
+        targets={
+            "control_lookup_nodes": BenchTarget(
+                threshold_us=30_000.0,
+                warn_us=15_000.0,
+            ),
+        },
+    ),
 }
 
 # Regex lines look like:

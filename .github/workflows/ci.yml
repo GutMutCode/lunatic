@@ -64,6 +64,7 @@ jobs:
           cargo bench --bench instance_pool --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
           cargo bench --bench messaging --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
           cargo bench --bench distributed_messaging --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
+          cargo bench --bench distributed_latency --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           cat benchmark_output.txt >> $GITHUB_STEP_SUMMARY

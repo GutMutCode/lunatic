@@ -29,7 +29,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `InstancePool` reports hit/miss counters (`stats()` and `lunatic.instance_pool.*` metrics) and the `instance_pool_hit_rate` Criterion bench runs in CI to guard pooled spawn latency (`crates/lunatic-process/src/instance_pool.rs:71`, `.github/workflows/ci.yml:63`).
 - Evidence: Messaging round-trip benches execute in CI to monitor mailbox latency (`benches/messaging.rs:1`, `.github/workflows/ci.yml:64`).
 - Evidence: Distributed encode/decode costs are tracked via the new Criterion suite (`benches/distributed_messaging.rs:1`, `scripts/check_bench_thresholds.py:45`).
-- Gap: extend coverage from serialization costs to end-to-end multi-node latency measurements.
+- Evidence: Control-plane node lookup latency is captured to baseline cross-node registration calls (`benches/distributed_latency.rs:1`, `scripts/check_bench_thresholds.py:52`).
+- Gap: expand coverage from control-plane requests to full QUIC messaging round-trips across nodes.
 
 ### Robust
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
