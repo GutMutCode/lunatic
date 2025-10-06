@@ -1,6 +1,7 @@
 pub mod config;
 pub mod env;
 pub mod hot_reload;
+pub mod instance_pool;
 pub mod mailbox;
 pub mod message;
 pub mod module_registry;
@@ -44,48 +45,57 @@ where
 {
     log::info!(
         "Starting hot reload: module_id={}, {} -> {}",
-        module_id, old_version, new_version
+        module_id,
+        old_version,
+        new_version
     );
 
-    let module_registry = env.get_module_registry()
+    let module_registry = env
+        .get_module_registry()
         .ok_or_else(|| anyhow!("ModuleRegistry not available in environment"))?;
-    
+
     let module_registry = module_registry
         .downcast::<module_registry::ModuleRegistry<S>>()
         .map_err(|_| anyhow!("Failed to downcast ModuleRegistry"))?;
-    
+
     let new_module = module_registry
         .get_version(module_id, new_version)
         .ok_or_else(|| anyhow!("Module version {} not found", new_version))?;
-    
+
     let old_module = module_registry
         .get_version(module_id, old_version)
         .ok_or_else(|| anyhow!("Old module version {} not found", old_version))?;
 
     // Validate signature compatibility
     log::info!("Validating module compatibility...");
-    let validation_errors = signature_validation::SignatureValidator::validate_compatibility(
-        &old_module,
-        &new_module,
-    )?;
-    
+    let validation_errors =
+        signature_validation::SignatureValidator::validate_compatibility(&old_module, &new_module)?;
+
     if !validation_errors.is_empty() {
         log::error!("Module incompatibility detected:");
         for error in &validation_errors {
             log::error!("  - {}", error);
         }
-        return Err(anyhow!("Module signature validation failed: {} incompatibilities found", validation_errors.len()));
+        return Err(anyhow!(
+            "Module signature validation failed: {} incompatibilities found",
+            validation_errors.len()
+        ));
     }
-    
+
     log::info!("Module signatures are compatible");
 
     let mut instance_guard = context.instance.write().await;
-    let mut old_instance = instance_guard.take()
+    let mut old_instance = instance_guard
+        .take()
         .ok_or_else(|| anyhow!("No instance available for hot reload"))?;
 
+    let mut resource_snapshot = None;
     let memory_snapshot = old_instance.snapshot_memory()?;
+    if let Some(resources) = old_instance.state().capture_resource_snapshot()? {
+        resource_snapshot = Some(resources);
+    }
     let mailbox_snapshot = old_instance.state().message_mailbox().snapshot();
-    
+
     log::info!(
         "Captured {} bytes of memory and {} messages",
         memory_snapshot.memory.len(),
@@ -95,16 +105,28 @@ where
     let runtime = old_instance.state().runtime().clone();
     let config = old_instance.state().config().clone();
     let new_state = old_instance.state().new_state(new_module.clone(), config)?;
-    
+
     let mut new_instance = runtime.instantiate(&new_module, new_state).await?;
-    
+
     new_instance.restore_memory(&memory_snapshot)?;
-    new_instance.state_mut().message_mailbox().restore(mailbox_snapshot);
-    
+    new_instance
+        .state_mut()
+        .message_mailbox()
+        .restore(mailbox_snapshot);
+
+    if let Some(resources) = resource_snapshot {
+        if let Err(err) = new_instance
+            .state_mut()
+            .restore_resource_snapshot(resources)
+        {
+            log::warn!("Failed to restore resources during hot reload: {}", err);
+        }
+    }
+
     log::info!("Hot reload completed successfully");
-    
+
     *instance_guard = Some(new_instance);
-    
+
     Ok(())
 }
 
@@ -125,7 +147,10 @@ impl<S: Send> ProcessContext<S> {
     }
 
     /// Swap the instance atomically for hot reload
-    pub async fn swap_instance(&self, new_instance: crate::runtimes::wasmtime::WasmtimeInstance<S>) -> Option<crate::runtimes::wasmtime::WasmtimeInstance<S>> {
+    pub async fn swap_instance(
+        &self,
+        new_instance: crate::runtimes::wasmtime::WasmtimeInstance<S>,
+    ) -> Option<crate::runtimes::wasmtime::WasmtimeInstance<S>> {
         let mut instance = self.instance.write().await;
         instance.replace(new_instance)
     }
@@ -284,8 +309,6 @@ pub fn describe_metrics() {
     );
 }
 
-
-
 #[derive(Clone, Debug)]
 pub struct NativeProcess {
     id: u64,
@@ -312,7 +335,14 @@ where
     };
     let fut = func(process.clone(), message_mailbox.clone());
     let signal_mailbox = Arc::new(Mutex::new(signal_mailbox));
-    let join = tokio::task::spawn(new(fut, id, env.clone(), signal_mailbox, message_mailbox, None));
+    let join = tokio::task::spawn(new(
+        fut,
+        id,
+        env.clone(),
+        signal_mailbox,
+        message_mailbox,
+        None,
+    ));
     (join, process)
 }
 
@@ -661,9 +691,6 @@ where
             Err(anyhow!("Process killed"))
         }
     };
-
-    // TODO: Implement full hot reload logic
-    // For Phase 4 MVP, pending reloads are logged but not executed
 
     // Notify all monitors that this process died
     for monitor in monitors.values() {

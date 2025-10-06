@@ -1,18 +1,21 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
 use hash_map_id::HashMapId;
 use lunatic_distributed::{DistributedCtx, DistributedProcessState};
 use lunatic_error_api::{ErrorCtx, ErrorResource};
-use lunatic_networking_api::{DnsIterator, TlsConnection, TlsListener};
-use lunatic_networking_api::{NetworkingCtx, TcpConnection};
+use lunatic_networking_api::{
+    DnsIterator, NetworkingCtx, TcpConnection, TlsConnection, TlsListener,
+};
 use lunatic_process::env::{Environment, LunaticEnvironment};
 use lunatic_process::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use lunatic_process::state::{ConfigResources, ProcessState};
 use lunatic_process::{
     config::ProcessConfig,
+    resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot},
     state::{SignalReceiver, SignalSender},
 };
 use lunatic_process::{mailbox::MessageMailbox, message::Message};
@@ -22,12 +25,14 @@ use lunatic_stdout_capture::StdoutCapture;
 use lunatic_timer_api::{TimerCtx, TimerResources};
 use lunatic_wasi_api::{build_wasi, LunaticWasiCtx};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::runtime::Handle;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::{Mutex, RwLock};
 use wasmtime::{Linker, ResourceLimiter};
 use wasmtime_wasi::WasiCtx;
 
 use crate::DefaultProcessConfig;
+use log::warn;
 
 #[derive(Debug, Default)]
 pub struct DbResources {
@@ -84,7 +89,10 @@ pub struct DefaultProcessState {
 impl DefaultProcessState {
     pub fn can_open_file_descriptor(&mut self) -> anyhow::Result<()> {
         if self.resource_stats.open_file_descriptors >= self.config.get_max_file_descriptors() {
-            anyhow::bail!("Max file descriptors ({}) reached", self.config.get_max_file_descriptors());
+            anyhow::bail!(
+                "Max file descriptors ({}) reached",
+                self.config.get_max_file_descriptors()
+            );
         }
         self.resource_stats.open_file_descriptors += 1;
         Ok(())
@@ -97,8 +105,12 @@ impl DefaultProcessState {
     }
 
     pub fn can_open_network_connection(&mut self) -> anyhow::Result<()> {
-        if self.resource_stats.open_network_connections >= self.config.get_max_network_connections() {
-            anyhow::bail!("Max network connections ({}) reached", self.config.get_max_network_connections());
+        if self.resource_stats.open_network_connections >= self.config.get_max_network_connections()
+        {
+            anyhow::bail!(
+                "Max network connections ({}) reached",
+                self.config.get_max_network_connections()
+            );
         }
         self.resource_stats.open_network_connections += 1;
         Ok(())
@@ -246,6 +258,220 @@ impl ProcessState for DefaultProcessState {
 
     fn registry(&self) -> &Arc<RwLock<HashMap<String, (u64, u64)>>> {
         &self.registry
+    }
+
+    fn capture_resource_snapshot(&self) -> Result<Option<ResourceMigrationSnapshot>> {
+        let mut snapshot = ResourceMigrationSnapshot::new();
+
+        for (id, listener) in self.resources.tcp_listeners.iter() {
+            match listener.local_addr() {
+                Ok(addr) => snapshot.add_tcp_listener(
+                    *id,
+                    ResourceSnapshot::TcpListener {
+                        local_addr: addr.to_string(),
+                    },
+                ),
+                Err(err) => snapshot.add_tcp_listener(
+                    *id,
+                    ResourceSnapshot::NonMigratable {
+                        resource_type: "tcp_listener".into(),
+                        reason: format!("local_addr_failed: {err}"),
+                    },
+                ),
+            }
+        }
+
+        for (id, stream) in self.resources.tcp_streams.iter() {
+            let reason = match stream.peer_addr() {
+                Some(addr) => format!("active peer {addr}"),
+                None => "untracked peer address".into(),
+            };
+            snapshot.add_tcp_stream(
+                *id,
+                ResourceSnapshot::NonMigratable {
+                    resource_type: "tcp_stream".into(),
+                    reason,
+                },
+            );
+        }
+
+        for (id, listener) in self.resources.tls_listeners.iter() {
+            match listener.listener.local_addr() {
+                Ok(addr) => snapshot.add_tls_listener(
+                    *id,
+                    ResourceSnapshot::TlsListener {
+                        local_addr: addr.to_string(),
+                    },
+                ),
+                Err(err) => snapshot.add_tls_listener(
+                    *id,
+                    ResourceSnapshot::NonMigratable {
+                        resource_type: "tls_listener".into(),
+                        reason: format!("local_addr_failed: {err}"),
+                    },
+                ),
+            }
+        }
+
+        for (id, _) in self.resources.tls_streams.iter() {
+            snapshot.add_tls_stream(
+                *id,
+                ResourceSnapshot::NonMigratable {
+                    resource_type: "tls_stream".into(),
+                    reason: "migration not implemented".into(),
+                },
+            );
+        }
+
+        for (id, socket) in self.resources.udp_sockets.iter() {
+            match socket.local_addr() {
+                Ok(addr) => snapshot.add_udp_socket(
+                    *id,
+                    ResourceSnapshot::UdpSocket {
+                        local_addr: addr.to_string(),
+                    },
+                ),
+                Err(err) => snapshot.add_udp_socket(
+                    *id,
+                    ResourceSnapshot::NonMigratable {
+                        resource_type: "udp_socket".into(),
+                        reason: format!("local_addr_failed: {err}"),
+                    },
+                ),
+            }
+        }
+
+        if snapshot.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(snapshot))
+        }
+    }
+
+    fn restore_resource_snapshot(&mut self, snapshot: ResourceMigrationSnapshot) -> Result<()> {
+        if snapshot.is_empty() {
+            return Ok(());
+        }
+
+        let handle = match Handle::try_current() {
+            Ok(handle) => handle,
+            Err(_) => {
+                warn!("Skipping resource restoration: no active Tokio runtime available");
+                return Ok(());
+            }
+        };
+
+        let ResourceMigrationSnapshot {
+            tcp_listeners,
+            tcp_streams,
+            tls_listeners,
+            tls_streams,
+            udp_sockets,
+        } = snapshot;
+
+        let mut restored = 0usize;
+
+        for (_id, entry) in tcp_listeners.into_iter() {
+            match entry {
+                ResourceSnapshot::TcpListener { local_addr } => {
+                    match local_addr.parse::<SocketAddr>() {
+                        Ok(addr) => match self.can_open_network_connection() {
+                            Ok(()) => match handle.block_on(TcpListener::bind(addr)) {
+                                Ok(listener) => {
+                                    self.resources.tcp_listeners.add(listener);
+                                    restored += 1;
+                                }
+                                Err(err) => {
+                                    self.close_network_connection();
+                                    warn!(
+                                        "Failed to rebind TCP listener at {} during hot reload: {}",
+                                        local_addr, err
+                                    );
+                                }
+                            },
+                            Err(err) => warn!(
+                                "Cannot reopen TCP listener {} due to connection limits: {}",
+                                local_addr, err
+                            ),
+                        },
+                        Err(err) => warn!(
+                            "Invalid TCP listener address '{}' in snapshot: {}",
+                            local_addr, err
+                        ),
+                    }
+                }
+                other => warn!(
+                    "Unexpected snapshot entry for TCP listener ignored: {:?}",
+                    other
+                ),
+            }
+        }
+
+        for (_id, entry) in udp_sockets.into_iter() {
+            match entry {
+                ResourceSnapshot::UdpSocket { local_addr } => {
+                    match local_addr.parse::<SocketAddr>() {
+                        Ok(addr) => match self.can_open_network_connection() {
+                            Ok(()) => match handle.block_on(UdpSocket::bind(addr)) {
+                                Ok(socket) => {
+                                    self.resources.udp_sockets.add(Arc::new(socket));
+                                    restored += 1;
+                                }
+                                Err(err) => {
+                                    self.close_network_connection();
+                                    warn!(
+                                        "Failed to rebind UDP socket at {} during hot reload: {}",
+                                        local_addr, err
+                                    );
+                                }
+                            },
+                            Err(err) => warn!(
+                                "Cannot reopen UDP socket {} due to connection limits: {}",
+                                local_addr, err
+                            ),
+                        },
+                        Err(err) => warn!(
+                            "Invalid UDP socket address '{}' in snapshot: {}",
+                            local_addr, err
+                        ),
+                    }
+                }
+                other => warn!(
+                    "Unexpected snapshot entry for UDP socket ignored: {:?}",
+                    other
+                ),
+            }
+        }
+
+        if !tcp_streams.is_empty() {
+            warn!(
+                "{} TCP stream(s) skipped during hot reload; active connections are not yet migratable",
+                tcp_streams.len()
+            );
+        }
+
+        if !tls_listeners.is_empty() {
+            warn!(
+                "{} TLS listener(s) skipped during hot reload; certificate reprovisioning not implemented",
+                tls_listeners.len()
+            );
+        }
+
+        if !tls_streams.is_empty() {
+            warn!(
+                "{} TLS stream(s) skipped during hot reload; active TLS sessions cannot be migrated",
+                tls_streams.len()
+            );
+        }
+
+        if restored > 0 {
+            log::info!(
+                "Restored {} network listener(s) from hot reload snapshot",
+                restored
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -529,7 +755,7 @@ mod tests {
         use tokio::sync::RwLock;
 
         use crate::state::DefaultProcessState;
-use crate::DefaultProcessConfig;
+        use crate::DefaultProcessConfig;
         use lunatic_process::env::Environment;
         use lunatic_process::runtimes::wasmtime::WasmtimeRuntime;
         use lunatic_process::wasm::spawn_wasm;
@@ -569,11 +795,11 @@ impl lunatic_process::reloadable_state::ReloadableState for DefaultProcessState 
     fn serialize_state(&self) -> anyhow::Result<Vec<u8>> {
         let snapshot = self.message_mailbox.snapshot();
         let message_count = snapshot.len() as u64;
-        
+
         let mut result = Vec::new();
         result.extend_from_slice(&self.id.to_le_bytes());
         result.extend_from_slice(&message_count.to_le_bytes());
-        
+
         Ok(result)
     }
 

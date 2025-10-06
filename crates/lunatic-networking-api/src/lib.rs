@@ -32,6 +32,8 @@ pub struct TcpConnection {
     pub read_timeout: Mutex<Option<Duration>>,
     pub write_timeout: Mutex<Option<Duration>>,
     pub peek_timeout: Mutex<Option<Duration>>,
+    pub peer_addr: Option<SocketAddr>,
+    pub local_addr: Option<SocketAddr>,
 }
 
 /// This encapsulates the TCP-level connection, some connection
@@ -69,6 +71,8 @@ impl TlsConnection {
 
 impl TcpConnection {
     pub fn new(stream: TcpStream) -> Self {
+        let peer_addr = stream.peer_addr().ok();
+        let local_addr = stream.local_addr().ok();
         let (read_half, write_half) = stream.into_split();
         TcpConnection {
             reader: Mutex::new(read_half),
@@ -76,7 +80,17 @@ impl TcpConnection {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             peek_timeout: Mutex::new(None),
+            peer_addr,
+            local_addr,
         }
+    }
+
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
     }
 }
 
@@ -100,11 +114,11 @@ pub trait NetworkingCtx {
     fn udp_resources_mut(&mut self) -> &mut UdpResources;
     fn dns_resources(&self) -> &DnsResources;
     fn dns_resources_mut(&mut self) -> &mut DnsResources;
-    
+
     fn can_open_network_connection(&mut self) -> Result<()> {
         Ok(())
     }
-    
+
     fn close_network_connection(&mut self) {}
 }
 

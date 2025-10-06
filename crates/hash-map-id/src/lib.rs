@@ -1,4 +1,8 @@
-use std::{any::type_name, collections::HashMap, fmt::Debug};
+use std::{
+    any::type_name,
+    collections::{hash_map::Iter, hash_map::IterMut, HashMap},
+    fmt::Debug,
+};
 
 /// HashMap wrapper with incremental ID (u64) assignment.
 pub struct HashMapId<T> {
@@ -34,6 +38,18 @@ where
 
     pub fn get(&self, id: u64) -> Option<&T> {
         self.store.get(&id)
+    }
+
+    pub fn iter(&self) -> Iter<'_, u64, T> {
+        self.store.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> IterMut<'_, u64, T> {
+        self.store.iter_mut()
+    }
+
+    pub fn len(&self) -> usize {
+        self.store.len()
     }
 }
 
