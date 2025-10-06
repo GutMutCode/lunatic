@@ -1968,6 +1968,7 @@ dependencies = [
  "lunatic-wasi-api",
  "metrics-exporter-prometheus",
  "notify",
+ "quinn",
  "regex",
  "reqwest",
  "rmp-serde",

@@ -1,7 +1,7 @@
 # Core Values Compliance Status
 
-Generated: 2025-10-06  
-Commit: 64c68a3666be29fa9f165a8701f714c07bf6cfee
+Generated: 2025-10-07  
+Commit: d5da4150f2d8c02597a73d02a23831e910c9c9ff (workspace)
 
 This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
 
@@ -9,11 +9,11 @@ This document supersedes ad-hoc phase reports and consolidates how the current c
 
 | Focus | Status | Highlights |
 | --- | --- | --- |
-| Fast | Partial | Global epoch preemption and hot-reload snapshots implemented, distributed encode/decode bench lands; cross-node latency still pending. |
+| Fast | Partial | Global epoch preemption and hot-reload snapshots implemented; distributed encode/decode and QUIC round-trip benches guard latency budgets. |
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
-| Security Through Isolation | Strong | Capability checks enforced; TCP/UDP listeners auto-restore on hot reload while TLS streams remain pending. |
+| Security Through Isolation | Strong | Capability checks enforced; network listeners auto-restore while TLS streams remain explicitly non-migratable until session resumption lands. |
 | Fault Tolerance & HA | Partial | Hot reload pipeline and supervisor signals work, but cross-node reload and rollback policies still speculative. |
 | Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
 | Erlang-Inspired | Partial | Links, monitors, registry, and hot reload mirror OTP ideas; distribution, tooling, and OTP-equivalent libraries lag. |
@@ -30,7 +30,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: Messaging round-trip benches execute in CI to monitor mailbox latency (`benches/messaging.rs:1`, `.github/workflows/ci.yml:64`).
 - Evidence: Distributed encode/decode costs are tracked via the new Criterion suite (`benches/distributed_messaging.rs:1`, `scripts/check_bench_thresholds.py:45`).
 - Evidence: Control-plane node lookup latency is captured to baseline cross-node registration calls (`benches/distributed_latency.rs:1`, `scripts/check_bench_thresholds.py:52`).
-- Gap: expand coverage from control-plane requests to full QUIC messaging round-trips across nodes.
+- Evidence: QUIC round-trip latency is now benchmarked via `distributed_quic_round_trip` to catch regressions in encrypted messaging (`benches/distributed_messaging.rs:166`, `scripts/check_bench_thresholds.py:56`).
+- ✅ ~~Gap: expand coverage from control-plane requests to full QUIC messaging round-trips across nodes.~~ **RESOLVED**: the QUIC echo harness exercises mTLS client/server streams to validate end-to-end latency.
 
 ### Robust
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
@@ -57,10 +58,10 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: networking host calls enforce per-process quotas before creating sockets (`crates/lunatic-networking-api/src/tcp.rs:192`).
 - Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
 - Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
-- Evidence: TLS listeners are now fully migratable with certificate/key preservation (`src/state.rs:431-464`). TLS streams are correctly marked as non-migratable due to cryptographic state.
+- Evidence: TLS listeners remain migratable with certificate/key preservation (`src/state.rs:381-464`), while TLS streams are explicitly marked non-migratable and documented in code to reflect missing session resumption support (`src/state.rs:320-358`).
 - Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:113`). Implementation documented in `docs/security/AUDIT_LOGGING.md`.
 - Evidence: **Comprehensive audit logging persistence guide** - Production-ready documentation covering OpenTelemetry, syslog, and container logging architectures with storage recommendations, compliance checklists, and alerting strategies (`docs/security/AUDIT_LOGGING_PERSISTENCE.md`).
-- Gap: TLS active streams remain non-migratable (expected behavior).
+- Gap: TLS active streams remain non-migratable until resumable session support lands.
 
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).

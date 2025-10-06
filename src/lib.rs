@@ -27,7 +27,17 @@ Wasm modules, checkout out the [lunatic crate](https://crates.io/crates/lunatic)
 
 ## WebAssembly module requirements
 
-TODO
+Lunatic expects guest modules to target the `wasm32-wasi` ABI and export their linear memory as
+`memory`. Public entry points (for example `main`, `init` or any function that will be spawned as a
+process) must use the C calling convention and be marked with `#[no_mangle]` so that Wasmtime can
+locate them. Runtime features are accessed through the host imports defined in
+`wat/all_imports.wat`; using the high-level `lunatic` crate automatically links the required
+`lunatic::*` namespaces.
+
+At runtime the module is spawned inside a sandboxed process configuration that defines resource
+limits (memory, table slots, file descriptors, network handles, fuel). Modules should therefore
+avoid relying on globals or ambient authority and communicate exclusively through the message API
+provided by Lunatic.
 */
 
 mod config;

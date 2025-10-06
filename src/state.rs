@@ -321,7 +321,9 @@ impl ProcessState for DefaultProcessState {
                 *id,
                 ResourceSnapshot::NonMigratable {
                     resource_type: "tls_stream".into(),
-                    reason: "migration not implemented".into(),
+                    reason:
+                        "hot reload capture is disabled until TLS session resumption is implemented"
+                            .into(),
                 },
             );
         }
@@ -351,6 +353,10 @@ impl ProcessState for DefaultProcessState {
         }
     }
 
+    /// Restore runtime resources captured during hot reload.
+    ///
+    /// TLS streams are intentionally skipped because the runtime cannot yet resurface the
+    /// negotiated session keys safely. This limitation is documented in `docs/core_values/status.md`.
     fn restore_resource_snapshot(&mut self, snapshot: ResourceMigrationSnapshot) -> Result<()> {
         if snapshot.is_empty() {
             return Ok(());

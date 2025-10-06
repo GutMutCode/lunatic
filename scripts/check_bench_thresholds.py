@@ -53,6 +53,10 @@ BENCHES: Dict[str, BenchConfig] = {
                 threshold_us=400.0,
                 warn_us=200.0,
             ),
+            "distributed_quic_round_trip": BenchTarget(
+                threshold_us=50_000.0,
+                warn_us=25_000.0,
+            ),
         },
     ),
     "distributed_latency": BenchConfig(
