@@ -3,8 +3,11 @@
   "version": "1.0.0",
   "description": "AssemblyScript examples for Lunatic runtime",
   "scripts": {
-    "asbuild": "asc assembly/counter.ts --target release --bindings esm --exportRuntime --optimize --outFile build/counter.wasm",
-    "build": "npm run asbuild"
+    "build:counter": "asc assembly/counter.ts --target release --bindings esm --exportRuntime --optimize --outFile build/counter.wasm",
+    "build:gen_server": "asc assembly/gen_server_example.ts --target release --bindings esm --exportRuntime --optimize --outFile build/gen_server_example.wasm",
+    "build:supervisor": "asc assembly/supervisor_example.ts --target release --bindings esm --exportRuntime --optimize --outFile build/supervisor_example.wasm",
+    "build": "npm run build:counter && npm run build:gen_server && npm run build:supervisor",
+    "test": "node test.js"
   },
   "devDependencies": {
     "assemblyscript": "^0.27.0"

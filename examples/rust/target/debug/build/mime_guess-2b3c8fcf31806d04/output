@@ -1,0 +1,1 @@
+cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/xxxx/devs/repos/lunatic/examples/rust/target/debug/build/mime_guess-2b3c8fcf31806d04/out/mime_types_generated.rs

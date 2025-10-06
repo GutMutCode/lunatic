@@ -16,3 +16,4 @@ lunatic-messaging-api = { path = "../lunatic-messaging-api" }
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 serde_json = "1.0"
+criterion = { version = "0.5", features = ["html_reports"] }

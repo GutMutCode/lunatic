@@ -2,23 +2,34 @@
 // This demonstrates OTP-style message passing using TypeScript classes
 
 // Message types for GenServer communication
-export class CounterRequest {
-  type: string;
-  value: i32;
-  reply: CounterResponse | null;
+export enum CounterRequestType {
+  Increment = 0,
+  Decrement = 1,
+  Get = 2,
+  Set = 3,
+}
 
-  constructor(type: string, value: i32 = 0, reply: CounterResponse | null = null) {
+export enum CounterResponseType {
+  Ok = 0,
+  Value = 1,
+  Error = 2,
+}
+
+export class CounterRequest {
+  type: CounterRequestType;
+  value: i32;
+
+  constructor(type: CounterRequestType, value: i32 = 0) {
     this.type = type;
     this.value = value;
-    this.reply = reply;
   }
 }
 
 export class CounterResponse {
-  type: string;
+  type: CounterResponseType;
   value: i32;
 
-  constructor(type: string, value: i32 = 0) {
+  constructor(type: CounterResponseType, value: i32 = 0) {
     this.type = type;
     this.value = value;
   }
@@ -31,32 +42,32 @@ export class CounterServer {
   // Handle synchronous calls (like GenServer.call)
   handleCall(request: CounterRequest): CounterResponse {
     switch (request.type) {
-      case "increment":
+      case CounterRequestType.Increment:
         this.count++;
-        return new CounterResponse("ok", this.count);
-      case "decrement":
+        return new CounterResponse(CounterResponseType.Ok, this.count);
+      case CounterRequestType.Decrement:
         this.count--;
-        return new CounterResponse("ok", this.count);
-      case "get":
-        return new CounterResponse("value", this.count);
-      case "set":
+        return new CounterResponse(CounterResponseType.Ok, this.count);
+      case CounterRequestType.Get:
+        return new CounterResponse(CounterResponseType.Value, this.count);
+      case CounterRequestType.Set:
         this.count = request.value;
-        return new CounterResponse("ok", this.count);
+        return new CounterResponse(CounterResponseType.Ok, this.count);
       default:
-        return new CounterResponse("error", 0);
+        return new CounterResponse(CounterResponseType.Error, 0);
     }
   }
 
   // Handle asynchronous casts (like GenServer.cast)
   handleCast(request: CounterRequest): void {
     switch (request.type) {
-      case "increment":
+      case CounterRequestType.Increment:
         this.count++;
         break;
-      case "decrement":
+      case CounterRequestType.Decrement:
         this.count--;
         break;
-      case "set":
+      case CounterRequestType.Set:
         this.count = request.value;
         break;
       // "get" cast is ignored (no response)
@@ -78,13 +89,13 @@ export class CounterHandle {
   }
 
   // Synchronous call (blocks until response)
-  call(requestType: string, value: i32 = 0): CounterResponse {
+  call(requestType: CounterRequestType, value: i32 = 0): CounterResponse {
     const request = new CounterRequest(requestType, value);
     return this.server.handleCall(request);
   }
 
   // Asynchronous cast (fire and forget)
-  cast(requestType: string, value: i32 = 0): void {
+  cast(requestType: CounterRequestType, value: i32 = 0): void {
     const request = new CounterRequest(requestType, value);
     this.server.handleCast(request);
   }
@@ -104,7 +115,7 @@ export function initCounterServer(): void {
 }
 
 // Synchronous call to global counter
-export function callCounter(requestType: string, value: i32 = 0): i32 {
+export function callCounter(requestType: CounterRequestType, value: i32 = 0): i32 {
   if (!globalCounter) {
     initCounterServer();
   }
@@ -113,7 +124,7 @@ export function callCounter(requestType: string, value: i32 = 0): i32 {
 }
 
 // Asynchronous cast to global counter
-export function castCounter(requestType: string, value: i32 = 0): void {
+export function castCounter(requestType: CounterRequestType, value: i32 = 0): void {
   if (!globalCounter) {
     initCounterServer();
   }
@@ -138,18 +149,18 @@ export function run_gen_server_example(): void {
   // Test synchronous calls
   console.log("Initial value: " + getCounterValue().toString());
 
-  callCounter("increment");
+  callCounter(CounterRequestType.Increment);
   console.log("After increment: " + getCounterValue().toString());
 
-  callCounter("set", 42);
+  callCounter(CounterRequestType.Set, 42);
   console.log("After set to 42: " + getCounterValue().toString());
 
-  callCounter("decrement");
+  callCounter(CounterRequestType.Decrement);
   console.log("After decrement: " + getCounterValue().toString());
 
   // Test asynchronous casts
-  castCounter("increment");
-  castCounter("increment");
+  castCounter(CounterRequestType.Increment);
+  castCounter(CounterRequestType.Increment);
   console.log("After 2 casts: " + getCounterValue().toString());
 
   console.log("AssemblyScript GenServer example completed successfully!");

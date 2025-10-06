@@ -37,30 +37,39 @@ impl GenServer for TestCounter {
         TestCounter { count: 0 }
     }
 
-    fn handle_call(&mut self, request: Self::Call) -> Self::CallReply {
+    fn handle_call(&mut self, request: Self::Call) -> anyhow::Result<Self::CallReply> {
         match request {
             CounterRequest::Increment => {
                 self.count += 1;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
             CounterRequest::Decrement => {
                 self.count -= 1;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
-            CounterRequest::Get => CounterResponse::Value(self.count),
+            CounterRequest::Get => Ok(CounterResponse::Value(self.count)),
             CounterRequest::Set(value) => {
                 self.count = value;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
         }
     }
 
-    fn handle_cast(&mut self, request: Self::Cast) {
+    fn handle_cast(&mut self, request: Self::Cast) -> anyhow::Result<()> {
         match request {
-            CounterRequest::Increment => self.count += 1,
-            CounterRequest::Decrement => self.count -= 1,
-            CounterRequest::Get => {} // Cast ignores response
-            CounterRequest::Set(value) => self.count = value,
+            CounterRequest::Increment => {
+                self.count += 1;
+                Ok(())
+            }
+            CounterRequest::Decrement => {
+                self.count -= 1;
+                Ok(())
+            }
+            CounterRequest::Get => Ok(()), // Cast ignores response
+            CounterRequest::Set(value) => {
+                self.count = value;
+                Ok(())
+            }
         }
     }
 }
@@ -73,11 +82,11 @@ fn test_gen_server_basic() {
     assert_eq!(counter.count, 0);
 
     // Test handle_call
-    let response = counter.handle_call(CounterRequest::Increment);
+    let response = counter.handle_call(CounterRequest::Increment).unwrap();
     assert!(matches!(response, CounterResponse::Ok));
     assert_eq!(counter.count, 1);
 
-    let response = counter.handle_call(CounterRequest::Get);
+    let response = counter.handle_call(CounterRequest::Get).unwrap();
     match response {
         CounterResponse::Value(v) => assert_eq!(v, 1),
         _ => panic!("Expected Value"),

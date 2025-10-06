@@ -311,6 +311,9 @@ impl Supervisor {
 
     /// Restart child and all children started after it
     fn restart_from_child(&mut self, failed_child_id: &str) -> Result<(), String> {
+        // Check restart intensity before proceeding
+        self.check_restart_intensity()?;
+
         // Find index of failed child
         let failed_index = self
             .spec
@@ -333,10 +336,35 @@ impl Supervisor {
         // Restart all children from failed_index onwards
         for child_id in &child_ids {
             self.start_child(child_id)?;
+            // Log restart event for each restarted child
+            self.log_restart_event(child_id);
         }
 
         Ok(())
     }
+
+    /// Log a restart event for audit purposes
+    fn log_restart_event(&mut self, child_id: &str) {
+        let event = RestartEvent {
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            child_id: child_id.to_string(),
+        };
+
+        self.restart_history.push(event.clone());
+
+        // Keep only recent history (last 100 events)
+        if self.restart_history.len() > 100 {
+            self.restart_history.remove(0);
+        }
+
+        // Log restart event
+        println!("SUPERVISOR: Child '{}' restarted at timestamp {}", child_id, event.timestamp);
+    }
+
+
 
     /// Stop a child process
     fn stop_child(&mut self, child_id: &str) -> Result<(), String> {

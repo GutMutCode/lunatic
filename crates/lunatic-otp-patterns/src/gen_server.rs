@@ -91,12 +91,12 @@ pub trait GenServer: Sized {
     /// Handle synchronous call
     ///
     /// Receives request, modifies state, returns reply to caller
-    fn handle_call(&mut self, request: Self::Call) -> Self::CallReply;
+    fn handle_call(&mut self, request: Self::Call) -> Result<Self::CallReply>;
 
     /// Handle asynchronous cast
     ///
     /// Receives request, modifies state, no reply sent
-    fn handle_cast(&mut self, request: Self::Cast);
+    fn handle_cast(&mut self, request: Self::Cast) -> Result<()>;
 
     /// Handle generic info message (optional)
     ///
@@ -257,20 +257,26 @@ mod tests {
             TestServer { value: 0 }
         }
 
-        fn handle_call(&mut self, request: Self::Call) -> Self::CallReply {
+        fn handle_call(&mut self, request: Self::Call) -> Result<Self::CallReply> {
             match request {
-                TestCall::Get => TestReply::Value(self.value),
+                TestCall::Get => Ok(TestReply::Value(self.value)),
                 TestCall::Set(v) => {
                     self.value = v;
-                    TestReply::Ok
+                    Ok(TestReply::Ok)
                 }
             }
         }
 
-        fn handle_cast(&mut self, request: Self::Cast) {
+        fn handle_cast(&mut self, request: Self::Cast) -> Result<()> {
             match request {
-                TestCast::Increment => self.value += 1,
-                TestCast::Decrement => self.value -= 1,
+                TestCast::Increment => {
+                    self.value += 1;
+                    Ok(())
+                }
+                TestCast::Decrement => {
+                    self.value -= 1;
+                    Ok(())
+                }
             }
         }
     }
@@ -281,21 +287,21 @@ mod tests {
         assert_eq!(server.value, 0);
 
         // Test call
-        let reply = server.handle_call(TestCall::Set(42));
+        let reply = server.handle_call(TestCall::Set(42)).unwrap();
         assert!(matches!(reply, TestReply::Ok));
         assert_eq!(server.value, 42);
 
-        let reply = server.handle_call(TestCall::Get);
+        let reply = server.handle_call(TestCall::Get).unwrap();
         match reply {
             TestReply::Value(v) => assert_eq!(v, 42),
             _ => panic!("Expected Value"),
         }
 
         // Test cast
-        server.handle_cast(TestCast::Increment);
+        server.handle_cast(TestCast::Increment).unwrap();
         assert_eq!(server.value, 43);
 
-        server.handle_cast(TestCast::Decrement);
+        server.handle_cast(TestCast::Decrement).unwrap();
         assert_eq!(server.value, 42);
     }
 
