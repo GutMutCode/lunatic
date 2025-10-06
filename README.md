@@ -34,8 +34,13 @@ If you would like to see other languages supported or just follow the discussion
 ## Documentation
 
 - [**CORE_VALUES.md**](CORE_VALUES.md) - Design principles and Erlang inspiration
+- [**docs/core_values/status.md**](docs/core_values/status.md) - Up-to-date implementation compliance review
+- [**docs/security/AUDIT_LOGGING.md**](docs/security/AUDIT_LOGGING.md) - How to capture and route audit log events
 - [**HOT_RELOAD_ARCHITECTURE.md**](HOT_RELOAD_ARCHITECTURE.md) - Hot reload system design
 - [**docs/HOT_RELOAD_PREEMPTIVE.md**](docs/HOT_RELOAD_PREEMPTIVE.md) - Preemptive hot reload implementation
+- [**docs/PERFORMANCE_ANALYSIS.md**](docs/PERFORMANCE_ANALYSIS.md) - Performance metrics and analysis
+- [**docs/BENCHMARK_RESULTS.md**](docs/BENCHMARK_RESULTS.md) - Actual benchmark measurements
+- [**docs/BENCHMARK_SUITE.md**](docs/BENCHMARK_SUITE.md) - Complete benchmark suite guide
 
 ## Installation
 
