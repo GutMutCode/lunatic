@@ -254,7 +254,7 @@ impl DistributedRegistry {
     fn add_reverse_mapping(&self, global_pid: GlobalProcessId, name: ProcessName) {
         self.reverse
             .entry(global_pid)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(name);
     }
 

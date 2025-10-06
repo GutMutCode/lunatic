@@ -1,3 +1,5 @@
+pub type Trap = anyhow::Error;
+
 pub mod wire_format;
 
 #[cfg(not(target_arch = "wasm32"))]

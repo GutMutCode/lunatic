@@ -315,20 +315,3 @@ mod tests {
     }
 }
 
-impl Default for DefaultProcessConfig {
-    fn default() -> Self {
-        Self {
-            max_memory: u32::MAX as usize, // = 4 GB
-            max_fuel: None,
-            can_compile_modules: false,
-            can_create_configs: false,
-            can_spawn_processes: false,
-            preopened_dirs: vec![],
-            command_line_arguments: vec![],
-            environment_variables: vec![],
-            max_table_elements: 100_000,
-            max_file_descriptors: 1024,
-            max_network_connections: 1024,
-        }
-    }
-}
