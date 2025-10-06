@@ -36,6 +36,10 @@ impl WasmtimeRuntime {
         self.engine.clone()
     }
 
+    pub fn engine(&self) -> &wasmtime::Engine {
+        &self.engine
+    }
+
     /// Starts a single global epoch ticker for all processes in the runtime.
     /// This replaces the per-process epoch ticker approach to reduce overhead.
     fn start_global_epoch_ticker(engine: wasmtime::Engine) {
