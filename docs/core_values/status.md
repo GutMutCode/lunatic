@@ -12,7 +12,7 @@ This document supersedes ad-hoc phase reports and consolidates how the current c
 | Fast | Partial | Global epoch preemption and hot-reload snapshots implemented, but process spawn and messaging targets lack repeatable benchmarks. |
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
-| Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`, though examples skew toward WAT only. |
+| Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
 | Security Through Isolation | Strong | Capability checks enforced; TCP/UDP listeners auto-restore on hot reload while TLS streams remain pending. |
 | Fault Tolerance & HA | Partial | Hot reload pipeline and supervisor signals work, but cross-node reload and rollback policies still speculative. |
 | Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
@@ -45,7 +45,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 ## 2. Language Independence via WebAssembly
 - Evidence: host registration for all subsystems lives behind traits and is language-neutral (`src/state.rs:195`).
 - Evidence: exhaustive host import list kept in sync at `wat/all_imports.wat`.
-- Gap: repo samples are only WAT; need non-Rust WASM guest examples to demonstrate ergonomics (`examples/`).
+- Evidence: **Comprehensive multi-language examples now available** - Rust, Go (TinyGo), and AssemblyScript (TypeScript) examples with full build systems, READMEs, and feature comparison guide (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
+- ✅ ~~Gap: repo samples are only WAT; need non-Rust WASM guest examples to demonstrate ergonomics~~ **RESOLVED**: Complete examples for Rust, Go, and AssemblyScript with comprehensive documentation, feature matrix, migration guides, and troubleshooting.
 - Gap: no automated validation that `wat/all_imports.wat` matches linker exposure.
 
 ## 3. Security Through Isolation
@@ -88,7 +89,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
 2. ✅ ~~Extend resource migration to cover TLS streams~~ **COMPLETED**: TLS listeners now fully migratable with certificate/key preservation (`src/state.rs:431-464`, `tests/tls_resource_migration.rs`). TLS streams correctly marked as non-migratable due to cryptographic session state.
-3. Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations.
+3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
 5. Add structured audit logging for privileged host operations to close the remaining security gap.
 

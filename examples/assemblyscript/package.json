@@ -1,0 +1,12 @@
+{
+  "name": "lunatic-assemblyscript-example",
+  "version": "1.0.0",
+  "description": "AssemblyScript examples for Lunatic runtime",
+  "scripts": {
+    "asbuild": "asc assembly/counter.ts --target release --bindings esm --exportRuntime --optimize --outFile build/counter.wasm",
+    "build": "npm run asbuild"
+  },
+  "devDependencies": {
+    "assemblyscript": "^0.27.0"
+  }
+}

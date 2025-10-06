@@ -1,0 +1,21 @@
+[package]
+name = "lunatic-rust-examples"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "counter"
+path = "src/counter.rs"
+
+[[bin]]
+name = "echo_server"
+path = "src/echo_server.rs"
+
+[dependencies]
+# Note: lunatic crate would be used in production
+# For these examples, we demonstrate the concepts without requiring the full crate
+
+[profile.release]
+opt-level = "z"  # Optimize for size
+lto = true       # Enable Link Time Optimization
+strip = true     # Remove debug symbols
