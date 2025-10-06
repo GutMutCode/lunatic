@@ -85,7 +85,10 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: messaging, monitors, and process registry mirror OTP patterns (`crates/lunatic-process/src/lib.rs:559`).
 - Evidence: hot reload uses module versioning and memory snapshots similar to BEAM upgrades (`crates/lunatic-process/src/hot_reload.rs:397`).
 - Evidence: per-environment registry supports name-based lookup (`src/state.rs:190`).
-- Gap: no distributed OTP equivalents beyond `lunatic-distributed`, which lacks coverage.
+- Evidence: **GlobalProcessId provides location transparency** - node-aware process addressing with compact u128 encoding (`crates/lunatic-distributed/src/distributed/global_process_id.rs`).
+- Evidence: **DistributedRegistry implements Erlang-style process registration** - supports both local (node-scoped) and global (cluster-wide) name registration with reverse lookup (`crates/lunatic-distributed/src/distributed/registry.rs`).
+- Evidence: **Comprehensive registry test suite** - 14 tests validate registration, lookup, cleanup, and Erlang-style workflows (`crates/lunatic-distributed/tests/distributed_registry.rs`).
+- ✅ ~~Gap: no distributed OTP equivalents beyond `lunatic-distributed`, which lacks coverage~~ **PARTIALLY RESOLVED**: Global process registry infrastructure complete with location-transparent process IDs and dual-scope (local/global) name registration. Cross-node coordination for global names planned as next enhancement.
 - Gap: tooling (tracing, dashboards) referenced in `CORE_VALUES.md` not implemented.
 
 ## Validation and Test Coverage

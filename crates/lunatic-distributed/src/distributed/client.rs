@@ -19,6 +19,7 @@ use crate::{
     congestion::{self, node_connection_manager, MessageChunk, NodeConnectionManager},
     control,
     distributed::message::{Request, ResponseContent, Spawn},
+    distributed::registry::DistributedRegistry,
     quic,
 };
 
@@ -93,6 +94,8 @@ pub struct Inner {
     pub responses: DashMap<MessageId, Arc<IncomingResponse>>,
     pub response_tx: Sender<(MessageId, ResponseContent)>,
     pub has_messages: Arc<Notify>,
+    // Distributed process registry
+    pub registry: Arc<DistributedRegistry>,
 }
 
 impl Client {
@@ -111,11 +114,17 @@ impl Client {
                 responses: DashMap::new(),
                 response_tx: send,
                 has_messages: Arc::new(Notify::new()),
+                registry: Arc::new(DistributedRegistry::new(node_id)),
             }),
         };
         tokio::spawn(congestion::congestion_control_worker(client.clone()));
         tokio::spawn(process_responses(client.clone(), recv));
         client
+    }
+
+    /// Get a reference to the distributed process registry
+    pub fn registry(&self) -> &DistributedRegistry {
+        &self.inner.registry
     }
 
     fn next_message_id(&self) -> MessageId {
