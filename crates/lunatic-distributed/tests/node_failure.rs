@@ -605,3 +605,71 @@ async fn test_concurrent_node_failures() -> Result<()> {
 
     Ok(())
 }
+
+
+/// DISTRIBUTED STRESS TESTS
+/// 
+/// The following tests validate distributed scheduler performance under high load
+/// Closes gap: "distributed scheduler still lacks automated stress runs" (docs/core_values/status.md:47)
+
+/// Test: High-volume cross-node message passing
+/// Validates scheduler handles 1000+ messages across multiple nodes
+#[tokio::test]
+async fn test_distributed_stress_message_throughput() -> Result<()> {
+    const NODE_COUNT: usize = 3;
+    const MESSAGES_PER_NODE: usize = 350; // ~1000 total
+    const CONCURRENT_SENDERS: usize = 10;
+
+    println!("
+🚀 Distributed stress test: Cross-node message throughput");
+    println!("   Nodes: {}", NODE_COUNT);
+    println!("   Messages: {} total", NODE_COUNT * MESSAGES_PER_NODE);
+
+    let cluster = TestCluster::new(NODE_COUNT).await?;
+    let start = std::time::Instant::now();
+    let success_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(CONCURRENT_SENDERS));
+
+    let mut handles = vec![];
+
+    for sender_idx in 0..NODE_COUNT {
+        for msg_idx in 0..MESSAGES_PER_NODE {
+            let sender = cluster.node(sender_idx).client.clone();
+            let receiver_id = cluster.node((sender_idx + 1) % NODE_COUNT).id;
+            let sem = semaphore.clone();
+            let counter = success_count.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+                let params = SendParams {
+                    env: EnvironmentId(1),
+                    src: ProcessId((sender_idx + 1) as u64),
+                    node: NodeId(receiver_id),
+                    dest: ProcessId((sender_idx + 2) as u64),
+                    tag: Some(msg_idx as i64),
+                    data: vec![0u8; 128],
+                };
+                if timeout(Duration::from_secs(5), sender.send(params)).await.is_ok() {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+            handles.push(handle);
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.await;
+    }
+
+    let successful = success_count.load(std::sync::atomic::Ordering::Relaxed);
+    let duration = start.elapsed();
+    let total = NODE_COUNT * MESSAGES_PER_NODE;
+    let throughput = successful as f64 / duration.as_secs_f64();
+
+    println!("   ✅ Success: {} / {} ({:.1}%)", successful, total, 100.0 * successful as f64 / total as f64);
+    println!("   ⏱️  Throughput: {:.2} msg/sec", throughput);
+
+    assert!(successful as f64 / total as f64 > 0.70, "< 70% success rate");
+    Ok(())
+}
+

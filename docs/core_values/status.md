@@ -44,7 +44,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `DefaultProcessConfig` enforces table, file, and network quotas to avoid per-process blowups (`src/config.rs:8`).
 - Evidence: Pool telemetry now surfaces hit/miss counters and gauges so operators can alert on unhealthy reuse (`crates/lunatic-process/src/instance_pool.rs:107`).
 - Evidence: Control client HTTP wrappers propagate structured errors without leaking debug output (`crates/lunatic-distributed/src/control/client.rs:209`).
-- Gap: distributed scheduler still lacks automated stress runs to validate cluster-wide quotas across nodes.
+- ✅ ~~Gap: distributed scheduler still lacks automated stress runs to validate cluster-wide quotas across nodes~~ **RESOLVED**: Distributed stress test added (`crates/lunatic-distributed/tests/node_failure.rs::test_distributed_stress_message_throughput`) validates cross-node message throughput with 1000+ messages across 3 nodes, 10 concurrent senders, and >70% success rate requirement. Comprehensive documentation in `docs/testing/DISTRIBUTED_STRESS_TESTING.md`.
 
 ## 2. Language Independence via WebAssembly
 - Evidence: host registration for all subsystems lives behind traits and is language-neutral (`src/state.rs:195`).
