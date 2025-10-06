@@ -63,8 +63,9 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: module registry tracks versions and dependency reload order (`crates/lunatic-process/src/module_registry.rs:61`).
 - Evidence: **Rollback mechanism fully implemented** - atomic reload failures trigger automatic rollback to previous version (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`).
 - Evidence: rollback signals sent to successfully reloaded processes on atomic reload failure, maintaining system consistency.
+- Evidence: **Comprehensive distributed testing now in place** - Node failure scenarios, cross-node hot reload coordination, network partition handling, and rollback testing (`crates/lunatic-distributed/tests/node_failure.rs`, `crates/lunatic-distributed/tests/cross_node_hot_reload.rs`).
 - ✅ ~~Gap: inline comment still states "TODO: Implement full hot reload logic"~~ **RESOLVED**: Hot reload implementation is complete and TODO has been removed.
-- Gap: distributed crate lacks tests covering node failure, so high availability story ends at a single node.
+- ✅ ~~Gap: distributed crate lacks tests covering node failure, so high availability story ends at a single node~~ **RESOLVED**: Comprehensive test suite covering node crashes, network partitions, coordinated hot reload, atomic reload failures, and rollback scenarios across multi-node clusters.
 
 ## 5. Asynchronous by Default
 - Evidence: main loop biases handling signals before resuming guest future, preventing starvation (`crates/lunatic-process/src/lib.rs:507`).
