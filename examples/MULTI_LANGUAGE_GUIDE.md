@@ -152,6 +152,7 @@ export function increment(): i32 {
 | **Strings** | ✅ | ✅ | ✅ | ⚠️ Manual |
 | **Collections** | ✅ HashMap, Vec | ✅ map, slice | ✅ Array, Map | ❌ |
 | **Error Handling** | ✅ Result, Option | ✅ error | ⚠️ Limited | ❌ |
+| **OTP Patterns** | ✅ GenServer, Supervisor | ⚠️ Manual implementation | ⚠️ Manual implementation | ❌ |
 | **Hot Reload Compatible** | ✅ | ✅ | ✅ | ✅ |
 | **Process Spawning** | ✅ Full API | ⚠️ Manual bindings | ⚠️ Manual bindings | ⚠️ Manual bindings |
 | **Networking** | ✅ Full API | ⚠️ Manual bindings | ❌ | ❌ |
@@ -308,6 +309,157 @@ var counter int32 = 0
 ```typescript
 let counter: i32 = 0;
 ```
+
+---
+
+## OTP Patterns in Lunatic
+
+Lunatic implements Erlang/OTP-inspired patterns for building fault-tolerant, concurrent applications. While Rust has first-class support through the `lunatic-otp-patterns` crate, other languages can implement these patterns manually.
+
+### GenServer Pattern
+
+GenServer provides a generic server process that handles synchronous and asynchronous requests.
+
+**Rust (with lunatic-otp-patterns):**
+```rust
+use lunatic_otp_patterns::{GenServer, SupervisorSpec, RestartStrategy};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Counter {
+    count: i64,
+}
+
+impl GenServer for Counter {
+    type State = Self;
+    type Call = CounterRequest;
+    type CallReply = CounterResponse;
+    type Cast = CounterRequest;
+
+    fn init() -> Self::State {
+        Counter { count: 0 }
+    }
+
+    fn handle_call(&mut self, request: Self::Call) -> Self::CallReply {
+        match request {
+            CounterRequest::Increment => {
+                self.count += 1;
+                CounterResponse::Ok
+            }
+            CounterRequest::Get => CounterResponse::Value(self.count),
+            // ... other handlers
+        }
+    }
+}
+```
+
+**Go (manual implementation):**
+```go
+type CounterServer struct {
+    count int
+}
+
+func (c *CounterServer) handleCall(request CounterRequest) CounterResponse {
+    switch request.Type {
+    case "increment":
+        c.count++
+        return CounterResponse{Type: "ok", Value: c.count}
+    case "get":
+        return CounterResponse{Type: "value", Value: c.count}
+    }
+    return CounterResponse{Type: "error", Value: 0}
+}
+```
+
+**AssemblyScript (manual implementation):**
+```typescript
+export class CounterServer {
+    private count: i32 = 0;
+
+    handleCall(request: CounterRequest): CounterResponse {
+        switch (request.type) {
+            case "increment":
+                this.count++;
+                return new CounterResponse("ok", this.count);
+            case "get":
+                return new CounterResponse("value", this.count);
+        }
+        return new CounterResponse("error", 0);
+    }
+}
+```
+
+### Supervisor Pattern
+
+Supervisors manage child processes with configurable restart strategies.
+
+**Rust (with lunatic-otp-patterns):**
+```rust
+let spec = SupervisorSpec {
+    strategy: RestartStrategy::OneForOne,
+    max_restarts: 3,
+    max_seconds: 5,
+    children: vec![
+        ChildSpec {
+            id: "worker1".to_string(),
+            start: WorkerModule::start,
+            restart: RestartPolicy::Permanent,
+            shutdown: ShutdownPolicy::Timeout(5000),
+        },
+    ],
+};
+
+let supervisor = Supervisor::start(spec)?;
+```
+
+**Go (manual implementation):**
+```go
+type SupervisorSpec struct {
+    Strategy     RestartStrategy
+    MaxRestarts  int
+    MaxSeconds   int
+    Children     []ChildSpec
+}
+
+type Supervisor struct {
+    spec         SupervisorSpec
+    children     map[string]*WorkerHandle
+    restartCount int
+    lastRestart  time.Time
+}
+```
+
+**AssemblyScript (manual implementation):**
+```typescript
+export class SupervisorSpec {
+    strategy: RestartStrategy;
+    maxRestarts: i32;
+    maxSeconds: i32;
+    children: ChildSpec[];
+}
+
+export class Supervisor {
+    private spec: SupervisorSpec;
+    private children: Map<string, WorkerHandle>;
+
+    handleChildExit(childID: string, reason: string): boolean {
+        // Implement restart logic based on strategy
+        return true;
+    }
+}
+```
+
+### When to Use OTP Patterns
+
+- **Use GenServer** for stateful processes that need to handle requests
+- **Use Supervisor** for managing groups of related processes
+- **Use both together** for building fault-tolerant application architectures
+
+**Examples:**
+- [`rust/gen_server_example.rs`](../rust/src/gen_server_example.rs) - Rust GenServer
+- [`go/gen_server_example.go`](../go/gen_server_example.go) - Go GenServer
+- [`assemblyscript/gen_server_example.ts`](../assemblyscript/assembly/gen_server_example.ts) - AssemblyScript GenServer
+- [`go/supervisor_example.go`](../go/supervisor_example.go) - Go Supervisor
+- [`assemblyscript/supervisor_example.ts`](../assemblyscript/assembly/supervisor_example.ts) - AssemblyScript Supervisor
 
 ---
 

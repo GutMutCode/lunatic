@@ -406,16 +406,20 @@ impl Supervisor {
         let mut supervisors = 0;
         let mut workers = 0;
 
-        for (_, state) in &self.children {
+        // Count specs from the specification
+        for child_spec in &self.spec.children {
             specs += 1;
 
-            if state.process_id.is_some() {
-                active += 1;
-            }
-
-            match state.spec.child_type {
+            match child_spec.child_type {
                 ChildType::Supervisor => supervisors += 1,
                 ChildType::Worker => workers += 1,
+            }
+        }
+
+        // Count active processes from the children map
+        for (_, state) in &self.children {
+            if state.process_id.is_some() {
+                active += 1;
             }
         }
 
