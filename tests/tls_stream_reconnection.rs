@@ -275,3 +275,40 @@ async fn test_migration_snapshot_count() -> Result<()> {
 
     Ok(())
 }
+
+/// Helper to create a mock TLS client connection snapshot
+fn create_mock_tls_client_snapshot(
+    id: u64,
+    server_name: &str,
+    port: u16,
+    peer_addr: Option<&str>,
+    local_addr: Option<&str>,
+) -> (u64, ResourceSnapshot) {
+    (
+        id,
+        ResourceSnapshot::TlsClientConnection {
+            server_name: server_name.to_string(),
+            port,
+            peer_addr: peer_addr.map(|s| s.to_string()),
+            local_addr: local_addr.map(|s| s.to_string()),
+            custom_root_certs: vec![vec![0x30, 0x82, 0x01, 0x0a]], // Mock cert
+            read_timeout_ms: Some(10000),
+            write_timeout_ms: Some(5000),
+        },
+    )
+}
+
+/// Helper to create a mock TLS server connection snapshot
+fn create_mock_tls_server_snapshot(id: u64, graceful_shutdown: bool) -> (u64, ResourceSnapshot) {
+    (
+        id,
+        ResourceSnapshot::TlsServerConnection {
+            graceful_shutdown,
+            reason: if graceful_shutdown {
+                "Server-accepted TLS connections require client reconnection after hot reload".into()
+            } else {
+                "Non-graceful shutdown".into()
+            },
+        },
+    )
+}

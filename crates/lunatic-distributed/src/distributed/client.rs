@@ -9,6 +9,8 @@ use std::{
 use anyhow::{anyhow, Result};
 use async_cell::sync::AsyncCell;
 use bytes::Bytes;
+
+use crate::distributed::message;
 use dashmap::DashMap;
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -228,10 +230,8 @@ impl Client {
             tag: params.tag,
             data: params.data,
         };
-        let data = match rmp_serde::to_vec(&message) {
-            Ok(data) => data,
-            Err(_) => unreachable!("lunatic::distributed::client::send serialize_message"),
-        };
+        let data = message::serialize_message(&message)
+            .unwrap_or_else(|_| unreachable!("lunatic::distributed::client::send serialize_message"));
         self.new_message(
             params.env,
             params.src,
@@ -245,10 +245,8 @@ impl Client {
     // Send distributed spawn message
     pub async fn spawn(&self, params: SpawnParams) -> Result<MessageId> {
         let message = Request::Spawn(params.spawn);
-        let data = match rmp_serde::to_vec(&message) {
-            Ok(data) => data,
-            Err(_) => unreachable!("lunatic::distributed::client::spawn serialize_message"),
-        };
+        let data = message::serialize_message(&message)
+            .unwrap_or_else(|_| unreachable!("lunatic::distributed::client::spawn serialize_message"));
         let message_id = self
             .new_message(
                 params.env,
@@ -267,10 +265,8 @@ impl Client {
     // Send distributed response message
     pub async fn send_response(&self, params: ResponseParams) -> Result<MessageId> {
         let message = Request::Response(params.response);
-        let data = match rmp_serde::to_vec(&message) {
-            Ok(data) => data,
-            Err(_) => unreachable!("lunatic::distributed::client::spawn serialize_message"),
-        };
+        let data = message::serialize_message(&message)
+            .unwrap_or_else(|_| unreachable!("lunatic::distributed::client::send_response serialize_message"));
         self.new_message(
             EnvironmentId(0),
             ProcessId(0),

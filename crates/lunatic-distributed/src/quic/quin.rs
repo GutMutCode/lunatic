@@ -5,13 +5,14 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use lunatic_process::{env::Environment, state::ProcessState};
 use quinn::{ClientConfig, Connecting, Connection, ConnectionError, Endpoint, ServerConfig};
+
+use crate::distributed;
 use rustls::server::AllowAnyAuthenticatedClient;
 use rustls_pemfile::Item;
 use wasmtime::ResourceLimiter;
 use x509_parser::{der_parser::oid, oid_registry::asn1_rs::Utf8String, prelude::FromDer};
 
 use crate::{
-    distributed::{self},
     CertAttrs, DistributedCtx,
 };
 
@@ -247,7 +248,7 @@ async fn handle_quic_stream_node<T, E>(
     };
     log::trace!("distributed::server::handle_quic_stream started");
     while let Ok((msg_id, bytes)) = read_next_stream_message(&mut recv_ctx).await {
-        if let Ok(request) = rmp_serde::from_slice::<distributed::message::Request>(&bytes) {
+        if let Ok(request) = distributed::message::deserialize_message::<distributed::message::Request>(&bytes) {
             distributed::server::handle_message(
                 ctx.clone(),
                 msg_id,

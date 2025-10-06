@@ -99,3 +99,13 @@ pub fn pack_response(msg_id: u64, resp: Response) -> [Bytes; 2] {
     let bytes: Bytes = data.into();
     [size, bytes]
 }
+
+/// Serialize a message to bytes
+pub fn serialize_message<T: serde::Serialize>(message: &T) -> anyhow::Result<Vec<u8>> {
+    rmp_serde::to_vec(message).map_err(Into::into)
+}
+
+/// Deserialize a message from bytes
+pub fn deserialize_message<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> anyhow::Result<T> {
+    rmp_serde::from_slice(bytes).map_err(Into::into)
+}
