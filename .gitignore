@@ -6,3 +6,11 @@ debug.log
 notes-*.md
 publish.sh
 control_server.db
+
+# Examples build artifacts
+examples/assemblyscript/build/
+examples/assemblyscript/node_modules/
+examples/assemblyscript/package-lock.json
+examples/rust/Cargo.lock
+examples/rust/target/
+examples/go/*_example
