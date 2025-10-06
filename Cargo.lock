@@ -1214,6 +1214,7 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "pin-utils",
+ "slab",
 ]
 
 [[package]]
@@ -1863,6 +1864,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "dashmap",
+ "futures-util",
  "hash-map-id",
  "log",
  "lunatic-networking-api",

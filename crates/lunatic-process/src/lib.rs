@@ -12,10 +12,18 @@ pub mod signature_validation;
 pub mod state;
 pub mod wasm;
 
-use std::{collections::HashMap, fmt::Debug, future::Future, sync::Arc};
+use std::{
+    any::Any,
+    collections::HashMap,
+    fmt::Debug,
+    future::Future,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+};
 
 use anyhow::{anyhow, Result};
 use env::Environment;
+use futures_util::FutureExt;
 use log::{debug, log_enabled, trace, warn, Level};
 
 use smallvec::SmallVec;
@@ -433,6 +441,7 @@ pub enum ResultValue {
 pub enum Finished<R> {
     Normal(R),
     KillSignal,
+    Panicked(String),
 }
 
 /// Enum containing a process name if available, otherwise its ID.
@@ -505,6 +514,7 @@ where
     F: Future<Output = R> + Send + 'static,
 {
     trace!("Process {} spawned", id);
+    let fut = AssertUnwindSafe(fut).catch_unwind();
     tokio::pin!(fut);
 
     // If the value is set to false, instead of dying too the process will receive a message about
@@ -514,9 +524,8 @@ where
     let mut links = HashMap::new();
     // Processes monitoring this one
     let mut monitors = HashMap::new();
-    // TODO: Maybe wrapping this in some kind of `std::panic::catch_unwind` wold be a good idea,
-    //       to protect against panics in host function calls that unwind through Wasm code.
-    //       Currently a panic would just kill the task, but not notify linked processes.
+    // Panics inside host calls are captured by the `AssertUnwindSafe(...).catch_unwind()` wrapper
+    // above so we can still notify linked processes before the task unwinds.
     let mut signal_mailbox = signal_mailbox.lock().await;
     let mut has_sender = true;
     #[cfg(all(feature = "metrics", not(feature = "detailed_metrics")))]
@@ -697,8 +706,13 @@ where
                     }
                 }
             }
-            // Run process
-            output = &mut fut => { break Finished::Normal(output); }
+            // Run process (guarding against unwinding panics inside host calls)
+            output = &mut fut => {
+                match output {
+                    Ok(result) => break Finished::Normal(result),
+                    Err(payload) => break Finished::Panicked(format_panic_payload(payload)),
+                }
+            }
         }
     };
 
@@ -734,6 +748,11 @@ where
                 Ok(result.into_state())
             }
         }
+        Finished::Panicked(message) => {
+            warn!("Process {} panicked, notifying: {} links", id, links.len());
+
+            Err(anyhow!(format!("Process panicked: {message}")))
+        }
         Finished::KillSignal => {
             // TODO: We should return the state here too, but it's not possible with the current
             //       Wasmtime API. See: https://github.com/bytecodealliance/wasmtime/issues/2986
@@ -752,4 +771,14 @@ where
     }
 
     final_result
+}
+
+fn format_panic_payload(payload: Box<dyn Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "process panicked with non-string payload".to_string(),
+        },
+    }
 }

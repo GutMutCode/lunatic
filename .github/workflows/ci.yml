@@ -80,6 +80,10 @@ jobs:
           echo "⚠️ Performance regression detection coming soon" >> $GITHUB_STEP_SUMMARY
           echo "Compare benchmark_output.txt with baseline manually for now" >> $GITHUB_STEP_SUMMARY
 
+      - name: "Check benchmark thresholds"
+        if: runner.os == 'Linux'
+        run: ./scripts/check_bench_thresholds.py
+
       # Create a release:
       # - The next steps will only run if a tag was added during the push
       - name: Build project on Linux and Windows

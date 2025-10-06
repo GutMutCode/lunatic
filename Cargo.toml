@@ -86,7 +86,11 @@ wat = "1.0"
 
 [[bench]]
 harness = false
-name = "benchmark"
+name = "spawn"
+
+[[bench]]
+harness = false
+name = "messaging"
 
 [[bench]]
 harness = false
