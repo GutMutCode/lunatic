@@ -54,6 +54,30 @@ jobs:
         run: cargo fmt -- --check
       - name: "Run tests"
         run: cargo test --all
+      - name: "Run benchmarks (baseline check)"
+        if: runner.os == 'Linux'
+        run: |
+          cargo bench --bench benchmark --no-fail-fast -- --output-format bencher | tee benchmark_output.txt
+          cargo bench --bench mailbox --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
+          cargo bench --bench hot_reload --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
+          cargo bench --bench memory_profile --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
+          cargo bench --bench instance_pool --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat benchmark_output.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+      - name: "Upload benchmark results"
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v3
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmark_output.txt
+          retention-days: 30
+      - name: "Performance regression check"
+        if: runner.os == 'Linux' && github.event_name == 'pull_request'
+        run: |
+          echo "⚠️ Performance regression detection coming soon" >> $GITHUB_STEP_SUMMARY
+          echo "Compare benchmark_output.txt with baseline manually for now" >> $GITHUB_STEP_SUMMARY
 
       # Create a release:
       # - The next steps will only run if a tag was added during the push

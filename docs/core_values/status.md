@@ -26,8 +26,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: global epoch ticker plus async fuel ensure preemption even for tight guest loops (`crates/lunatic-process/src/runtimes/wasmtime.rs:27`).
 - Evidence: hot reload preserves memory and queues via `perform_pending_reload` (`crates/lunatic-process/src/lib.rs:475`).
 - Evidence: `MessageMailbox` async future prevents busy waiting and supports selective receive (`crates/lunatic-process/src/mailbox.rs:32`).
-- Evidence: `InstancePool` reports hit/miss counters (`stats()` and `lunatic.instance_pool.*` metrics) and the `instance_pool_hit_rate` Criterion bench measures pooled spawn latency under load (`crates/lunatic-process/src/instance_pool.rs:71`, `benches/instance_pool.rs:65`).
-- Gap: the new benches still run manually; integrate them into CI alongside messaging latency checks (`benches/hot_reload.rs`).
+ - Evidence: `InstancePool` reports hit/miss counters (`stats()` and `lunatic.instance_pool.*` metrics) and the `instance_pool_hit_rate` Criterion bench runs in CI to guard pooled spawn latency (`crates/lunatic-process/src/instance_pool.rs:71`, `.github/workflows/ci.yml:63`).
+- Gap: add dedicated messaging latency coverage to CI (current suite only checks spawn/hot-reload benches).
 
 ### Robust
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
