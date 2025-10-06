@@ -171,6 +171,15 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         }
     }
 
+    /// Get old state for a specific process
+    pub async fn get_old_state(&self, module_id: u64, process_id: u64) -> Option<Vec<u8>> {
+        let reloads = self.active_reloads.read().await;
+        reloads
+            .get(&module_id)
+            .and_then(|op| op.old_states.get(&process_id))
+            .cloned()
+    }
+
     /// Perform atomic reload - all processes reload or none do
     pub async fn perform_atomic_reload(
         &self,
@@ -220,14 +229,33 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
                     )
                     .await?;
 
-                    // TODO: Send rollback signals to successfully reloaded processes
-                    warn!(
-                        "Atomic reload failed - {} processes may be in inconsistent state",
+                    // Send rollback signals to successfully reloaded processes
+                    info!(
+                        "Attempting to rollback {} processes after atomic reload failure",
                         reloaded.len()
                     );
 
+                    for rollback_pid in &reloaded {
+                        match send_rollback_signal(
+                            *rollback_pid,
+                            module_id,
+                            old_version,
+                            env
+                        ) {
+                            Ok(_) => {
+                                info!("Sent rollback signal to process {}", rollback_pid);
+                            }
+                            Err(rollback_err) => {
+                                warn!(
+                                    "Failed to send rollback signal to process {}: {}",
+                                    rollback_pid, rollback_err
+                                );
+                            }
+                        }
+                    }
+
                     return Err(anyhow!(
-                        "Atomic reload failed at process {}: {}. {} processes already reloaded.",
+                        "Atomic reload failed at process {}: {}. Attempted rollback for {} processes.",
                         process_id,
                         e,
                         reloaded.len()
@@ -612,6 +640,31 @@ pub fn send_hot_reload_signal(
     } else {
         warn!(
             "Process {} not found, cannot send hot reload signal",
+            process_id
+        );
+        Err(anyhow!("Process {} not found", process_id))
+    }
+}
+
+pub fn send_rollback_signal(
+    process_id: u64,
+    module_id: u64,
+    target_version: u32,
+    env: &dyn crate::env::Environment,
+) -> Result<()> {
+    if let Some(process) = env.get_process(process_id) {
+        process.send(Signal::Rollback {
+            module_id,
+            target_version,
+        });
+        info!(
+            "Sent rollback signal to process {} for module {} version {}",
+            process_id, module_id, target_version
+        );
+        Ok(())
+    } else {
+        warn!(
+            "Process {} not found, cannot send rollback signal",
             process_id
         );
         Err(anyhow!("Process {} not found", process_id))

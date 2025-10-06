@@ -88,7 +88,7 @@ pub async fn handle_message<T, E>(
     msg: Request,
     node_permissions: Arc<NodeEnvPermission>,
 ) where
-    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + Sync + 'static,
+    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + Sync + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment + 'static,
 {
     if let Err(e) = handle_message_err(ctx, msg_id, msg, node_permissions).await {
@@ -103,7 +103,7 @@ async fn handle_message_err<T, E>(
     node_permissions: Arc<NodeEnvPermission>,
 ) -> Result<()>
 where
-    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + Sync + 'static,
+    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + Sync + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment + 'static,
 {
     let env_id = match &msg {
@@ -243,7 +243,7 @@ where
 
 async fn handle_spawn<T, E>(ctx: ServerCtx<T, E>, spawn: Spawn) -> Result<Result<u64, ClientError>>
 where
-    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + Sync + 'static,
+    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + Sync + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment + 'static,
 {
     let Spawn {
@@ -308,7 +308,7 @@ async fn handle_process_message<T, E>(
     data: Vec<u8>,
 ) -> std::result::Result<(), ClientError>
 where
-    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + 'static,
+    T: ProcessState + DistributedCtx<E> + ResourceLimiter + Send + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment,
 {
     let env = ctx.envs.get(environment_id).await;

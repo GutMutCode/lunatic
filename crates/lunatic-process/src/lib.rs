@@ -193,6 +193,12 @@ pub enum Signal {
     Kill,
     /// Hot reload signal
     HotReload { module_id: u64, new_version: u32 },
+    /// Rollback to previous version after failed reload
+    /// Note: Rollback is best-effort and may not preserve all state
+    Rollback {
+        module_id: u64,
+        target_version: u32,
+    },
 }
 
 /// Reason why a process died
@@ -321,7 +327,7 @@ pub fn spawn<T, F, K, R>(
     func: F,
 ) -> (JoinHandle<Result<T>>, NativeProcess)
 where
-    T: ProcessState + Send + Sync + wasmtime::ResourceLimiter + 'static,
+    T: ProcessState + Send + Sync + wasmtime::ResourceLimiter + crate::reloadable_state::ReloadableState + 'static,
     R: Into<ExecutionResult<T>> + Send + 'static,
     K: Future<Output = R> + Send + 'static,
     F: FnOnce(NativeProcess, MessageMailbox) -> K,
@@ -494,7 +500,7 @@ pub(crate) async fn new<F, S, R>(
     context: Option<ProcessContext<S>>,
 ) -> Result<S>
 where
-    S: ProcessState + Send + wasmtime::ResourceLimiter + 'static,
+    S: ProcessState + Send + wasmtime::ResourceLimiter + crate::reloadable_state::ReloadableState + 'static,
     R: Into<ExecutionResult<S>>,
     F: Future<Output = R> + Send + 'static,
 {
@@ -640,6 +646,49 @@ where
                             context.reload_in_progress.store(false, Ordering::SeqCst);
                         } else {
                             log::warn!("Hot reload signal received but no context available (native process?)");
+                        }
+                    }
+                    // Rollback signal - restore previous version
+                    Ok(Signal::Rollback { module_id, target_version }) => {
+                        if let Some(context) = &context {
+                            log::info!("Processing Rollback signal for module {} to version {}", module_id, target_version);
+
+                            // Check if reload already in progress
+                            if context.reload_in_progress.load(Ordering::SeqCst) {
+                                log::warn!("Reload in progress, deferring rollback");
+                                continue;
+                            }
+
+                            // Set reload flag
+                            context.reload_in_progress.store(true, Ordering::SeqCst);
+
+                            // Get current version to perform downgrade
+                            let current_version = {
+                                let pending = context.pending_reload.lock().unwrap();
+                                pending.map(|(_, v)| v).unwrap_or(target_version + 1)
+                            };
+
+                            // Perform rollback as a regular reload to previous version
+                            match perform_pending_reload(
+                                context,
+                                env.clone(),
+                                module_id,
+                                current_version,
+                                target_version,
+                            ).await {
+                                Ok(_) => {
+                                    log::info!("Rollback completed successfully for module {} to version {}", module_id, target_version);
+                                    context.clear_pending_reload();
+                                }
+                                Err(e) => {
+                                    log::error!("Rollback failed for module {}: {}", module_id, e);
+                                }
+                            }
+
+                            // Clear reload flag
+                            context.reload_in_progress.store(false, Ordering::SeqCst);
+                        } else {
+                            log::warn!("Rollback signal received but no context available (native process?)");
                         }
                     }
                     Err(_) => {

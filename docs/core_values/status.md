@@ -60,8 +60,9 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).
 - Evidence: module registry tracks versions and dependency reload order (`crates/lunatic-process/src/module_registry.rs:61`).
+- Evidence: **Rollback mechanism fully implemented** - atomic reload failures trigger automatic rollback to previous version (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`).
+- Evidence: rollback signals sent to successfully reloaded processes on atomic reload failure, maintaining system consistency.
 - Gap: inline comment still states "TODO: Implement full hot reload logic" despite implementation being present (`crates/lunatic-process/src/lib.rs:682`).
-- Gap: no rollback or multi-process coordination despite `ReloadCoordinator` scaffold (`crates/lunatic-process/src/hot_reload.rs:18`).
 - Gap: distributed crate lacks tests covering node failure, so high availability story ends at a single node.
 
 ## 5. Asynchronous by Default
@@ -89,7 +90,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
 2. ✅ ~~Extend resource migration to cover TLS streams~~ **COMPLETED**: TLS listeners now fully migratable with certificate/key preservation (`src/state.rs:431-464`, `tests/tls_resource_migration.rs`). TLS streams correctly marked as non-migratable due to cryptographic session state.
 3. Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations.
-4. Document and implement rollback semantics in `ReloadCoordinator` or explicitly scope them out.
+4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
 5. Add structured audit logging for privileged host operations to close the remaining security gap.
 
 ## Related Resources

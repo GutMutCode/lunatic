@@ -154,7 +154,7 @@ pub async fn handle_node_server<T, E>(
     ctx: distributed::server::ServerCtx<T, E>,
 ) -> Result<()>
 where
-    T: ProcessState + ResourceLimiter + DistributedCtx<E> + Send + Sync + 'static,
+    T: ProcessState + ResourceLimiter + DistributedCtx<E> + Send + Sync + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment + 'static,
 {
     while let Some(conn) = quic_server.accept().await {
@@ -181,7 +181,7 @@ async fn handle_quic_connection_node<T, E>(
     conn: Connecting,
 ) -> Result<()>
 where
-    T: ProcessState + ResourceLimiter + DistributedCtx<E> + Send + Sync + 'static,
+    T: ProcessState + ResourceLimiter + DistributedCtx<E> + Send + Sync + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment + 'static,
 {
     log::info!("New node connection");
@@ -220,7 +220,7 @@ async fn handle_quic_stream_node<T, E>(
     recv: quinn::RecvStream,
     node_permissions: Arc<NodeEnvPermission>,
 ) where
-    T: ProcessState + ResourceLimiter + DistributedCtx<E> + Send + Sync + 'static,
+    T: ProcessState + ResourceLimiter + DistributedCtx<E> + Send + Sync + lunatic_process::reloadable_state::ReloadableState + 'static,
     E: Environment + 'static,
 {
     let mut recv_ctx = RecvCtx {
