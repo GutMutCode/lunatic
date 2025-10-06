@@ -88,7 +88,9 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: **GlobalProcessId provides location transparency** - node-aware process addressing with compact u128 encoding (`crates/lunatic-distributed/src/distributed/global_process_id.rs`).
 - Evidence: **DistributedRegistry implements Erlang-style process registration** - supports both local (node-scoped) and global (cluster-wide) name registration with reverse lookup (`crates/lunatic-distributed/src/distributed/registry.rs`).
 - Evidence: **Comprehensive registry test suite** - 14 tests validate registration, lookup, cleanup, and Erlang-style workflows (`crates/lunatic-distributed/tests/distributed_registry.rs`).
-- ✅ ~~Gap: no distributed OTP equivalents beyond `lunatic-distributed`, which lacks coverage~~ **PARTIALLY RESOLVED**: Global process registry infrastructure complete with location-transparent process IDs and dual-scope (local/global) name registration. Cross-node coordination for global names planned as next enhancement.
+- Evidence: **RegistryCoordinator implements cross-node coordination** - majority-based consensus protocol for global name registration with conflict resolution and split-brain prevention (`crates/lunatic-distributed/src/distributed/registry_coordination.rs`).
+- Evidence: **Cross-node coordination test suite** - 16 tests (8 unit + 8 integration) validate majority consensus, conflict detection, node failure cleanup, and registry synchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- ✅ ~~Gap: no distributed OTP equivalents beyond `lunatic-distributed`, which lacks coverage~~ **RESOLVED**: Global process registry with full cross-node coordination. Implements majority-based consensus (prevents split-brain), conflict resolution (timestamp-based), node failure cleanup, and new node synchronization. Documentation in `docs/distributed/GLOBAL_REGISTRY_COORDINATION.md`.
 - Gap: tooling (tracing, dashboards) referenced in `CORE_VALUES.md` not implemented.
 
 ## Validation and Test Coverage

@@ -20,6 +20,7 @@ use crate::{
     control,
     distributed::message::{Request, ResponseContent, Spawn},
     distributed::registry::DistributedRegistry,
+    distributed::registry_coordination::RegistryCoordinator,
     quic,
 };
 
@@ -96,11 +97,16 @@ pub struct Inner {
     pub has_messages: Arc<Notify>,
     // Distributed process registry
     pub registry: Arc<DistributedRegistry>,
+    // Registry coordinator for cross-node coordination
+    pub coordinator: Arc<RegistryCoordinator>,
 }
 
 impl Client {
     pub fn new(node_id: u64, control_client: control::Client, node_client: quic::Client) -> Self {
         let (send, recv) = tokio::sync::mpsc::channel(1000);
+        let registry = Arc::new(DistributedRegistry::new(node_id));
+        let coordinator = Arc::new(RegistryCoordinator::new(registry.clone(), node_id));
+
         let client = Self {
             node_id: NodeId(node_id),
             inner: Arc::new(Inner {
@@ -114,7 +120,8 @@ impl Client {
                 responses: DashMap::new(),
                 response_tx: send,
                 has_messages: Arc::new(Notify::new()),
-                registry: Arc::new(DistributedRegistry::new(node_id)),
+                registry,
+                coordinator,
             }),
         };
         tokio::spawn(congestion::congestion_control_worker(client.clone()));
@@ -125,6 +132,11 @@ impl Client {
     /// Get a reference to the distributed process registry
     pub fn registry(&self) -> &DistributedRegistry {
         &self.inner.registry
+    }
+
+    /// Get a reference to the registry coordinator
+    pub fn coordinator(&self) -> &RegistryCoordinator {
+        &self.inner.coordinator
     }
 
     fn next_message_id(&self) -> MessageId {
