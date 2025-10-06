@@ -55,8 +55,9 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
 - Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
 - Evidence: TLS listeners are now fully migratable with certificate/key preservation (`src/state.rs:431-464`). TLS streams are correctly marked as non-migratable due to cryptographic state.
-- Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:80`). Guidance for routing is documented in `docs/security/AUDIT_LOGGING.md`.
-- Gap: TLS active streams remain non-migratable (expected behavior), and audit logging still needs persistence/aggregation guidance.
+- Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:113`). Implementation documented in `docs/security/AUDIT_LOGGING.md`.
+- Evidence: **Comprehensive audit logging persistence guide** - Production-ready documentation covering OpenTelemetry, syslog, and container logging architectures with storage recommendations, compliance checklists, and alerting strategies (`docs/security/AUDIT_LOGGING_PERSISTENCE.md`).
+- Gap: TLS active streams remain non-migratable (expected behavior).
 
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).
