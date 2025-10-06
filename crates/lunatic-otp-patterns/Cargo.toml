@@ -12,6 +12,7 @@ serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 lunatic-process-api = { path = "../lunatic-process-api" }
 lunatic-messaging-api = { path = "../lunatic-messaging-api" }
+tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

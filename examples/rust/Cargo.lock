@@ -1416,6 +1416,7 @@ dependencies = [
  "lunatic-messaging-api",
  "lunatic-process-api",
  "serde",
+ "tokio",
 ]
 
 [[package]]
