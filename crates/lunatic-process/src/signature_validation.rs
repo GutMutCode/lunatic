@@ -7,9 +7,19 @@ use crate::state::ProcessState;
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationError {
     MissingExport(String),
-    TypeMismatch { export: String, expected: String, got: String },
-    MemorySizeMismatch { expected: u64, got: u64 },
-    IncompatibleSignature { function: String, details: String },
+    TypeMismatch {
+        export: String,
+        expected: String,
+        got: String,
+    },
+    MemorySizeMismatch {
+        expected: u64,
+        got: u64,
+    },
+    IncompatibleSignature {
+        function: String,
+        details: String,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -18,11 +28,23 @@ impl std::fmt::Display for ValidationError {
             ValidationError::MissingExport(name) => {
                 write!(f, "Missing export: '{}'", name)
             }
-            ValidationError::TypeMismatch { export, expected, got } => {
-                write!(f, "Type mismatch for '{}': expected {}, got {}", export, expected, got)
+            ValidationError::TypeMismatch {
+                export,
+                expected,
+                got,
+            } => {
+                write!(
+                    f,
+                    "Type mismatch for '{}': expected {}, got {}",
+                    export, expected, got
+                )
             }
             ValidationError::MemorySizeMismatch { expected, got } => {
-                write!(f, "Memory size mismatch: expected {} pages, got {} pages", expected, got)
+                write!(
+                    f,
+                    "Memory size mismatch: expected {} pages, got {} pages",
+                    expected, got
+                )
             }
             ValidationError::IncompatibleSignature { function, details } => {
                 write!(f, "Incompatible signature for '{}': {}", function, details)
@@ -46,9 +68,9 @@ impl SignatureValidator {
 
         for old_export in &old_exports {
             let export_name = old_export.name();
-            
+
             let new_export = new_exports.iter().find(|e| e.name() == export_name);
-            
+
             if let Some(new_export) = new_export {
                 if let Err(err) = Self::validate_export_types(old_export, new_export) {
                     errors.push(err);

@@ -69,7 +69,17 @@ async fn instance_pool_reports_hit_rate() {
     pool.release(instance);
 
     let stats = pool.stats();
-    assert!(stats.hits >= 1, "expected at least one pool hit, stats={:?}", stats);
-    assert_eq!(stats.misses, 1, "exactly one miss expected for first acquire");
-    assert!(stats.pool_size >= 1, "instance should remain pooled after release");
+    assert!(
+        stats.hits >= 1,
+        "expected at least one pool hit, stats={:?}",
+        stats
+    );
+    assert_eq!(
+        stats.misses, 1,
+        "exactly one miss expected for first acquire"
+    );
+    assert!(
+        stats.pool_size >= 1,
+        "instance should remain pooled after release"
+    );
 }

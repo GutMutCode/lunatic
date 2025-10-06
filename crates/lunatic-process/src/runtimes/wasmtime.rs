@@ -1,5 +1,5 @@
-use std::{collections::HashMap, sync::Arc};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use wasmtime::ResourceLimiter;
@@ -23,12 +23,12 @@ pub struct WasmtimeRuntime {
 impl WasmtimeRuntime {
     pub fn new(config: &wasmtime::Config) -> Result<Self> {
         let engine = wasmtime::Engine::new(config)?;
-        
+
         // Start global epoch ticker once
         if !EPOCH_TICKER_STARTED.swap(true, Ordering::SeqCst) {
             Self::start_global_epoch_ticker(engine.clone());
         }
-        
+
         Ok(Self { engine })
     }
 
@@ -42,7 +42,7 @@ impl WasmtimeRuntime {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
             log::debug!("Global epoch ticker started (10ms interval)");
-            
+
             loop {
                 interval.tick().await;
                 // Increment epoch to trigger interruption points in all WASM instances
@@ -89,10 +89,10 @@ impl WasmtimeRuntime {
         };
         // Set epoch deadline for preemptive hot reload (every 1 epoch tick)
         store.set_epoch_deadline(1);
-        
+
         // Set epoch interruption callback to yield for hot reload checks
         store.epoch_deadline_async_yield_and_update(1);
-        
+
         // Create instance
         let instance = compiled_module
             .instantiator()
@@ -104,6 +104,7 @@ impl WasmtimeRuntime {
     }
 }
 
+#[derive(Clone)]
 pub struct MemorySnapshot {
     pub memory: Vec<u8>,
     pub stack_ptr: Option<u32>,
@@ -231,19 +232,21 @@ where
             .instance
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
-        
+
         let memory_data = memory.data(&self.store).to_vec();
-        
-        let stack_ptr = self.instance
+
+        let stack_ptr = self
+            .instance
             .get_global(&mut self.store, "__stack_pointer")
             .and_then(|g| g.get(&mut self.store).i32())
             .map(|v| v as u32);
-        
-        let heap_ptr = self.instance
+
+        let heap_ptr = self
+            .instance
             .get_global(&mut self.store, "__heap_base")
             .and_then(|g| g.get(&mut self.store).i32())
             .map(|v| v as u32);
-        
+
         Ok(MemorySnapshot {
             memory: memory_data,
             stack_ptr,
@@ -257,23 +260,23 @@ where
             .instance
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
-        
+
         let data = memory.data_mut(&mut self.store);
         let copy_len = snapshot.memory.len().min(data.len());
         data[..copy_len].copy_from_slice(&snapshot.memory[..copy_len]);
-        
+
         if let Some(stack_ptr) = snapshot.stack_ptr {
             if let Some(global) = self.instance.get_global(&mut self.store, "__stack_pointer") {
                 global.set(&mut self.store, wasmtime::Val::I32(stack_ptr as i32))?;
             }
         }
-        
+
         if let Some(heap_ptr) = snapshot.heap_ptr {
             if let Some(global) = self.instance.get_global(&mut self.store, "__heap_base") {
                 global.set(&mut self.store, wasmtime::Val::I32(heap_ptr as i32))?;
             }
         }
-        
+
         Ok(())
     }
 
@@ -295,18 +298,14 @@ pub fn default_config() -> wasmtime::Config {
     config
         .async_support(true)
         .debug_info(false)
-        // The behavior of fuel running out is defined on the Store
         .consume_fuel(true)
-        // Enable epoch interruption for preemptive hot reload
         .epoch_interruption(true)
         .wasm_reference_types(true)
         .wasm_bulk_memory(true)
         .wasm_multi_value(true)
         .wasm_multi_memory(true)
         .cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize)
-        // Allocate resources on demand because we can't predict how many process will exist
-        .allocation_strategy(wasmtime::InstanceAllocationStrategy::OnDemand)
-        // Always use static memories
+        .allocation_strategy(wasmtime::InstanceAllocationStrategy::pooling())
         .static_memory_forced(true);
     config
 }

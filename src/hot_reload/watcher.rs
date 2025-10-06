@@ -26,7 +26,8 @@ impl FileWatcher {
         let watched_path = path.clone();
 
         let tx = Arc::new(tx);
-        let last_event_times: Arc<Mutex<HashMap<PathBuf, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let last_event_times: Arc<Mutex<HashMap<PathBuf, Instant>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let debounce_duration = Duration::from_millis(300);
 
         let watcher = RecommendedWatcher::new(
@@ -35,18 +36,18 @@ impl FileWatcher {
                     if should_trigger_reload(&event) {
                         let mut last_times = last_event_times.lock().unwrap();
                         let now = Instant::now();
-                        
+
                         for path in &event.paths {
                             if path.extension().and_then(|s| s.to_str()) != Some("wasm") {
                                 continue;
                             }
-                            
+
                             if let Some(last_time) = last_times.get(path) {
                                 if now.duration_since(*last_time) < debounce_duration {
                                     continue;
                                 }
                             }
-                            
+
                             last_times.insert(path.clone(), now);
                             info!("File changed: {:?}", path);
                             let _ = tx.send(FileChangeEvent { path: path.clone() });

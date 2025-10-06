@@ -86,16 +86,21 @@ async fn run_with_watch(
     info!("Watching file: {:?}", args.path);
 
     let module_registry = Arc::new(ModuleRegistry::<DefaultProcessState>::new());
-    
+
     let initial_bytes = std::fs::read(&args.path)?;
     let initial_module = runtime.compile_module(initial_bytes.into())?;
     let module_id = 0u64;
     let _initial_version = module_registry.add_version(module_id, initial_module);
-    
+
     info!("Module registry initialized with version 0");
 
     drop(env);
-    let env = envs.create_with_registry(1, module_registry.clone() as Arc<dyn std::any::Any + Send + Sync>).await?;
+    let env = envs
+        .create_with_registry(
+            1,
+            module_registry.clone() as Arc<dyn std::any::Any + Send + Sync>,
+        )
+        .await?;
 
     let (tx, mut rx) = mpsc::unbounded_channel::<FileChangeEvent>();
     let mut watcher = FileWatcher::new(&args.path, tx)?;
@@ -143,7 +148,8 @@ async fn run_with_watch(
         Ok(handle)
     }
 
-    let handle = start_process(&runtime, &path, &wasm_args, &dir, envs.clone(), env.clone()).await?;
+    let handle =
+        start_process(&runtime, &path, &wasm_args, &dir, envs.clone(), env.clone()).await?;
     process_info = Some(ProcessInfo { handle, env_id: 1 });
     info!("Initial process started with hot reload support");
 
@@ -166,12 +172,12 @@ async fn run_with_watch(
                             Ok(new_module) => {
                                 let new_version = module_registry.add_version(module_id, new_module);
                                 info!("Compiled new module version: {}", new_version);
-                                
+
                                 env.send_to_all(Signal::HotReload {
                                     module_id,
                                     new_version,
                                 });
-                                
+
                                 println!("✅ Hot reload signal sent (version {})\n", new_version);
                                 info!("Hot reload completed successfully");
                             }
@@ -202,7 +208,7 @@ async fn run_with_watch(
                     Ok(Err(e)) => {
                         error!("Process error: {}", e);
                         info!("Restarting process...");
-                        
+
                         let new_handle = start_process(&runtime, &path, &wasm_args, &dir, envs.clone(), env.clone()).await?;
                         process_info = Some(ProcessInfo { handle: new_handle, env_id: 1 });
                         info!("Process restarted");

@@ -11,6 +11,7 @@ use wasmtime::Linker;
 use crate::{
     config::ProcessConfig,
     mailbox::MessageMailbox,
+    resource_migration::ResourceMigrationSnapshot,
     runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime},
     Signal,
 };
@@ -63,4 +64,12 @@ pub trait ProcessState: Sized {
 
     // Registry
     fn registry(&self) -> &Arc<RwLock<HashMap<String, (u64, u64)>>>;
+
+    fn capture_resource_snapshot(&self) -> Result<Option<ResourceMigrationSnapshot>> {
+        Ok(None)
+    }
+
+    fn restore_resource_snapshot(&mut self, _snapshot: ResourceMigrationSnapshot) -> Result<()> {
+        Ok(())
+    }
 }

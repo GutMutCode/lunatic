@@ -233,7 +233,8 @@ impl Client {
     }
 
     pub async fn notify_node_stopped(&self) -> Result<()> {
-        self.post(&self.inner.reg.urls.node_stopped, ()).await?;
+        self.post::<_, ()>(&self.inner.reg.urls.node_stopped, ())
+            .await?;
         Ok(())
     }
 

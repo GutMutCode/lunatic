@@ -18,7 +18,7 @@ pub trait Environment: Send + Sync {
     fn process_count(&self) -> usize;
     async fn can_spawn_next_process(&self) -> Result<Option<()>>;
     fn send(&self, id: u64, signal: Signal);
-    
+
     /// Send a signal to all processes in this environment
     fn send_to_all(&self, signal: Signal);
 
@@ -41,7 +41,11 @@ pub trait Environments: Send + Sync {
 
     async fn create(&self, id: u64) -> Result<Arc<Self::Env>>;
     async fn get(&self, id: u64) -> Option<Arc<Self::Env>>;
-    async fn create_with_registry(&self, id: u64, registry: Arc<dyn std::any::Any + Send + Sync>) -> Result<Arc<Self::Env>>;
+    async fn create_with_registry(
+        &self,
+        id: u64,
+        registry: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Arc<Self::Env>>;
 }
 
 #[derive(Clone)]
@@ -125,7 +129,7 @@ impl Environment for LunaticEnvironment {
             proc.send(signal);
         }
     }
-    
+
     fn send_to_all(&self, signal: Signal) {
         match signal {
             Signal::Kill => {
@@ -133,9 +137,15 @@ impl Environment for LunaticEnvironment {
                     entry.value().send(Signal::Kill);
                 }
             }
-            Signal::HotReload { module_id, new_version } => {
+            Signal::HotReload {
+                module_id,
+                new_version,
+            } => {
                 for entry in self.processes.iter() {
-                    entry.value().send(Signal::HotReload { module_id, new_version });
+                    entry.value().send(Signal::HotReload {
+                        module_id,
+                        new_version,
+                    });
                 }
             }
             Signal::DieWhenLinkDies(flag) => {
@@ -184,7 +194,11 @@ impl Environments for LunaticEnvironments {
         Ok(env)
     }
 
-    async fn create_with_registry(&self, id: u64, registry: Arc<dyn std::any::Any + Send + Sync>) -> Result<Arc<Self::Env>> {
+    async fn create_with_registry(
+        &self,
+        id: u64,
+        registry: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<Arc<Self::Env>> {
         let env = Arc::new(LunaticEnvironment::with_module_registry(id, registry));
         self.envs.insert(id, env.clone());
         #[cfg(feature = "metrics")]

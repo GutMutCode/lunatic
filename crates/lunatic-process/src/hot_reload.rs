@@ -7,7 +7,9 @@ use tokio::sync::RwLock;
 use crate::{
     module_registry::ModuleRegistry,
     resource_migration::ResourceMigrationSnapshot,
-    runtimes::wasmtime::{MemorySnapshot, WasmtimeCompiledModule, WasmtimeInstance, WasmtimeRuntime},
+    runtimes::wasmtime::{
+        MemorySnapshot, WasmtimeCompiledModule, WasmtimeInstance, WasmtimeRuntime,
+    },
     state::ProcessState,
     Signal,
 };
@@ -67,7 +69,10 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         let mut reloads = self.active_reloads.write().await;
 
         if reloads.contains_key(&module_id) {
-            return Err(anyhow!("Reload already in progress for module {}", module_id));
+            return Err(anyhow!(
+                "Reload already in progress for module {}",
+                module_id
+            ));
         }
 
         let operation = ReloadOperation {
@@ -81,7 +86,10 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         };
 
         reloads.insert(module_id, operation);
-        info!("Started coordinated reload for module {}: {} -> {}", module_id, old_version, new_version);
+        info!(
+            "Started coordinated reload for module {}: {} -> {}",
+            module_id, old_version, new_version
+        );
         Ok(())
     }
 
@@ -104,7 +112,10 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
 
         if let Some(operation) = reloads.get_mut(&module_id) {
             operation.status = ReloadStatus::Failed(error.clone());
-            warn!("Failed coordinated reload for module {}: {}", module_id, error);
+            warn!(
+                "Failed coordinated reload for module {}: {}",
+                module_id, error
+            );
             Ok(())
         } else {
             Err(anyhow!("No active reload found for module {}", module_id))
@@ -120,11 +131,18 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
     /// Get the processes affected by a reload
     pub async fn get_affected_processes(&self, module_id: u64) -> Option<Vec<u64>> {
         let reloads = self.active_reloads.read().await;
-        reloads.get(&module_id).map(|op| op.affected_processes.clone())
+        reloads
+            .get(&module_id)
+            .map(|op| op.affected_processes.clone())
     }
 
     /// Store old state for a process for potential rollback
-    pub async fn store_old_state(&self, module_id: u64, process_id: u64, state_bytes: Vec<u8>) -> Result<()> {
+    pub async fn store_old_state(
+        &self,
+        module_id: u64,
+        process_id: u64,
+        state_bytes: Vec<u8>,
+    ) -> Result<()> {
         let mut reloads = self.active_reloads.write().await;
 
         if let Some(operation) = reloads.get_mut(&module_id) {
@@ -163,11 +181,20 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         affected_processes: Vec<u64>,
     ) -> Result<()> {
         // Start the reload operation
-        self.start_reload(module_id, old_version, new_version, affected_processes.clone()).await?;
+        self.start_reload(
+            module_id,
+            old_version,
+            new_version,
+            affected_processes.clone(),
+        )
+        .await?;
 
         info!(
             "Starting atomic reload for module {}: {} -> {} ({} processes)",
-            module_id, old_version, new_version, affected_processes.len()
+            module_id,
+            old_version,
+            new_version,
+            affected_processes.len()
         );
 
         // Track successful reloads for potential rollback
@@ -181,17 +208,29 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
                     info!("Sent reload signal to process {}", process_id);
                 }
                 Err(e) => {
-                    warn!("Failed to send reload signal to process {}: {}", process_id, e);
+                    warn!(
+                        "Failed to send reload signal to process {}: {}",
+                        process_id, e
+                    );
 
                     // Atomic reload failed - attempt rollback
-                    self.fail_reload(module_id, format!("Failed to signal process {}: {}", process_id, e)).await?;
+                    self.fail_reload(
+                        module_id,
+                        format!("Failed to signal process {}: {}", process_id, e),
+                    )
+                    .await?;
 
                     // TODO: Send rollback signals to successfully reloaded processes
-                    warn!("Atomic reload failed - {} processes may be in inconsistent state", reloaded.len());
+                    warn!(
+                        "Atomic reload failed - {} processes may be in inconsistent state",
+                        reloaded.len()
+                    );
 
                     return Err(anyhow!(
                         "Atomic reload failed at process {}: {}. {} processes already reloaded.",
-                        process_id, e, reloaded.len()
+                        process_id,
+                        e,
+                        reloaded.len()
                     ));
                 }
             }
@@ -202,7 +241,10 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
 
         info!(
             "Completed atomic reload for module {}: {} -> {} ({} processes updated)",
-            module_id, old_version, new_version, reloaded.len()
+            module_id,
+            old_version,
+            new_version,
+            reloaded.len()
         );
         Ok(())
     }
@@ -265,13 +307,16 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
             );
 
             // Perform atomic reload for this module
-            match self.perform_atomic_reload(
-                env,
-                mid,
-                old_version.unwrap_or(0),
-                version_to_use,
-                affected_processes,
-            ).await {
+            match self
+                .perform_atomic_reload(
+                    env,
+                    mid,
+                    old_version.unwrap_or(0),
+                    version_to_use,
+                    affected_processes,
+                )
+                .await
+            {
                 Ok(_) => {
                     info!("Successfully reloaded module {}", mid);
                 }
@@ -339,10 +384,7 @@ impl<S: ProcessState + Send> HotReloadContext<S> {
 
     pub fn set_resource_snapshot(&mut self, snapshot: ResourceMigrationSnapshot) {
         if !snapshot.is_empty() {
-            info!(
-                "Captured {} resources for migration",
-                snapshot.count()
-            );
+            info!("Captured {} resources for migration", snapshot.count());
             self.resource_snapshot = Some(snapshot);
         }
     }
@@ -454,7 +496,10 @@ pub fn validate_reload_compatibility(
                 ));
             }
         } else {
-            info!("New import added: '{}::{}' - runtime must support it", module, name);
+            info!(
+                "New import added: '{}::{}' - runtime must support it",
+                module, name
+            );
         }
     }
 
@@ -470,17 +515,13 @@ fn get_export_signatures<S: ProcessState>(
 
     for export in module.module().exports() {
         let sig = match export.ty() {
-            wasmtime::ExternType::Func(func_ty) => {
-                ExportSignature::Func {
-                    params: func_ty.params().len(),
-                    results: func_ty.results().len(),
-                }
-            }
-            wasmtime::ExternType::Global(global_ty) => {
-                ExportSignature::Global {
-                    mutable: global_ty.mutability() == wasmtime::Mutability::Var,
-                }
-            }
+            wasmtime::ExternType::Func(func_ty) => ExportSignature::Func {
+                params: func_ty.params().len(),
+                results: func_ty.results().len(),
+            },
+            wasmtime::ExternType::Global(global_ty) => ExportSignature::Global {
+                mutable: global_ty.mutability() == wasmtime::Mutability::Var,
+            },
             wasmtime::ExternType::Memory(_) => ExportSignature::Memory,
             wasmtime::ExternType::Table(_) => ExportSignature::Table,
         };
@@ -498,25 +539,17 @@ fn get_import_signatures<S: ProcessState>(
 
     for import in module.module().imports() {
         let sig = match import.ty() {
-            wasmtime::ExternType::Func(func_ty) => {
-                ExportSignature::Func {
-                    params: func_ty.params().len(),
-                    results: func_ty.results().len(),
-                }
-            }
-            wasmtime::ExternType::Global(global_ty) => {
-                ExportSignature::Global {
-                    mutable: global_ty.mutability() == wasmtime::Mutability::Var,
-                }
-            }
+            wasmtime::ExternType::Func(func_ty) => ExportSignature::Func {
+                params: func_ty.params().len(),
+                results: func_ty.results().len(),
+            },
+            wasmtime::ExternType::Global(global_ty) => ExportSignature::Global {
+                mutable: global_ty.mutability() == wasmtime::Mutability::Var,
+            },
             wasmtime::ExternType::Memory(_) => ExportSignature::Memory,
             wasmtime::ExternType::Table(_) => ExportSignature::Table,
         };
-        imports.push((
-            import.module().to_string(),
-            import.name().to_string(),
-            sig,
-        ));
+        imports.push((import.module().to_string(), import.name().to_string(), sig));
     }
 
     imports
@@ -577,7 +610,10 @@ pub fn send_hot_reload_signal(
         );
         Ok(())
     } else {
-        warn!("Process {} not found, cannot send hot reload signal", process_id);
+        warn!(
+            "Process {} not found, cannot send hot reload signal",
+            process_id
+        );
         Err(anyhow!("Process {} not found", process_id))
     }
 }
@@ -687,9 +723,18 @@ mod tests {
         use super::ExportSignature;
 
         // Function signatures must match exactly
-        let func1 = ExportSignature::Func { params: 2, results: 1 };
-        let func2 = ExportSignature::Func { params: 2, results: 1 };
-        let func3 = ExportSignature::Func { params: 3, results: 1 };
+        let func1 = ExportSignature::Func {
+            params: 2,
+            results: 1,
+        };
+        let func2 = ExportSignature::Func {
+            params: 2,
+            results: 1,
+        };
+        let func3 = ExportSignature::Func {
+            params: 3,
+            results: 1,
+        };
 
         assert!(signatures_compatible(&func1, &func2));
         assert!(!signatures_compatible(&func1, &func3));
