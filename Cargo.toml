@@ -108,10 +108,6 @@ name = "memory_profile"
 harness = false
 name = "instance_pool"
 
-[[bench]]
-harness = false
-name = "messaging"
-
 [workspace]
 members = [
     "crates/hash-map-id",
