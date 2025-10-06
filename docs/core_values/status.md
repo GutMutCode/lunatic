@@ -34,7 +34,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
 - Evidence: per-process file and network caps tracked at runtime (`src/state.rs:84`).
 - Evidence: monitors and links propagate failure reason without crashing unrelated processes (`crates/lunatic-process/src/lib.rs:491`).
-- Gap: TODO note about missing `catch_unwind` means host panics can bypass supervisor notifications (`crates/lunatic-process/src/lib.rs:498`).
+- ✅ ~~Gap: TODO note about missing `catch_unwind` means host panics can bypass supervisor notifications (`crates/lunatic-process/src/lib.rs:498`)~~ **RESOLVED**: process runner wraps native futures in `AssertUnwindSafe(...).catch_unwind()` and reports panics before unwinding (`crates/lunatic-process/src/lib.rs:517-754`).
 
 ### Scalable
 - Evidence: environment registry uses `DashMap` and exposes broadcast APIs (`crates/lunatic-process/src/env.rs:66`).
@@ -47,7 +47,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: exhaustive host import list kept in sync at `wat/all_imports.wat`.
 - Evidence: **Comprehensive multi-language examples now available** - Rust, Go (TinyGo), and AssemblyScript (TypeScript) examples with full build systems, READMEs, and feature comparison guide (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 - ✅ ~~Gap: repo samples are only WAT; need non-Rust WASM guest examples to demonstrate ergonomics~~ **RESOLVED**: Complete examples for Rust, Go, and AssemblyScript with comprehensive documentation, feature matrix, migration guides, and troubleshooting.
-- Gap: no automated validation that `wat/all_imports.wat` matches linker exposure.
+- ✅ ~~Gap: no automated validation that `wat/all_imports.wat` matches linker exposure~~ **RESOLVED**: `tests/imports_match.rs` validates host registrations against the curated `wat/all_imports.wat` list each run.
 
 ## 3. Security Through Isolation
 - Evidence: capability checks guard spawn, compile, and config creation (`crates/lunatic-process-api/src/lib.rs:563`).
