@@ -240,8 +240,9 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Dynamic children management
 
 **Lunatic Implementation Status:**
-- ⚠️  Guest library responsibility (not runtime)
-- 📝 Reference implementations needed in multiple languages
+- ✅ Guest library implemented (`lunatic-otp-patterns` crate)
+- ✅ Reference implementation in Rust with examples
+- 📝 Additional language implementations needed
 
 ---
 

@@ -100,12 +100,21 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 ## Known Documentation Deltas
 - Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
 
+## OTP Patterns Implementation
+- Evidence: Complete OTP patterns library implemented in `lunatic-otp-patterns` crate with GenServer, Supervisor, and GenStatem traits.
+- Evidence: Comprehensive Rust example demonstrating GenServer usage (`examples/rust/src/gen_server_example.rs`).
+- Evidence: Type-safe message handling with serde serialization for cross-language compatibility.
+- Evidence: Supervisor restart strategies (OneForOne, OneForAll, RestForOne) with configurable intensity limits.
+- Evidence: Finite state machine support with event-driven transitions and state data management.
+- ✅ ~~Gap: OTP patterns were guest library responsibility with no reference implementations~~ **RESOLVED**: Full OTP patterns implementation with traits, examples, and documentation.
+
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
 2. ✅ ~~Extend resource migration to cover TLS streams~~ **COMPLETED**: TLS listeners now fully migratable with certificate/key preservation (`src/state.rs:431-464`, `tests/tls_resource_migration.rs`). TLS streams correctly marked as non-migratable due to cryptographic session state.
 3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
-5. Add structured audit logging for privileged host operations to close the remaining security gap.
+5. ✅ ~~Implement OTP patterns (GenServer, Supervisor, GenStatem)~~ **COMPLETED**: Full OTP patterns library with traits, examples, and integration tests.
+6. Add structured audit logging for privileged host operations to close the remaining security gap.
 
 ## Related Resources
 - `CORE_VALUES.md` – source principles and metrics.
