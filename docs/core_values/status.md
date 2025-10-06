@@ -62,7 +62,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: module registry tracks versions and dependency reload order (`crates/lunatic-process/src/module_registry.rs:61`).
 - Evidence: **Rollback mechanism fully implemented** - atomic reload failures trigger automatic rollback to previous version (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`).
 - Evidence: rollback signals sent to successfully reloaded processes on atomic reload failure, maintaining system consistency.
-- Gap: inline comment still states "TODO: Implement full hot reload logic" despite implementation being present (`crates/lunatic-process/src/lib.rs:682`).
+- ✅ ~~Gap: inline comment still states "TODO: Implement full hot reload logic"~~ **RESOLVED**: Hot reload implementation is complete and TODO has been removed.
 - Gap: distributed crate lacks tests covering node failure, so high availability story ends at a single node.
 
 ## 5. Asynchronous by Default
@@ -83,8 +83,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - No automated benchmark or fuzzing jobs are executed in CI for the metrics listed in `CORE_VALUES.md`.
 
 ## Known Documentation Deltas
-- Legacy phase reports (`docs/PHASE*` and `docs/BENCHMARK_*.md`) contain historical context but diverge from current implementation details. Use this status file as the canonical source.
-- The TODO near hot reload completion must be clarified or removed to avoid confusion (`crates/lunatic-process/src/lib.rs:682`).
+- Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
 
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.

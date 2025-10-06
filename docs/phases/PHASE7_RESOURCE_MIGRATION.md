@@ -1,8 +1,10 @@
 # Phase 7: Resource Migration Infrastructure - COMPLETE
 
-**Date**: October 5, 2025  
-**Branch**: feature/phase4-state-preservation  
+**Date**: October 5, 2025
+**Branch**: feature/phase4-state-preservation
 **Status**: Infrastructure complete, application-level implementation pattern documented
+
+> **UPDATE (October 6, 2025)**: TLS listener migration has been **fully implemented** beyond the original infrastructure-only scope. See `feature/tls-resource-migration-complete` branch and `tests/tls_resource_migration.rs` for complete implementation including certificate/key preservation during hot reload.
 
 ---
 
