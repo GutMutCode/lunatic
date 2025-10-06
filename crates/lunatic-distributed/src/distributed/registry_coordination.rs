@@ -108,9 +108,7 @@ enum RequestType {
         global_pid: GlobalProcessId,
     },
     #[allow(dead_code)] // Reserved for future unregister coordination
-    Unregister {
-        name: String,
-    },
+    Unregister { name: String },
 }
 
 impl RegistryCoordinator {
@@ -233,8 +231,7 @@ impl RegistryCoordinator {
                 if successes >= majority {
                     // Majority approved - commit registration
                     if let RequestType::Register { name, global_pid } = &req.request_type {
-                        self.registry
-                            .register_global(name.as_str(), *global_pid)?;
+                        self.registry.register_global(name.as_str(), *global_pid)?;
 
                         // Return notification message
                         let notify = RegistryCoordinationMessage::GlobalRegisterNotify {
@@ -447,7 +444,11 @@ mod tests {
 
         // Handle notification from coordinator
         coordinator
-            .handle_register_notify("coordinated_service".to_string(), gpid, current_timestamp_ms())
+            .handle_register_notify(
+                "coordinated_service".to_string(),
+                gpid,
+                current_timestamp_ms(),
+            )
             .await
             .unwrap();
 
@@ -466,8 +467,12 @@ mod tests {
         let gpid_node2_2 = GlobalProcessId::new(2, 1, 200);
         let gpid_node3 = GlobalProcessId::new(3, 1, 300);
 
-        registry.register_global("service_2a", gpid_node2_1).unwrap();
-        registry.register_global("service_2b", gpid_node2_2).unwrap();
+        registry
+            .register_global("service_2a", gpid_node2_1)
+            .unwrap();
+        registry
+            .register_global("service_2b", gpid_node2_2)
+            .unwrap();
         registry.register_global("service_3", gpid_node3).unwrap();
 
         assert_eq!(registry.global_count(), 3);

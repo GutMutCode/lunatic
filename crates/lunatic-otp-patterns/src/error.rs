@@ -37,9 +37,16 @@ impl fmt::Display for OtpError {
             OtpError::ProcessTerminated(msg) => write!(f, "Process terminated: {}", msg),
             OtpError::Timeout(msg) => write!(f, "Timeout: {}", msg),
             OtpError::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
-            OtpError::RestartIntensityExceeded { restarts, max_restarts, window_seconds } => {
-                write!(f, "Restart intensity exceeded: {} restarts in {} seconds (max: {})",
-                    restarts, window_seconds, max_restarts)
+            OtpError::RestartIntensityExceeded {
+                restarts,
+                max_restarts,
+                window_seconds,
+            } => {
+                write!(
+                    f,
+                    "Restart intensity exceeded: {} restarts in {} seconds (max: {})",
+                    restarts, window_seconds, max_restarts
+                )
             }
             OtpError::ChildStartFailure(msg) => write!(f, "Child start failure: {}", msg),
             OtpError::InvalidConfig(msg) => write!(f, "Invalid config: {}", msg),

@@ -1,6 +1,6 @@
 use lunatic_distributed::distributed::{
-    GlobalProcessId, DistributedRegistry, RegistryCoordinator,
-    RegistryCoordinationMessage, GlobalRegisterResult,
+    DistributedRegistry, GlobalProcessId, GlobalRegisterResult, RegistryCoordinationMessage,
+    RegistryCoordinator,
 };
 use std::sync::Arc;
 
@@ -30,7 +30,10 @@ async fn test_cross_node_registration_workflow() {
 
     // Should get success response (no conflict)
     match response {
-        RegistryCoordinationMessage::GlobalRegisterResponse { request_id: rid, result } => {
+        RegistryCoordinationMessage::GlobalRegisterResponse {
+            request_id: rid,
+            result,
+        } => {
             assert_eq!(rid, request_id);
             assert!(matches!(result, GlobalRegisterResult::Success));
         }
@@ -68,7 +71,9 @@ async fn test_global_registration_conflict() {
 
     // Node 2: Pre-register the service
     let gpid2 = GlobalProcessId::new(2, 1, 200);
-    registry2.register_global("conflict_service", gpid2).unwrap();
+    registry2
+        .register_global("conflict_service", gpid2)
+        .unwrap();
 
     // Node 1: Try to register same name
     let gpid1 = GlobalProcessId::new(1, 1, 100);
@@ -80,7 +85,10 @@ async fn test_global_registration_conflict() {
         .await;
 
     match response {
-        RegistryCoordinationMessage::GlobalRegisterResponse { request_id: rid, result } => {
+        RegistryCoordinationMessage::GlobalRegisterResponse {
+            request_id: rid,
+            result,
+        } => {
             assert_eq!(rid, request_id);
             match result {
                 GlobalRegisterResult::AlreadyRegistered { existing_gpid, .. } => {
@@ -146,9 +154,15 @@ async fn test_node_failure_cleanup() {
     let gpid_node2_b = GlobalProcessId::new(2, 1, 200);
     let gpid_node3 = GlobalProcessId::new(3, 1, 300);
 
-    registry.register_global("node2_service_a", gpid_node2_a).unwrap();
-    registry.register_global("node2_service_b", gpid_node2_b).unwrap();
-    registry.register_global("node3_service", gpid_node3).unwrap();
+    registry
+        .register_global("node2_service_a", gpid_node2_a)
+        .unwrap();
+    registry
+        .register_global("node2_service_b", gpid_node2_b)
+        .unwrap();
+    registry
+        .register_global("node3_service", gpid_node3)
+        .unwrap();
 
     assert_eq!(registry.global_count(), 3);
 
@@ -261,17 +275,44 @@ async fn test_three_node_cluster_simulation() {
     let gpid3 = GlobalProcessId::new(3, 1, 300);
 
     // Simulate successful coordinated registrations
-    coordinator1.handle_register_notify("service1".to_string(), gpid1, 1000).await.unwrap();
-    coordinator2.handle_register_notify("service1".to_string(), gpid1, 1000).await.unwrap();
-    coordinator3.handle_register_notify("service1".to_string(), gpid1, 1000).await.unwrap();
+    coordinator1
+        .handle_register_notify("service1".to_string(), gpid1, 1000)
+        .await
+        .unwrap();
+    coordinator2
+        .handle_register_notify("service1".to_string(), gpid1, 1000)
+        .await
+        .unwrap();
+    coordinator3
+        .handle_register_notify("service1".to_string(), gpid1, 1000)
+        .await
+        .unwrap();
 
-    coordinator1.handle_register_notify("service2".to_string(), gpid2, 2000).await.unwrap();
-    coordinator2.handle_register_notify("service2".to_string(), gpid2, 2000).await.unwrap();
-    coordinator3.handle_register_notify("service2".to_string(), gpid2, 2000).await.unwrap();
+    coordinator1
+        .handle_register_notify("service2".to_string(), gpid2, 2000)
+        .await
+        .unwrap();
+    coordinator2
+        .handle_register_notify("service2".to_string(), gpid2, 2000)
+        .await
+        .unwrap();
+    coordinator3
+        .handle_register_notify("service2".to_string(), gpid2, 2000)
+        .await
+        .unwrap();
 
-    coordinator1.handle_register_notify("service3".to_string(), gpid3, 3000).await.unwrap();
-    coordinator2.handle_register_notify("service3".to_string(), gpid3, 3000).await.unwrap();
-    coordinator3.handle_register_notify("service3".to_string(), gpid3, 3000).await.unwrap();
+    coordinator1
+        .handle_register_notify("service3".to_string(), gpid3, 3000)
+        .await
+        .unwrap();
+    coordinator2
+        .handle_register_notify("service3".to_string(), gpid3, 3000)
+        .await
+        .unwrap();
+    coordinator3
+        .handle_register_notify("service3".to_string(), gpid3, 3000)
+        .await
+        .unwrap();
 
     // All nodes should have all 3 services
     assert_eq!(registry1.global_count(), 3);

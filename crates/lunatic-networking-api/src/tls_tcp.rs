@@ -433,13 +433,12 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                         custom_root_certs: custom_certs,
                     };
 
-                    let id = caller
-                        .data_mut()
-                        .tls_stream_resources_mut()
-                        .add(Arc::new(TlsConnection::with_reconnection_info(
+                    let id = caller.data_mut().tls_stream_resources_mut().add(Arc::new(
+                        TlsConnection::with_reconnection_info(
                             TlsStream::Client(tls_stream),
                             reconnection_info,
-                        )));
+                        ),
+                    ));
                     audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));
                     (id, 0)
                 }

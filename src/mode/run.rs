@@ -112,11 +112,11 @@ async fn run_with_watch(
 
     struct ProcessInfo {
         handle: tokio::task::JoinHandle<Result<()>>,
+        #[allow(dead_code)]
         env_id: u64,
     }
 
     let mut process_info: Option<ProcessInfo> = None;
-    let mut next_env_id = 1u64;
     let mut last_reload_time = tokio::time::Instant::now();
     let reload_debounce = tokio::time::Duration::from_millis(500);
 

@@ -102,7 +102,10 @@ impl DistributedRegistry {
         let name = name.into();
 
         if self.local.contains_key(&name) {
-            return Err(anyhow!("Name '{}' already registered locally", name.as_str()));
+            return Err(anyhow!(
+                "Name '{}' already registered locally",
+                name.as_str()
+            ));
         }
 
         let entry = RegistryEntry {
@@ -131,7 +134,10 @@ impl DistributedRegistry {
         let name = name.into();
 
         if self.global.contains_key(&name) {
-            return Err(anyhow!("Name '{}' already registered globally", name.as_str()));
+            return Err(anyhow!(
+                "Name '{}' already registered globally",
+                name.as_str()
+            ));
         }
 
         let entry = RegistryEntry {
@@ -220,7 +226,10 @@ impl DistributedRegistry {
 
     /// Get all globally registered names
     pub fn global_names(&self) -> Vec<ProcessName> {
-        self.global.iter().map(|entry| entry.key().clone()).collect()
+        self.global
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     /// Get the number of locally registered names
@@ -356,7 +365,9 @@ mod tests {
         let gpid_global = GlobalProcessId::new(1, 1, 200);
 
         registry.register_local("local_only", gpid_local).unwrap();
-        registry.register_global("global_only", gpid_global).unwrap();
+        registry
+            .register_global("global_only", gpid_global)
+            .unwrap();
 
         assert!(registry.lookup_local("local_only").is_some());
         assert!(registry.lookup_local("global_only").is_none());

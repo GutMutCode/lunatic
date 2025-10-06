@@ -36,8 +36,11 @@ async fn test_tls_client_connection_snapshot() -> Result<()> {
             assert_eq!(*write_timeout_ms, Some(3000));
             println!("✓ Client connection snapshot data verified");
             println!("  - Server: {}:{}", server_name, port);
-            println!("  - Timeouts: read={}ms, write={}ms",
-                     read_timeout_ms.unwrap(), write_timeout_ms.unwrap());
+            println!(
+                "  - Timeouts: read={}ms, write={}ms",
+                read_timeout_ms.unwrap(),
+                write_timeout_ms.unwrap()
+            );
         }
         _ => panic!("Expected TlsClientConnection snapshot"),
     }
@@ -102,12 +105,18 @@ async fn test_tls_client_snapshot_serialization() -> Result<()> {
     // Serialize
     let bytes = migration_snapshot.to_bytes()?;
     assert!(!bytes.is_empty());
-    println!("✓ Serialized TLS migration snapshot to {} bytes", bytes.len());
+    println!(
+        "✓ Serialized TLS migration snapshot to {} bytes",
+        bytes.len()
+    );
 
     // Deserialize
     let restored = ResourceMigrationSnapshot::from_bytes(&bytes)?;
     assert_eq!(restored.tls_streams.len(), 2);
-    println!("✓ Deserialized {} TLS stream snapshots", restored.tls_streams.len());
+    println!(
+        "✓ Deserialized {} TLS stream snapshots",
+        restored.tls_streams.len()
+    );
 
     // Verify client connection
     let client_snapshot = restored.tls_streams.get(&1).unwrap();
@@ -121,7 +130,10 @@ async fn test_tls_client_snapshot_serialization() -> Result<()> {
             assert_eq!(server_name, "secure.example.com");
             assert_eq!(*port, 8443);
             assert_eq!(custom_root_certs.len(), 1);
-            println!("✓ Client connection data preserved: {}:{}", server_name, port);
+            println!(
+                "✓ Client connection data preserved: {}:{}",
+                server_name, port
+            );
         }
         _ => panic!("Expected TlsClientConnection"),
     }

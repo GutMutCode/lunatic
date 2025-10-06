@@ -4,7 +4,10 @@
 //! work correctly. They validate the core functionality that would be used
 //! in WASM processes, focusing on trait implementations and message handling.
 
-use lunatic_otp_patterns::{GenServer, Supervisor, SupervisorSpec, RestartStrategy, ChildSpec, RestartPolicy, ShutdownPolicy, ChildType, GenStatem, StateData, ServerMessage, ServerReply, TerminateReason};
+use lunatic_otp_patterns::{
+    ChildSpec, ChildType, GenServer, GenStatem, RestartPolicy, RestartStrategy, ServerMessage,
+    ServerReply, ShutdownPolicy, StateData, Supervisor, SupervisorSpec, TerminateReason,
+};
 use serde::{Deserialize, Serialize};
 
 /// Test GenServer implementation
@@ -107,15 +110,13 @@ fn test_supervisor_basic() {
         strategy: RestartStrategy::OneForOne,
         max_restarts: 3,
         max_seconds: 5,
-        children: vec![
-            ChildSpec {
-                id: "test_child".to_string(),
-                start: || Ok(12345), // Mock process ID
-                restart: RestartPolicy::Permanent,
-                shutdown: ShutdownPolicy::Timeout(5000),
-                child_type: ChildType::Worker,
-            },
-        ],
+        children: vec![ChildSpec {
+            id: "test_child".to_string(),
+            start: || Ok(12345), // Mock process ID
+            restart: RestartPolicy::Permanent,
+            shutdown: ShutdownPolicy::Timeout(5000),
+            child_type: ChildType::Worker,
+        }],
     };
 
     let supervisor = Supervisor::new(spec);
@@ -163,12 +164,8 @@ fn test_gen_statem_basic() {
             mut data: Self::Data,
         ) -> StateData<Self::State, Self::Data> {
             match (state, event) {
-                (TestState::Idle, TestEvent::Start) => {
-                    StateData::new(TestState::Active, data)
-                }
-                (TestState::Active, TestEvent::Stop) => {
-                    StateData::new(TestState::Idle, data)
-                }
+                (TestState::Idle, TestEvent::Start) => StateData::new(TestState::Active, data),
+                (TestState::Active, TestEvent::Stop) => StateData::new(TestState::Idle, data),
                 (TestState::Active, TestEvent::Update(new_value)) => {
                     data.value = new_value;
                     StateData::new(TestState::Active, data)
@@ -206,7 +203,10 @@ fn test_supervisor_restart_strategies() {
     assert_eq!(RestartStrategy::OneForOne, RestartStrategy::OneForOne);
     assert_eq!(RestartStrategy::OneForAll, RestartStrategy::OneForAll);
     assert_eq!(RestartStrategy::RestForOne, RestartStrategy::RestForOne);
-    assert_eq!(RestartStrategy::SimpleOneForOne, RestartStrategy::SimpleOneForOne);
+    assert_eq!(
+        RestartStrategy::SimpleOneForOne,
+        RestartStrategy::SimpleOneForOne
+    );
 
     // Test restart policies
     assert_eq!(RestartPolicy::Permanent, RestartPolicy::Permanent);
@@ -215,7 +215,10 @@ fn test_supervisor_restart_strategies() {
 
     // Test shutdown policies
     assert!(matches!(ShutdownPolicy::Brutal, ShutdownPolicy::Brutal));
-    assert!(matches!(ShutdownPolicy::Timeout(5000), ShutdownPolicy::Timeout(_)));
+    assert!(matches!(
+        ShutdownPolicy::Timeout(5000),
+        ShutdownPolicy::Timeout(_)
+    ));
     assert!(matches!(ShutdownPolicy::Infinity, ShutdownPolicy::Infinity));
 
     // Test child types

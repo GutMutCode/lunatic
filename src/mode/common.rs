@@ -21,6 +21,7 @@ pub struct RunWasm {
     pub dir: Vec<PathBuf>,
 
     pub runtime: WasmtimeRuntime,
+    #[allow(dead_code)]
     pub envs: Arc<LunaticEnvironments>,
     pub env: Arc<LunaticEnvironment>,
     pub distributed: Option<DistributedProcessState>,

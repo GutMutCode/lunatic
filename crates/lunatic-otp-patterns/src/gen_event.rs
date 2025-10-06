@@ -142,31 +142,44 @@ mod tests {
         let gen_event = GenEvent::<LogEvent>::new();
 
         // Add handler
-        gen_event.add_handler("console".to_string(), console_logger).await;
+        gen_event
+            .add_handler("console".to_string(), console_logger)
+            .await;
 
         // Send event
-        gen_event.notify(LogEvent::Info("Test message".to_string())).await;
+        gen_event
+            .notify(LogEvent::Info("Test message".to_string()))
+            .await;
 
         // Check handlers
         assert_eq!(gen_event.count_handlers().await, 1);
-        assert_eq!(gen_event.which_handlers().await, vec!["console".to_string()]);
+        assert_eq!(
+            gen_event.which_handlers().await,
+            vec!["console".to_string()]
+        );
     }
 
     #[tokio::test]
     async fn test_metrics_collector() {
         let gen_event = GenEvent::<MetricEvent>::new();
 
-        gen_event.add_handler("metrics".to_string(), metrics_collector).await;
+        gen_event
+            .add_handler("metrics".to_string(), metrics_collector)
+            .await;
 
         // Send counter events
-        gen_event.notify(MetricEvent::Counter {
-            name: "requests".to_string(),
-            value: 5,
-        }).await;
+        gen_event
+            .notify(MetricEvent::Counter {
+                name: "requests".to_string(),
+                value: 5,
+            })
+            .await;
 
-        gen_event.notify(MetricEvent::Counter {
-            name: "requests".to_string(),
-            value: 3,
-        }).await;
+        gen_event
+            .notify(MetricEvent::Counter {
+                name: "requests".to_string(),
+                value: 3,
+            })
+            .await;
     }
 }

@@ -236,12 +236,7 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
                     );
 
                     for rollback_pid in &reloaded {
-                        match send_rollback_signal(
-                            *rollback_pid,
-                            module_id,
-                            old_version,
-                            env
-                        ) {
+                        match send_rollback_signal(*rollback_pid, module_id, old_version, env) {
                             Ok(_) => {
                                 info!("Sent rollback signal to process {}", rollback_pid);
                             }

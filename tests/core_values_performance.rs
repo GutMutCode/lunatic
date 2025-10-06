@@ -23,7 +23,10 @@ async fn test_process_spawn_latency_acceptable() {
 
     println!("\n⏱️  Testing process spawn latency...");
     println!("   Target: < 10μs (aspirational)");
-    println!("   Acceptable: < {}μs (WASM overhead)", ACCEPTABLE_SPAWN_TIME_US);
+    println!(
+        "   Acceptable: < {}μs (WASM overhead)",
+        ACCEPTABLE_SPAWN_TIME_US
+    );
 
     // Mock spawn measurement (actual implementation would use lunatic-process)
     let mut spawn_times = Vec::with_capacity(SAMPLES);
@@ -50,7 +53,8 @@ async fn test_process_spawn_latency_acceptable() {
     assert!(
         avg_spawn_us < ACCEPTABLE_SPAWN_TIME_US,
         "Process spawn average ({}μs) exceeds acceptable threshold ({}μs)",
-        avg_spawn_us, ACCEPTABLE_SPAWN_TIME_US
+        avg_spawn_us,
+        ACCEPTABLE_SPAWN_TIME_US
     );
 
     if avg_spawn_us < 10 {
@@ -98,7 +102,8 @@ async fn test_hot_reload_response_time() {
     assert!(
         reload_time_ms < TARGET_RELOAD_MS,
         "Hot reload time ({}ms) exceeds target ({}ms)",
-        reload_time_ms, TARGET_RELOAD_MS
+        reload_time_ms,
+        TARGET_RELOAD_MS
     );
 
     println!("   ✅ Hot reload target achieved!");
@@ -139,7 +144,8 @@ async fn test_message_passing_latency() {
     assert!(
         avg_latency_ns < TARGET_LATENCY_NS,
         "Message passing latency ({}ns) exceeds target ({}ns)",
-        avg_latency_ns, TARGET_LATENCY_NS
+        avg_latency_ns,
+        TARGET_LATENCY_NS
     );
 
     println!("   ✅ Message passing target exceeded!");
@@ -155,7 +161,10 @@ async fn test_memory_overhead_per_process() {
 
     println!("\n💾 Testing memory overhead per process...");
     println!("   Target: < {}KB (aspirational)", ASPIRATIONAL_OVERHEAD_KB);
-    println!("   Acceptable: < {}KB (WASM reality)", ACCEPTABLE_OVERHEAD_KB);
+    println!(
+        "   Acceptable: < {}KB (WASM reality)",
+        ACCEPTABLE_OVERHEAD_KB
+    );
 
     // Estimated per-process overhead:
     // - Wasmtime Store: 5-10KB
@@ -178,7 +187,8 @@ async fn test_memory_overhead_per_process() {
     assert!(
         estimated_overhead_kb < ACCEPTABLE_OVERHEAD_KB,
         "Memory overhead ({}KB) exceeds acceptable limit ({}KB)",
-        estimated_overhead_kb, ACCEPTABLE_OVERHEAD_KB
+        estimated_overhead_kb,
+        ACCEPTABLE_OVERHEAD_KB
     );
 
     if estimated_overhead_kb < ASPIRATIONAL_OVERHEAD_KB {
@@ -233,7 +243,9 @@ async fn test_performance_under_concurrent_load() {
     assert!(
         fairness_ratio < 3.0,
         "Unfair scheduling detected: max {}μs is {}x average {}μs",
-        max_time_us, fairness_ratio, avg_time_us
+        max_time_us,
+        fairness_ratio,
+        avg_time_us
     );
 
     println!("   ✅ Fair scheduling maintained under load");
@@ -254,9 +266,9 @@ async fn test_performance_regression_baseline() {
     }
 
     let baseline = PerformanceBaseline {
-        spawn_us: 23,      // Process spawn (mean from benches/benchmark.rs)
-        message_ns: 353,   // Message passing FIFO (from benches/mailbox.rs)
-        reload_ms: 50,     // Hot reload typical (from integration tests)
+        spawn_us: 23,    // Process spawn (mean from benches/benchmark.rs)
+        message_ns: 353, // Message passing FIFO (from benches/mailbox.rs)
+        reload_ms: 50,   // Hot reload typical (from integration tests)
     };
 
     println!("   Baseline metrics (from benchmarks):");

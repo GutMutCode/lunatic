@@ -34,8 +34,6 @@ use wasmtime_wasi::WasiCtx;
 
 use crate::DefaultProcessConfig;
 use log::warn;
-use std::time::Duration;
-use tokio::net::TcpStream;
 
 #[derive(Debug, Default)]
 pub struct DbResources {
@@ -510,7 +508,10 @@ impl ProcessState for DefaultProcessState {
                 }
                 ResourceSnapshot::TlsServerConnection { reason, .. } => {
                     // Server connections cannot be restored - client must reconnect
-                    warn!("TLS server connection dropped during hot reload: {}", reason);
+                    warn!(
+                        "TLS server connection dropped during hot reload: {}",
+                        reason
+                    );
                 }
                 other => warn!(
                     "Unexpected snapshot entry for TLS stream ignored: {:?}",
@@ -525,7 +526,6 @@ impl ProcessState for DefaultProcessState {
                 tcp_streams.len()
             );
         }
-
 
         if restored > 0 {
             log::info!(

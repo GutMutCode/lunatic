@@ -15,7 +15,16 @@ pub mod gen_statem;
 pub mod supervisor;
 
 pub use error::{OtpError, OtpResult};
-pub use gen_event::{GenEvent, Event, TerminateReason as EventTerminateReason, LogEvent, MetricEvent};
-pub use gen_server::{GenServer, GenServerHandle, GenServerConfig, TerminateReason, ServerMessage, ServerReply};
-pub use gen_statem::{GenStatem, StateData, TransitionResult, StopReason, GenStatemHandle, StatemMessage};
-pub use supervisor::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec, ChildType, RestartPolicy, ShutdownPolicy, ExitReason, ChildInfo, ChildrenCount};
+pub use gen_event::{
+    Event, GenEvent, LogEvent, MetricEvent, TerminateReason as EventTerminateReason,
+};
+pub use gen_server::{
+    GenServer, GenServerConfig, GenServerHandle, ServerMessage, ServerReply, TerminateReason,
+};
+pub use gen_statem::{
+    GenStatem, GenStatemHandle, StateData, StatemMessage, StopReason, TransitionResult,
+};
+pub use supervisor::{
+    ChildInfo, ChildSpec, ChildType, ChildrenCount, ExitReason, RestartPolicy, RestartStrategy,
+    ShutdownPolicy, Supervisor, SupervisorSpec,
+};

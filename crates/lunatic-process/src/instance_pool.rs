@@ -95,6 +95,7 @@ where
         }
     }
 
+    #[allow(clippy::await_holding_lock)]
     pub async fn acquire(&self, state: S) -> Result<WasmtimeInstance<S>> {
         let mut pool = self.pool.lock().unwrap();
         while let Some(pooled) = pool.pop_front() {

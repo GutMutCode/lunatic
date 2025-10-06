@@ -29,7 +29,12 @@ pub async fn spawn_wasm<S>(
     link: Option<(Option<i64>, Arc<dyn Process>)>,
 ) -> Result<(JoinHandle<Result<S>>, Arc<dyn Process>)>
 where
-    S: ProcessState + Send + Sync + ResourceLimiter + crate::reloadable_state::ReloadableState + 'static,
+    S: ProcessState
+        + Send
+        + Sync
+        + ResourceLimiter
+        + crate::reloadable_state::ReloadableState
+        + 'static,
 {
     let id = state.id();
     trace!("Spawning process: {}", id);

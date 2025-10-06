@@ -62,9 +62,9 @@
 //! }
 //! ```
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use anyhow::Result;
 
 /// GenServer behavior trait
 ///
@@ -115,7 +115,9 @@ pub trait GenServer: Sized {
     /// Spawn a new GenServer process
     ///
     /// This creates a new process running the GenServer message loop
-    fn spawn(config: GenServerConfig) -> Result<GenServerHandle<Self::Call, Self::Cast, Self::CallReply>>
+    fn spawn(
+        config: GenServerConfig,
+    ) -> Result<GenServerHandle<Self::Call, Self::Cast, Self::CallReply>>
     where
         Self: Sized + 'static,
     {

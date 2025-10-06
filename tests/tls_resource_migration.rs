@@ -94,7 +94,10 @@ fn test_tls_stream_non_migratable() {
     };
 
     match snapshot {
-        ResourceSnapshot::NonMigratable { resource_type, reason } => {
+        ResourceSnapshot::NonMigratable {
+            resource_type,
+            reason,
+        } => {
             assert_eq!(resource_type, "TlsConnection");
             assert!(reason.contains("cryptographic state"));
             println!("✓ TLS streams correctly marked as non-migratable");
@@ -108,8 +111,9 @@ fn generate_test_cert() -> Vec<u8> {
     // This is a minimal self-signed certificate for testing
     // In production, use proper certificate generation
     vec![
-        0x30, 0x82, 0x01, 0x0a, // SEQUENCE header (certificate structure)
-        // ... simplified test cert data
+        0x30, 0x82, 0x01,
+        0x0a, // SEQUENCE header (certificate structure)
+             // ... simplified test cert data
     ]
 }
 
@@ -117,7 +121,8 @@ fn generate_test_key() -> Vec<u8> {
     // This is a minimal private key for testing
     // In production, use proper key generation
     vec![
-        0x30, 0x82, 0x01, 0x3a, // SEQUENCE header (private key structure)
-        // ... simplified test key data
+        0x30, 0x82, 0x01,
+        0x3a, // SEQUENCE header (private key structure)
+             // ... simplified test key data
     ]
 }

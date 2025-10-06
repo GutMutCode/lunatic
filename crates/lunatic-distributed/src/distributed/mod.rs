@@ -9,6 +9,5 @@ pub use client::Client;
 pub use global_process_id::GlobalProcessId;
 pub use registry::{DistributedRegistry, ProcessName, RegistrationScope, RegistryEntry};
 pub use registry_coordination::{
-    GlobalRegisterResult, GlobalUnregisterResult, RegistryCoordinator,
-    RegistryCoordinationMessage,
+    GlobalRegisterResult, GlobalUnregisterResult, RegistryCoordinationMessage, RegistryCoordinator,
 };

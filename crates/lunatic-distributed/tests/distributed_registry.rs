@@ -1,5 +1,5 @@
 use lunatic_distributed::distributed::{
-    GlobalProcessId, DistributedRegistry, ProcessName, RegistrationScope,
+    DistributedRegistry, GlobalProcessId, ProcessName, RegistrationScope,
 };
 
 #[test]
@@ -27,7 +27,11 @@ fn test_compact_encoding_preserves_data() {
         let compact = original.to_compact();
         let decoded = GlobalProcessId::from_compact(compact);
 
-        assert_eq!(original, decoded, "Round-trip encoding failed for {:?}", original);
+        assert_eq!(
+            original, decoded,
+            "Round-trip encoding failed for {:?}",
+            original
+        );
     }
 }
 
@@ -58,13 +62,15 @@ fn test_registry_global_registration() {
     assert!(registry.register_global("database_manager", gpid).is_ok());
 
     // Lookup in global scope
-    let entry = registry.lookup_global("database_manager")
+    let entry = registry
+        .lookup_global("database_manager")
         .expect("Global lookup should succeed");
     assert_eq!(entry.global_pid, gpid);
     assert_eq!(entry.scope, RegistrationScope::Global);
 
     // Generic lookup also works
-    let entry2 = registry.lookup("database_manager")
+    let entry2 = registry
+        .lookup("database_manager")
         .expect("Generic lookup should succeed");
     assert_eq!(entry2.global_pid, gpid);
 }
@@ -130,8 +136,12 @@ fn test_registry_local_vs_global_scope() {
     let gpid_local = GlobalProcessId::new(1, 1, 100);
     let gpid_global = GlobalProcessId::new(2, 1, 200);
 
-    registry.register_local("local_service", gpid_local).unwrap();
-    registry.register_global("global_service", gpid_global).unwrap();
+    registry
+        .register_local("local_service", gpid_local)
+        .unwrap();
+    registry
+        .register_global("global_service", gpid_global)
+        .unwrap();
 
     // Local-only lookup
     assert!(registry.lookup_local("local_service").is_some());
@@ -214,7 +224,9 @@ fn test_erlang_style_workflow() {
     registry.register_local("cache", cache_pid).unwrap();
 
     // Lookup by name (location transparency)
-    let logger_entry = registry.lookup("logger").expect("Logger should be registered");
+    let logger_entry = registry
+        .lookup("logger")
+        .expect("Logger should be registered");
     assert_eq!(logger_entry.global_pid, logger_pid);
 
     // Simulate process crash - unregister all names

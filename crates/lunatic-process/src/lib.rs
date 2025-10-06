@@ -13,12 +13,7 @@ pub mod state;
 pub mod wasm;
 
 use std::{
-    any::Any,
-    collections::HashMap,
-    fmt::Debug,
-    future::Future,
-    panic::AssertUnwindSafe,
-    sync::Arc,
+    any::Any, collections::HashMap, fmt::Debug, future::Future, panic::AssertUnwindSafe, sync::Arc,
 };
 
 use anyhow::{anyhow, Result};
@@ -203,10 +198,7 @@ pub enum Signal {
     HotReload { module_id: u64, new_version: u32 },
     /// Rollback to previous version after failed reload
     /// Note: Rollback is best-effort and may not preserve all state
-    Rollback {
-        module_id: u64,
-        target_version: u32,
-    },
+    Rollback { module_id: u64, target_version: u32 },
 }
 
 /// Reason why a process died
@@ -335,7 +327,12 @@ pub fn spawn<T, F, K, R>(
     func: F,
 ) -> (JoinHandle<Result<T>>, NativeProcess)
 where
-    T: ProcessState + Send + Sync + wasmtime::ResourceLimiter + crate::reloadable_state::ReloadableState + 'static,
+    T: ProcessState
+        + Send
+        + Sync
+        + wasmtime::ResourceLimiter
+        + crate::reloadable_state::ReloadableState
+        + 'static,
     R: Into<ExecutionResult<T>> + Send + 'static,
     K: Future<Output = R> + Send + 'static,
     F: FnOnce(NativeProcess, MessageMailbox) -> K,
@@ -509,7 +506,11 @@ pub(crate) async fn new<F, S, R>(
     context: Option<ProcessContext<S>>,
 ) -> Result<S>
 where
-    S: ProcessState + Send + wasmtime::ResourceLimiter + crate::reloadable_state::ReloadableState + 'static,
+    S: ProcessState
+        + Send
+        + wasmtime::ResourceLimiter
+        + crate::reloadable_state::ReloadableState
+        + 'static,
     R: Into<ExecutionResult<S>>,
     F: Future<Output = R> + Send + 'static,
 {

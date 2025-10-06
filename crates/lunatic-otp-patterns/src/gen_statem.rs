@@ -238,7 +238,7 @@ mod traffic_light_example {
                 (_, TrafficLightEvent::Emergency) => StateData {
                     state: TrafficLightState::Red,
                     data,
-                }
+                },
             }
         }
 
@@ -259,27 +259,18 @@ mod traffic_light_example {
         assert_eq!(state_data.state, TrafficLightState::Red);
 
         // Red -> Green
-        let state_data = sm.handle_event(
-            state_data.state,
-            TrafficLightEvent::Timer,
-            state_data.data,
-        );
+        let state_data =
+            sm.handle_event(state_data.state, TrafficLightEvent::Timer, state_data.data);
         assert_eq!(state_data.state, TrafficLightState::Green);
 
         // Green -> Yellow
-        let state_data = sm.handle_event(
-            state_data.state,
-            TrafficLightEvent::Timer,
-            state_data.data,
-        );
+        let state_data =
+            sm.handle_event(state_data.state, TrafficLightEvent::Timer, state_data.data);
         assert_eq!(state_data.state, TrafficLightState::Yellow);
 
         // Yellow -> Red (cycle completes)
-        let state_data = sm.handle_event(
-            state_data.state,
-            TrafficLightEvent::Timer,
-            state_data.data,
-        );
+        let state_data =
+            sm.handle_event(state_data.state, TrafficLightEvent::Timer, state_data.data);
         assert_eq!(state_data.state, TrafficLightState::Red);
         assert_eq!(state_data.data.cycle_count, 1);
     }

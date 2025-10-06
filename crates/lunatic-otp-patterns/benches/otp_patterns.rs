@@ -4,7 +4,10 @@
 //! to ensure they meet the fast performance requirements.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use lunatic_otp_patterns::{GenServer, Supervisor, SupervisorSpec, RestartStrategy, ChildSpec, RestartPolicy, ShutdownPolicy};
+use lunatic_otp_patterns::{
+    ChildSpec, GenServer, RestartPolicy, RestartStrategy, ShutdownPolicy, Supervisor,
+    SupervisorSpec,
+};
 use serde::{Deserialize, Serialize};
 
 // Test GenServer implementation for benchmarking
@@ -93,15 +96,13 @@ fn bench_otp_patterns(c: &mut Criterion) {
         strategy: RestartStrategy::OneForOne,
         max_restarts: 3,
         max_seconds: 5,
-        children: vec![
-            ChildSpec {
-                id: "child1".to_string(),
-                start: || Ok(12345), // Mock process ID
-                restart: RestartPolicy::Permanent,
-                shutdown: ShutdownPolicy::Brutal,
-                child_type: Default::default(),
-            },
-        ],
+        children: vec![ChildSpec {
+            id: "child1".to_string(),
+            start: || Ok(12345), // Mock process ID
+            restart: RestartPolicy::Permanent,
+            shutdown: ShutdownPolicy::Brutal,
+            child_type: Default::default(),
+        }],
     };
 
     c.bench_function("supervisor_creation", |b| {

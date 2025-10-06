@@ -31,10 +31,10 @@
 //! let supervisor = Supervisor::start(spec)?;
 //! ```
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Debug;
-use anyhow::Result;
 
 /// Supervisor specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,7 +219,8 @@ impl Supervisor {
             .ok_or_else(|| format!("Child '{}' not found", child_id))?
             .clone();
 
-        let process_id = (child_spec.start)().map_err(|e| format!("Failed to start child: {}", e))?;
+        let process_id =
+            (child_spec.start)().map_err(|e| format!("Failed to start child: {}", e))?;
 
         self.children.insert(
             child_id.to_string(),
@@ -361,10 +362,11 @@ impl Supervisor {
         }
 
         // Log restart event
-        println!("SUPERVISOR: Child '{}' restarted at timestamp {}", child_id, event.timestamp);
+        println!(
+            "SUPERVISOR: Child '{}' restarted at timestamp {}",
+            child_id, event.timestamp
+        );
     }
-
-
 
     /// Stop a child process
     fn stop_child(&mut self, child_id: &str) -> Result<(), String> {

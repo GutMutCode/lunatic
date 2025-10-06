@@ -3,12 +3,7 @@
 // These tests validate the system's behavior when nodes crash, become
 // unreachable, or experience network partitions during various operations.
 
-use std::{
-    collections::HashSet,
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use lunatic_distributed::{
@@ -369,7 +364,10 @@ async fn test_node_crash_during_message_processing() -> Result<()> {
     };
 
     let result = timeout(Duration::from_secs(2), sender.client.send(params2)).await;
-    assert!(result.is_ok(), "Should be able to send to other nodes after one crashes");
+    assert!(
+        result.is_ok(),
+        "Should be able to send to other nodes after one crashes"
+    );
 
     Ok(())
 }
@@ -606,9 +604,8 @@ async fn test_concurrent_node_failures() -> Result<()> {
     Ok(())
 }
 
-
 /// DISTRIBUTED STRESS TESTS
-/// 
+///
 /// The following tests validate distributed scheduler performance under high load
 /// Closes gap: "distributed scheduler still lacks automated stress runs" (docs/core_values/status.md:47)
 
@@ -620,8 +617,10 @@ async fn test_distributed_stress_message_throughput() -> Result<()> {
     const MESSAGES_PER_NODE: usize = 350; // ~1000 total
     const CONCURRENT_SENDERS: usize = 10;
 
-    println!("
-🚀 Distributed stress test: Cross-node message throughput");
+    println!(
+        "
+🚀 Distributed stress test: Cross-node message throughput"
+    );
     println!("   Nodes: {}", NODE_COUNT);
     println!("   Messages: {} total", NODE_COUNT * MESSAGES_PER_NODE);
 
@@ -649,7 +648,10 @@ async fn test_distributed_stress_message_throughput() -> Result<()> {
                     tag: Some(msg_idx as i64),
                     data: vec![0u8; 128],
                 };
-                if timeout(Duration::from_secs(5), sender.send(params)).await.is_ok() {
+                if timeout(Duration::from_secs(5), sender.send(params))
+                    .await
+                    .is_ok()
+                {
                     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             });
@@ -666,10 +668,17 @@ async fn test_distributed_stress_message_throughput() -> Result<()> {
     let total = NODE_COUNT * MESSAGES_PER_NODE;
     let throughput = successful as f64 / duration.as_secs_f64();
 
-    println!("   ✅ Success: {} / {} ({:.1}%)", successful, total, 100.0 * successful as f64 / total as f64);
+    println!(
+        "   ✅ Success: {} / {} ({:.1}%)",
+        successful,
+        total,
+        100.0 * successful as f64 / total as f64
+    );
     println!("   ⏱️  Throughput: {:.2} msg/sec", throughput);
 
-    assert!(successful as f64 / total as f64 > 0.70, "< 70% success rate");
+    assert!(
+        successful as f64 / total as f64 > 0.70,
+        "< 70% success rate"
+    );
     Ok(())
 }
-

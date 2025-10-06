@@ -3,11 +3,7 @@
 // These tests validate hot reload functionality in multi-node scenarios,
 // ensuring coordinated reloads work correctly and handle failures gracefully.
 
-use std::{
-    net::SocketAddr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use lunatic_distributed::{
@@ -101,9 +97,7 @@ mod mock {
 
     impl ReloadableState for MockState {
         fn snapshot(&self) -> Result<Vec<u8>> {
-            let count = self
-                .reload_count
-                .load(std::sync::atomic::Ordering::SeqCst);
+            let count = self.reload_count.load(std::sync::atomic::Ordering::SeqCst);
             Ok(count.to_le_bytes().to_vec())
         }
 
