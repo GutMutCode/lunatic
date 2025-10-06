@@ -12,10 +12,20 @@ pub enum ResourceSnapshot {
     },
     /// TCP listener: store bound address
     TcpListener { local_addr: String },
-    /// TLS connection: store peer address and session data
-    TlsConnection {
-        peer_addr: String,
-        local_addr: String,
+    /// TLS client connection: store reconnection metadata
+    TlsClientConnection {
+        server_name: String,
+        port: u16,
+        peer_addr: Option<String>,
+        local_addr: Option<String>,
+        custom_root_certs: Vec<Vec<u8>>,
+        read_timeout_ms: Option<u64>,
+        write_timeout_ms: Option<u64>,
+    },
+    /// TLS server connection: graceful shutdown (client must reconnect)
+    TlsServerConnection {
+        graceful_shutdown: bool,
+        reason: String,
     },
     /// TLS listener: store bound address and certificate info
     TlsListener {

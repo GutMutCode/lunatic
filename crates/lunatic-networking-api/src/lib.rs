@@ -46,6 +46,19 @@ pub struct TlsConnection {
     pub read_timeout: Mutex<Option<Duration>>,
     pub write_timeout: Mutex<Option<Duration>>,
     pub peek_timeout: Mutex<Option<Duration>>,
+    /// Reconnection metadata for client connections (None for server-accepted connections)
+    pub reconnection_info: Option<TlsReconnectionInfo>,
+}
+
+/// Metadata needed to reconnect a TLS client stream after hot reload
+#[derive(Debug, Clone)]
+pub struct TlsReconnectionInfo {
+    pub server_name: String,
+    pub port: u16,
+    pub peer_addr: Option<SocketAddr>,
+    pub local_addr: Option<SocketAddr>,
+    /// Custom root certificates (empty = use system defaults)
+    pub custom_root_certs: Vec<Vec<u8>>,
 }
 
 pub struct TlsListener {
@@ -65,6 +78,24 @@ impl TlsConnection {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             peek_timeout: Mutex::new(None),
+            reconnection_info: None,
+        }
+    }
+
+    pub fn with_reconnection_info(
+        sock: TlsStream<TcpStream>,
+        info: TlsReconnectionInfo,
+    ) -> TlsConnection {
+        let (read_half, write_half) = split(sock);
+        TlsConnection {
+            reader: Mutex::new(read_half),
+            writer: Mutex::new(write_half),
+            closing: false,
+            clean_closure: false,
+            read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
+            peek_timeout: Mutex::new(None),
+            reconnection_info: Some(info),
         }
     }
 }

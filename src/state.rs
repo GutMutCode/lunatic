@@ -34,6 +34,8 @@ use wasmtime_wasi::WasiCtx;
 
 use crate::DefaultProcessConfig;
 use log::warn;
+use std::time::Duration;
+use tokio::net::TcpStream;
 
 #[derive(Debug, Default)]
 pub struct DbResources {
@@ -316,16 +318,34 @@ impl ProcessState for DefaultProcessState {
             }
         }
 
-        for (id, _) in self.resources.tls_streams.iter() {
-            snapshot.add_tls_stream(
-                *id,
-                ResourceSnapshot::NonMigratable {
-                    resource_type: "tls_stream".into(),
-                    reason:
-                        "hot reload capture is disabled until TLS session resumption is implemented"
-                            .into(),
-                },
-            );
+        for (id, stream) in self.resources.tls_streams.iter() {
+            if let Some(reconnection_info) = &stream.reconnection_info {
+                // Client connection: capture reconnection metadata
+                let read_timeout = stream.read_timeout.try_lock().ok().and_then(|t| *t);
+                let write_timeout = stream.write_timeout.try_lock().ok().and_then(|t| *t);
+
+                snapshot.add_tls_stream(
+                    *id,
+                    ResourceSnapshot::TlsClientConnection {
+                        server_name: reconnection_info.server_name.clone(),
+                        port: reconnection_info.port,
+                        peer_addr: reconnection_info.peer_addr.map(|a| a.to_string()),
+                        local_addr: reconnection_info.local_addr.map(|a| a.to_string()),
+                        custom_root_certs: reconnection_info.custom_root_certs.clone(),
+                        read_timeout_ms: read_timeout.map(|d| d.as_millis() as u64),
+                        write_timeout_ms: write_timeout.map(|d| d.as_millis() as u64),
+                    },
+                );
+            } else {
+                // Server-accepted connection: graceful shutdown
+                snapshot.add_tls_stream(
+                    *id,
+                    ResourceSnapshot::TlsServerConnection {
+                        graceful_shutdown: true,
+                        reason: "Server-accepted TLS connections require client reconnection after hot reload".into(),
+                    },
+                );
+            }
         }
 
         for (id, socket) in self.resources.udp_sockets.iter() {
@@ -469,6 +489,36 @@ impl ProcessState for DefaultProcessState {
             }
         }
 
+        // Restore TLS client streams via reconnection
+        for (_id, entry) in tls_streams.into_iter() {
+            match entry {
+                ResourceSnapshot::TlsClientConnection {
+                    server_name,
+                    port,
+                    custom_root_certs: _,
+                    read_timeout_ms: _,
+                    write_timeout_ms: _,
+                    ..
+                } => {
+                    // TLS stream reconnection is logged but not yet implemented
+                    // This requires importing additional dependencies (webpki, rustls_pemfile, webpki_roots)
+                    // For now, log the reconnection attempt
+                    warn!(
+                        "TLS client stream to {}:{} cannot be automatically reconnected yet - implementation pending",
+                        server_name, port
+                    );
+                }
+                ResourceSnapshot::TlsServerConnection { reason, .. } => {
+                    // Server connections cannot be restored - client must reconnect
+                    warn!("TLS server connection dropped during hot reload: {}", reason);
+                }
+                other => warn!(
+                    "Unexpected snapshot entry for TLS stream ignored: {:?}",
+                    other
+                ),
+            }
+        }
+
         if !tcp_streams.is_empty() {
             warn!(
                 "{} TCP stream(s) skipped during hot reload; active connections are not yet migratable",
@@ -476,12 +526,6 @@ impl ProcessState for DefaultProcessState {
             );
         }
 
-        if !tls_streams.is_empty() {
-            warn!(
-                "{} TLS stream(s) skipped during hot reload; active TLS sessions cannot be migrated",
-                tls_streams.len()
-            );
-        }
 
         if restored > 0 {
             log::info!(

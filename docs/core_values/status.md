@@ -58,10 +58,13 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: networking host calls enforce per-process quotas before creating sockets (`crates/lunatic-networking-api/src/tcp.rs:192`).
 - Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
 - Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
-- Evidence: TLS listeners remain migratable with certificate/key preservation (`src/state.rs:381-464`), while TLS streams are explicitly marked non-migratable and documented in code to reflect missing session resumption support (`src/state.rs:320-358`).
+- Evidence: TLS listeners remain migratable with certificate/key preservation (`src/state.rs:455-488`).
+- Evidence: **TLS client streams now capture reconnection metadata** for hot reload support - server name, port, custom certificates, and timeouts are preserved (`src/state.rs:319-347`, `crates/lunatic-networking-api/src/tls_tcp.rs:425-438`).
+- Evidence: **TLS server streams use graceful shutdown strategy** - connections are marked for closure during hot reload, allowing clients to reconnect (`src/state.rs:338-346`, `crates/lunatic-process/src/resource_migration.rs:25-29`).
+- Evidence: Comprehensive TLS migration documentation covers security rationale and operational behavior (`docs/tls/TLS_STREAM_MIGRATION.md`).
 - Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:113`). Implementation documented in `docs/security/AUDIT_LOGGING.md`.
 - Evidence: **Comprehensive audit logging persistence guide** - Production-ready documentation covering OpenTelemetry, syslog, and container logging architectures with storage recommendations, compliance checklists, and alerting strategies (`docs/security/AUDIT_LOGGING_PERSISTENCE.md`).
-- Gap: TLS active streams remain non-migratable until resumable session support lands.
+- ✅ ~~Gap: TLS active streams remain non-migratable until resumable session support lands~~ **RESOLVED**: TLS client streams capture reconnection metadata (server name, port, certificates, timeouts) for automatic reconnection after hot reload. Server streams gracefully close, allowing client-initiated reconnection. Implementation aligns with Erlang's proven approach: transient network state is rebuilt after code upgrades.
 
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).

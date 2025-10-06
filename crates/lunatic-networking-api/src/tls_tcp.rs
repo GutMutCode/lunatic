@@ -17,7 +17,7 @@ use lunatic_error_api::ErrorCtx;
 use webpki::TrustAnchor;
 
 use crate::dns::DnsIterator;
-use crate::{socket_address, NetworkingCtx, TlsConnection, TlsListener};
+use crate::{socket_address, NetworkingCtx, TlsConnection, TlsListener, TlsReconnectionInfo};
 use tokio_rustls::rustls::{self, OwnedTrustAnchor};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
@@ -370,7 +370,7 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
         };
 
         let mut root_cert_store = rustls::RootCertStore::empty();
-        if let Some(Ok(pem_list)) = cafile {
+        let custom_certs = if let Some(Ok(ref pem_list)) = cafile {
             let trust_anchors = pem_list
                 .iter()
                 .map(|pem| {
@@ -386,6 +386,7 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                 })
                 .filter_map(|r: Result<OwnedTrustAnchor>| r.ok());
             root_cert_store.add_trust_anchors(trust_anchors);
+            pem_list.clone()
         } else {
             root_cert_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
                 OwnedTrustAnchor::from_subject_spki_name_constraints(
@@ -394,7 +395,8 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                     ta.name_constraints,
                 )
             }));
-        }
+            Vec::new()
+        };
 
         let config = rustls::ClientConfig::builder()
             .with_safe_defaults()
@@ -410,19 +412,34 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
             t => timeout(Duration::from_millis(t), connect).await,
         } {
             let (stream_or_error_id, result) = match result {
-                Ok(stream) => {
+                Ok(tcp_stream) => {
+                    let peer_addr = tcp_stream.peer_addr().ok();
+                    let local_addr = tcp_stream.local_addr().ok();
                     let domain = &socket_addr[..];
                     let domain = rustls::ServerName::try_from(domain)
                         .or_trap("lunatic::networking::tls_connect::invalid_dnsname")?;
 
-                    let stream = connector
-                        .connect(domain, stream)
+                    let tls_stream = connector
+                        .connect(domain, tcp_stream)
                         .await
                         .or_trap("lunatic::networking::tls_connect::connect failed")?;
+
+                    // Store reconnection info for hot reload support
+                    let reconnection_info = TlsReconnectionInfo {
+                        server_name: socket_addr.clone(),
+                        port: port as u16,
+                        peer_addr,
+                        local_addr,
+                        custom_root_certs: custom_certs,
+                    };
+
                     let id = caller
                         .data_mut()
                         .tls_stream_resources_mut()
-                        .add(Arc::new(TlsConnection::new(TlsStream::Client(stream))));
+                        .add(Arc::new(TlsConnection::with_reconnection_info(
+                            TlsStream::Client(tls_stream),
+                            reconnection_info,
+                        )));
                     audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));
                     (id, 0)
                 }
