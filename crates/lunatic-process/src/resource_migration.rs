@@ -11,9 +11,7 @@ pub enum ResourceSnapshot {
         local_addr: String,
     },
     /// TCP listener: store bound address
-    TcpListener {
-        local_addr: String,
-    },
+    TcpListener { local_addr: String },
     /// TLS connection: store peer address and session data
     TlsConnection {
         peer_addr: String,
@@ -22,11 +20,11 @@ pub enum ResourceSnapshot {
     /// TLS listener: store bound address and certificate info
     TlsListener {
         local_addr: String,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
     },
     /// UDP socket: store bound address
-    UdpSocket {
-        local_addr: String,
-    },
+    UdpSocket { local_addr: String },
     /// Generic placeholder for resources that can't be migrated
     NonMigratable {
         resource_type: String,
@@ -102,7 +100,7 @@ impl ResourceMigrationSnapshot {
 pub trait MigratableResource {
     /// Create a snapshot of this resource
     fn snapshot(&self) -> Result<ResourceSnapshot>;
-    
+
     /// Restore from a snapshot (create new resource from saved data)
     fn restore(snapshot: &ResourceSnapshot) -> Result<Self>
     where
@@ -116,7 +114,7 @@ mod tests {
     #[test]
     fn test_resource_snapshot_serialization() {
         let mut snapshot = ResourceMigrationSnapshot::new();
-        
+
         snapshot.add_tcp_stream(
             1,
             ResourceSnapshot::TcpConnection {

@@ -28,6 +28,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::{Mutex, RwLock};
+use tokio_rustls::rustls::{Certificate, PrivateKey};
 use wasmtime::{Linker, ResourceLimiter};
 use wasmtime_wasi::WasiCtx;
 
@@ -301,6 +302,8 @@ impl ProcessState for DefaultProcessState {
                     *id,
                     ResourceSnapshot::TlsListener {
                         local_addr: addr.to_string(),
+                        cert_pem: listener.certs.0.clone(),
+                        key_pem: listener.keys.0.clone(),
                     },
                 ),
                 Err(err) => snapshot.add_tls_listener(
@@ -375,22 +378,13 @@ impl ProcessState for DefaultProcessState {
             match entry {
                 ResourceSnapshot::TcpListener { local_addr } => {
                     match local_addr.parse::<SocketAddr>() {
-                        Ok(addr) => match self.can_open_network_connection() {
-                            Ok(()) => match handle.block_on(TcpListener::bind(addr)) {
-                                Ok(listener) => {
-                                    self.resources.tcp_listeners.add(listener);
-                                    restored += 1;
-                                }
-                                Err(err) => {
-                                    self.close_network_connection();
-                                    warn!(
-                                        "Failed to rebind TCP listener at {} during hot reload: {}",
-                                        local_addr, err
-                                    );
-                                }
-                            },
+                        Ok(addr) => match handle.block_on(TcpListener::bind(addr)) {
+                            Ok(listener) => {
+                                self.resources.tcp_listeners.add(listener);
+                                restored += 1;
+                            }
                             Err(err) => warn!(
-                                "Cannot reopen TCP listener {} due to connection limits: {}",
+                                "Failed to rebind TCP listener at {} during hot reload: {}",
                                 local_addr, err
                             ),
                         },
@@ -411,22 +405,13 @@ impl ProcessState for DefaultProcessState {
             match entry {
                 ResourceSnapshot::UdpSocket { local_addr } => {
                     match local_addr.parse::<SocketAddr>() {
-                        Ok(addr) => match self.can_open_network_connection() {
-                            Ok(()) => match handle.block_on(UdpSocket::bind(addr)) {
-                                Ok(socket) => {
-                                    self.resources.udp_sockets.add(Arc::new(socket));
-                                    restored += 1;
-                                }
-                                Err(err) => {
-                                    self.close_network_connection();
-                                    warn!(
-                                        "Failed to rebind UDP socket at {} during hot reload: {}",
-                                        local_addr, err
-                                    );
-                                }
-                            },
+                        Ok(addr) => match handle.block_on(UdpSocket::bind(addr)) {
+                            Ok(socket) => {
+                                self.resources.udp_sockets.add(Arc::new(socket));
+                                restored += 1;
+                            }
                             Err(err) => warn!(
-                                "Cannot reopen UDP socket {} due to connection limits: {}",
+                                "Failed to rebind UDP socket at {} during hot reload: {}",
                                 local_addr, err
                             ),
                         },
@@ -443,17 +428,45 @@ impl ProcessState for DefaultProcessState {
             }
         }
 
+        for (_id, entry) in tls_listeners.into_iter() {
+            match entry {
+                ResourceSnapshot::TlsListener {
+                    local_addr,
+                    cert_pem,
+                    key_pem,
+                } => match local_addr.parse::<SocketAddr>() {
+                    Ok(addr) => match handle.block_on(TcpListener::bind(addr)) {
+                        Ok(listener) => {
+                            let cert = Certificate(cert_pem);
+                            let key = PrivateKey(key_pem);
+                            self.resources.tls_listeners.add(TlsListener {
+                                listener,
+                                certs: cert,
+                                keys: key,
+                            });
+                            restored += 1;
+                        }
+                        Err(err) => warn!(
+                            "Failed to rebind TLS listener at {} during hot reload: {}",
+                            local_addr, err
+                        ),
+                    },
+                    Err(err) => warn!(
+                        "Invalid TLS listener address '{}' in snapshot: {}",
+                        local_addr, err
+                    ),
+                },
+                other => warn!(
+                    "Unexpected snapshot entry for TLS listener ignored: {:?}",
+                    other
+                ),
+            }
+        }
+
         if !tcp_streams.is_empty() {
             warn!(
                 "{} TCP stream(s) skipped during hot reload; active connections are not yet migratable",
                 tcp_streams.len()
-            );
-        }
-
-        if !tls_listeners.is_empty() {
-            warn!(
-                "{} TLS listener(s) skipped during hot reload; certificate reprovisioning not implemented",
-                tls_listeners.len()
             );
         }
 

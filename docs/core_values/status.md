@@ -13,7 +13,7 @@ This document supersedes ad-hoc phase reports and consolidates how the current c
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`, though examples skew toward WAT only. |
-| Security Through Isolation | Strong | Capability checks and syscall-level limits enforced; resource migration primitives exist but are unused. |
+| Security Through Isolation | Strong | Capability checks enforced; TCP/UDP listeners auto-restore on hot reload while TLS streams remain pending. |
 | Fault Tolerance & HA | Partial | Hot reload pipeline and supervisor signals work, but cross-node reload and rollback policies still speculative. |
 | Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
 | Erlang-Inspired | Partial | Links, monitors, registry, and hot reload mirror OTP ideas; distribution, tooling, and OTP-equivalent libraries lag. |
@@ -75,7 +75,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Gap: tooling (tracing, dashboards) referenced in `CORE_VALUES.md` not implemented.
 
 ## Validation and Test Coverage
-- `cargo test resource_limits -- --nocapture` (2025-10-06) passes and exercises table, file, and network limits (`tests/resource_limits.rs:6`). Build emits warnings for unused pooling fields and missing never-type annotations, indicating technical debt that should be triaged.
+- `cargo test instance_pool_reports_hit_rate -- --nocapture` validates pooling telemetry; `cargo test resource_limits -- --nocapture` covers quota enforcement. Legacy compiler warnings (unused imports/fields) persist and should be triaged separately.
 - No automated benchmark or fuzzing jobs are executed in CI for the metrics listed in `CORE_VALUES.md`.
 
 ## Known Documentation Deltas
@@ -84,7 +84,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
-2. Extend resource migration to cover TLS listeners/streams and add regression tests for listener rebinding.
+2. Extend resource migration to cover TLS streams (and add regression tests) so encrypted sessions survive reloads.
 3. Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations.
 4. Document and implement rollback semantics in `ReloadCoordinator` or explicitly scope them out.
 5. Add structured audit logging for privileged host operations to close the remaining security gap.
