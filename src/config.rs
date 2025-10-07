@@ -31,6 +31,24 @@ pub struct DefaultProcessConfig {
     max_network_connections: u32,
 }
 
+impl Default for DefaultProcessConfig {
+    fn default() -> Self {
+        Self {
+            max_memory: 10_000_000, // 10MB default
+            max_fuel: None,
+            can_compile_modules: true,
+            can_create_configs: true,
+            can_spawn_processes: true,
+            preopened_dirs: Vec::new(),
+            command_line_arguments: Vec::new(),
+            environment_variables: Vec::new(),
+            max_table_elements: 10_000,
+            max_file_descriptors: 1024,
+            max_network_connections: 1024,
+        }
+    }
+}
+
 impl Debug for DefaultProcessConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         f.debug_struct("EnvConfig")
