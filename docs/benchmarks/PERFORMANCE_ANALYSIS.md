@@ -247,7 +247,7 @@ Based on Priority 1 improvements (Global Epoch Ticker):
 
 **Location**: `benches/`
 
-1. **`benchmark.rs`**: Process spawn baseline ✅
+1. **`spawn.rs`**: Process spawn baseline ✅
 2. **`mailbox.rs`**: Message passing & selective receive ✅
 
 **Current Status**:
@@ -258,7 +258,7 @@ Based on Priority 1 improvements (Global Epoch Ticker):
 **Running Benchmarks**:
 ```bash
 # Process spawn performance
-cargo bench --bench benchmark
+cargo bench --bench spawn
 
 # Message passing performance
 cargo bench --bench mailbox
@@ -275,7 +275,7 @@ open target/criterion/report/index.html
 ## Performance Roadmap
 
 ### ✅ Completed (October 6, 2025)
-1. ✅ **Fixed benchmark.rs Tokio runtime issue** (rt.block_on for WasmtimeRuntime)
+1. ✅ **Fixed spawn.rs Tokio runtime issue** (rt.block_on for WasmtimeRuntime)
 2. ✅ **Measured actual process spawn times**: **23.055μs**
 3. ✅ **Measured message passing latency**: **353ns-25μs**
 4. ✅ **Documented Priority 1-3 improvements** (this document + BENCHMARK_RESULTS.md)

@@ -223,10 +223,8 @@ mod tests {
 
     #[test]
     fn test_unit_roundtrip() {
-        let state = ();
-        let bytes = state.serialize_state().unwrap();
-        let restored = <()>::deserialize_state(&bytes).unwrap();
-        assert_eq!(state, restored);
+        let bytes = ().serialize_state().unwrap();
+        <()>::deserialize_state(&bytes).unwrap();
     }
 
     #[test]

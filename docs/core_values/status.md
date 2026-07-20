@@ -1,7 +1,7 @@
 # Core Values Compliance Status
 
 Reviewed: 2026-07-21
-Reviewed baseline: `57885c783a587718a893af7492340f486bbd56df`
+Reviewed baseline: `7bf6752424cfab859813249812776ad320cf7f79`
 
 This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
 
@@ -16,9 +16,9 @@ An item is complete only when the production path is connected and an executable
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
 | Security Through Isolation | Strong | Capability checks are enforced; in-process hot reload transfers live TLS sessions without serializing keys, while serialized TLS restoration fails explicitly. |
-| Fault Tolerance & HA | Partial | Hot reload plus links/monitors work; OTP process supervision and cross-node registry coordination are not connected to live runtime paths. |
+| Fault Tolerance & HA | Partial | Hot reload, links/monitors, actual-process OTP supervision, and networked registry quorum/recovery work; cross-node process failure and hot-reload recovery remain open. |
 | Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
-| Erlang-Inspired | Partial | Links, monitors, local registry structures, and OTP callback traits mirror Erlang concepts; live OTP process integration and coordinated global registration remain open. |
+| Erlang-Inspired | Partial | GenServer and Supervisor run on native Lunatic processes, while global registration uses mTLS QUIC quorum; remaining OTP adapters and automatic monitor intake are open. |
 
 Status values: **Strong** (implemented with validation), **Partial** (major elements shipped but measurable gaps), **Emerging** (initial scaffolding only).
 
@@ -46,7 +46,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `DefaultProcessConfig` enforces table, file, and network quotas to avoid per-process blowups (`src/config.rs:8`).
 - Evidence: Pool telemetry now surfaces hit/miss counters and gauges so operators can alert on unhealthy reuse (`crates/lunatic-process/src/instance_pool.rs:107`).
 - Evidence: Control client HTTP wrappers propagate structured errors without leaking debug output (`crates/lunatic-distributed/src/control/client.rs:209`).
-- ✅ ~~Gap: distributed scheduler still lacks automated stress runs to validate cluster-wide quotas across nodes~~ **RESOLVED**: Distributed stress test added (`crates/lunatic-distributed/tests/node_failure.rs::test_distributed_stress_message_throughput`) validates cross-node message throughput with 1000+ messages across 3 nodes, 10 concurrent senders, and >70% success rate requirement. Comprehensive documentation in `docs/testing/DISTRIBUTED_STRESS_TESTING.md`.
+- Gap: distributed scheduler stress, sustained throughput, and cluster-wide process/memory/network quota enforcement are not covered. The current multi-node tests validate registry correctness, not scheduler capacity (`docs/testing/DISTRIBUTED_STRESS_TESTING.md`).
 
 ## 2. Language Independence via WebAssembly
 - Evidence: host registration for all subsystems lives behind traits and is language-neutral (`src/state.rs:195`).
@@ -74,9 +74,10 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: module registry tracks versions and dependency reload order (`crates/lunatic-process/src/module_registry.rs:61`).
 - Evidence: **Rollback mechanism fully implemented** - atomic reload failures trigger automatic rollback to previous version (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`).
 - Evidence: rollback signals sent to successfully reloaded processes on atomic reload failure, maintaining system consistency.
-- Evidence: **Comprehensive distributed testing now in place** - Node failure scenarios, cross-node hot reload coordination, network partition handling, and rollback testing (`crates/lunatic-distributed/tests/node_failure.rs`, `crates/lunatic-distributed/tests/cross_node_hot_reload.rs`).
+- Evidence: global registration crosses real localhost mTLS QUIC endpoints and verifies one-winner contention in 2/3/5-node clusters, majority blocking, partition recovery, and resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- Evidence: production QUIC framing reassembles and dispatches a 4,097-byte multi-chunk distributed request (`crates/lunatic-distributed/tests/quic_transport.rs`).
 - ✅ ~~Gap: inline comment still states "TODO: Implement full hot reload logic"~~ **RESOLVED**: Hot reload implementation is complete and TODO has been removed.
-- ✅ ~~Gap: distributed crate lacks tests covering node failure, so high availability story ends at a single node~~ **RESOLVED**: Comprehensive test suite covering node crashes, network partitions, coordinated hot reload, atomic reload failures, and rollback scenarios across multi-node clusters.
+- Gap: registry endpoint interruption and recovery are covered, but live distributed process crashes, cross-node hot reload, rollback, and message recovery are not production-path E2E tested.
 
 ## 5. Asynchronous by Default
 - Evidence: main loop biases handling signals before resuming guest future, preventing starvation (`crates/lunatic-process/src/lib.rs:507`).
@@ -91,9 +92,9 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `GlobalProcessId` represents node/environment/process coordinates and supports compact encoding (`crates/lunatic-distributed/src/distributed/global_process_id.rs`).
 - Evidence: `DistributedRegistry` provides concurrent in-memory local/global maps and reverse lookup (`crates/lunatic-distributed/src/distributed/registry.rs`).
 - Evidence: `RegistryCoordinator` defines coordination messages and handler-side response aggregation (`crates/lunatic-distributed/src/distributed/registry_coordination.rs`).
-- Evidence: registry tests validate map operations, serialization, and manually orchestrated handler transitions (`crates/lunatic-distributed/tests/distributed_registry.rs`, `crates/lunatic-distributed/tests/registry_coordination.rs`).
-- Gap: multi-node `register_global_coordinated` stores a pending request and returns without sending a request or waiting for a quorum (`crates/lunatic-distributed/src/distributed/registry_coordination.rs:128-175`). Coordination messages are not carried by the existing distributed request/response transport, and the integration tests invoke handlers directly rather than running networked nodes.
-- Gap: tooling (tracing, dashboards) referenced in `CORE_VALUES.md` not implemented.
+- Evidence: `Client::register_global` delegates to `register_global_coordinated`, and `Request::Registry` carries prepare/response/decision/notify/sync messages through the production QUIC transport (`crates/lunatic-distributed/src/distributed/client.rs`, `crates/lunatic-distributed/src/distributed/message.rs`, `crates/lunatic-distributed/src/quic/quin.rs`).
+- Evidence: networked integration tests run real 2/3/5-node endpoints and prove one-winner registration, request-ID uniqueness, quorum waiting, and post-partition resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- Gap: registry lookup is not yet integrated into an end-to-end live distributed process-mailbox benchmark, and tooling (tracing, dashboards) referenced in `CORE_VALUES.md` is not implemented.
 
 ## Validation and Test Coverage
 
@@ -101,10 +102,10 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 | --- | --- | --- | --- |
 | OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process lifecycle and restart strategies; GenEvent exact-target and isolated concurrent fan-out | Supervisor automatic monitor-event intake; GenStatem/GenEvent process-runtime adapters; guest-WASM adapters | `cargo test -p lunatic-otp-patterns` (41 tests pass, including 9 real-process integration tests and 5 GenEvent contract tests) |
 | TLS streams | Live in-process transfer with preserved session, guest ID and timeouts; metadata serialization contract | Serialized/cross-process active-stream restoration | `cargo test --lib state::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`; `cargo test --test tls_stream_migration_contract` |
-| Global registry | In-memory registry operations and coordination handler transitions | Control/QUIC transport wiring, quorum wait, live concurrent registration, partition recovery | `cargo test -p lunatic-distributed --test registry_coordination` (8 manually orchestrated tests pass) |
-| QUIC benchmark | Real loopback mTLS, production uni-stream chunk framing, reassembly, MessagePack decode, and request dispatch boundary | Live process-mailbox delivery and multi-node behavior | `cargo bench --bench distributed_messaging` executes the measured path; `python scripts/check_bench_thresholds.py distributed_messaging` enforces its ceiling |
+| Global registry | Production mTLS QUIC transport, 2/3/5-node contention, request-ID uniqueness, quorum wait and partition resync | Live process ownership cleanup and process-mailbox lookup path | `cargo test -p lunatic-distributed --test registry_coordination` (4 networked E2E tests pass) |
+| QUIC transport and benchmark | Real loopback mTLS, production uni-stream chunk framing, reassembly, MessagePack decode, and request dispatch boundary | Live process-mailbox delivery and cross-host behavior | `cargo test -p lunatic-distributed --test quic_transport`; `cargo bench --bench distributed_messaging`; `python scripts/check_bench_thresholds.py distributed_messaging` |
 
-These commands were executed on Windows against the reviewed baseline on 2026-07-21. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem/GenEvent process-runtime adapters, serialized TLS recovery, registry, or distributed messaging gaps.
+These commands were executed on Windows against the reviewed baseline on 2026-07-21. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem/GenEvent process-runtime adapters, serialized TLS recovery, live distributed process delivery, or scheduler stress gaps.
 
 ## Known Documentation Deltas
 - Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
@@ -123,12 +124,12 @@ These commands were executed on Windows against the reviewed baseline on 2026-07
 - Gap: connect Supervisor monitor intake and GenStatem/GenEvent adapters to the process runtime before claiming complete OTP runtime coverage.
 
 ## Recommended Follow-Ups
-1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
+1. Add a live cross-node process-mailbox round-trip correctness test and benchmark beyond the current QUIC dispatch boundary.
 2. If cross-process TLS recovery becomes a requirement, design an explicit application-level quiesce/replay protocol; do not substitute a fresh stream behind an existing guest handle.
 3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
 5. Connect Supervisor monitor-event intake, GenStatem, and GenEvent to real Lunatic processes; add guest-WASM adapters and GenServer named registration.
-6. Carry registry coordination messages over the control/QUIC transport and test quorum behavior with real nodes.
+6. Add deterministic distributed process-failure, cross-node hot-reload, and cluster-wide quota stress suites.
 7. Add structured audit logging for privileged host operations to close the remaining security gap.
 
 ## Related Resources

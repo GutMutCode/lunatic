@@ -167,7 +167,8 @@ fn query_prepare<T: ProcessState + ErrorCtx + SQLiteCtx>(
             .as_ref()
             .map(|r| (*r).clone())
             .or_trap("lunatic::sqlite::query_prepare::obtain_conn")?;
-        let conn = conn.lock()
+        let conn = conn
+            .lock()
             .or_trap("lunatic::sqlite::query_prepare::obtain_conn")?;
 
         // prepare the statement

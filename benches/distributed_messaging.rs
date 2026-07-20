@@ -71,26 +71,23 @@ impl QuicDispatchHarness {
                                 tokio::spawn(async move {
                                     match connecting.await {
                                         Ok(connection) => {
-                                            loop {
-                                                match connection.accept_uni().await {
-                                                    Ok(recv) => {
+                                            while let Ok(recv) = connection.accept_uni().await {
+                                                let dispatch_tx = dispatch_tx.clone();
+                                                tokio::spawn(handle_request_stream(
+                                                    recv,
+                                                    move |message_id, request| {
                                                         let dispatch_tx = dispatch_tx.clone();
-                                                        tokio::spawn(handle_request_stream(
-                                                            recv,
-                                                            move |message_id, request| {
-                                                                let dispatch_tx = dispatch_tx.clone();
-                                                                async move {
-                                                                    if let Request::Message { data, .. } = request {
-                                                                        let _ = dispatch_tx
-                                                                            .send((message_id, data))
-                                                                            .await;
-                                                                    }
-                                                                }
-                                                            },
-                                                        ));
-                                                    }
-                                                    Err(_) => break,
-                                                }
+                                                        async move {
+                                                            if let Request::Message { data, .. } =
+                                                                request
+                                                            {
+                                                                let _ = dispatch_tx
+                                                                    .send((message_id, data))
+                                                                    .await;
+                                                            }
+                                                        }
+                                                    },
+                                                ));
                                             }
                                         }
                                         Err(error) => {

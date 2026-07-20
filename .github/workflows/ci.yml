@@ -52,12 +52,12 @@ jobs:
         run: cargo clippy --examples --tests --benches -- -D warnings
       - name: "Check formatting"
         run: cargo fmt -- --check
-      - name: "Run tests"
+      - name: "Run workspace tests and E2E suites"
         run: cargo test --all
       - name: "Run benchmarks (baseline check)"
         if: runner.os == 'Linux'
         run: |
-          cargo bench --bench benchmark --no-fail-fast -- --output-format bencher | tee benchmark_output.txt
+          cargo bench --bench spawn --no-fail-fast -- --output-format bencher | tee benchmark_output.txt
           cargo bench --bench mailbox --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           cargo bench --bench hot_reload --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           cargo bench --bench memory_profile --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt

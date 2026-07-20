@@ -42,7 +42,7 @@ impl Default for DefaultProcessConfig {
             preopened_dirs: Vec::new(),
             command_line_arguments: Vec::new(),
             environment_variables: Vec::new(),
-            max_table_elements: 10_000,
+            max_table_elements: 100_000,
             max_file_descriptors: 1024,
             max_network_connections: 1024,
         }
@@ -192,10 +192,7 @@ impl ProcessConfigCtx for DefaultProcessConfig {
         let has_access = self
             .preopened_dirs()
             .iter()
-            .filter_map(|(_, dir)| match get_absolute_path(Path::new(dir)) {
-                Ok(d) => Some(d),
-                _ => None,
-            })
+            .filter_map(|(_, dir)| get_absolute_path(Path::new(dir)).ok())
             .any(|dir| dir.exists() && path_is_ancestor(&dir, &parent_dir));
 
         match has_access {
@@ -204,7 +201,6 @@ impl ProcessConfigCtx for DefaultProcessConfig {
         }
     }
 }
-
 fn path_is_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     let ancestor_path = Path::new(ancestor);
     let descendant_path = Path::new(descendant);
@@ -332,4 +328,3 @@ mod tests {
         assert_eq!(crates, normalize_path(&sneaky_path));
     }
 }
-

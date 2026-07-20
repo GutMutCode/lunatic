@@ -1,4 +1,3 @@
-use lunatic_networking_api::NetworkingCtx;
 use lunatic_runtime::state::DefaultProcessState;
 use lunatic_runtime::DefaultProcessConfig;
 

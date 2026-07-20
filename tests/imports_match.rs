@@ -93,8 +93,8 @@ fn render_wat_file(imports: &BTreeMap<(String, String), FuncSig>) -> String {
     output
 }
 
-#[test]
-fn wat_imports_are_in_sync_with_runtime() -> Result<()> {
+#[tokio::test]
+async fn wat_imports_are_in_sync_with_runtime() -> Result<()> {
     let config = default_config();
     let runtime = WasmtimeRuntime::new(&config)?;
     let engine = runtime.engine();
@@ -126,7 +126,7 @@ fn wat_imports_are_in_sync_with_runtime() -> Result<()> {
     let mut host_imports: BTreeMap<(String, String), FuncSig> = BTreeMap::new();
     for (module, name, ext) in definitions {
         let key = (module, name);
-        let extern_type = ext.ty(&store.as_context());
+        let extern_type = ext.ty(store.as_context());
         let signature = func_sig_from_extern_type(&extern_type);
         let prev = host_imports.insert(key.clone(), signature);
         assert!(
@@ -137,7 +137,7 @@ fn wat_imports_are_in_sync_with_runtime() -> Result<()> {
     }
 
     let expected_wat = render_wat_file(&host_imports);
-    let current_wat = std::fs::read_to_string("wat/all_imports.wat")?;
+    let current_wat = std::fs::read_to_string("wat/all_imports.wat")?.replace("\r\n", "\n");
     if current_wat != expected_wat {
         std::fs::write("target/expected_all_imports.wat", &expected_wat)?;
         panic!(

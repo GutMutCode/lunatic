@@ -20,7 +20,7 @@ This document contains actual benchmark results from Lunatic's performance suite
 
 ## 1. Process Spawning Performance
 
-**Benchmark**: `benches/benchmark.rs::spawn process`
+**Benchmark**: `benches/spawn.rs::spawn process`
 
 ### Results
 
@@ -225,7 +225,7 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 ```bash
 # Process spawn benchmark
-cargo bench --bench benchmark
+cargo bench --bench spawn
 
 # Message passing benchmark
 cargo bench --bench mailbox
@@ -384,7 +384,7 @@ Process creation overhead:
 
 **Total Benchmarks**: 4 suites, 20+ individual tests
 
-1. **`benchmark.rs`** - Process spawn ✅
+1. **`spawn.rs`** - Process spawn ✅
 2. **`mailbox.rs`** - Message passing ✅
 3. **`hot_reload.rs`** - Hot reload cycle ✅
 4. **`memory_profile.rs`** - Memory profiling ✅

@@ -124,6 +124,7 @@ where
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(path.clone())
         {
             Ok(mut file) => {

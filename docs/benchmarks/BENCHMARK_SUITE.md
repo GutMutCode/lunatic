@@ -9,7 +9,7 @@
 
 Lunatic's benchmark suite provides comprehensive performance measurements across all core components:
 
-1. **Process Spawn** (`benchmark.rs`) - Process creation performance
+1. **Process Spawn** (`spawn.rs`) - Process creation performance
 2. **Message Passing** (`mailbox.rs`) - Mailbox and selective receive
 3. **Hot Reload** (`hot_reload.rs`) - End-to-end hot code reloading
 4. **Memory Profile** (`memory_profile.rs`) - Memory overhead and scalability
@@ -30,7 +30,7 @@ The benchmark covers MessagePack, chunking/framing, loopback QUIC, reassembly, d
 cargo bench
 
 # Run specific suite
-cargo bench --bench benchmark      # Process spawn
+cargo bench --bench spawn          # Process spawn
 cargo bench --bench mailbox        # Message passing
 cargo bench --bench hot_reload     # Hot reload
 cargo bench --bench memory_profile # Memory profiling
@@ -44,7 +44,7 @@ open target/criterion/report/index.html
 
 ## Benchmark Results Summary
 
-### 1. Process Spawn (`benchmark.rs`)
+### 1. Process Spawn (`spawn.rs`)
 
 **Key Metric**: **23.055μs** per process
 
@@ -162,7 +162,7 @@ spawn process           time:   [22.971 µs 23.055 µs 23.139 µs]
 - name: "Run benchmarks (baseline check)"
   if: runner.os == 'Linux'
   run: |
-    cargo bench --bench benchmark --no-fail-fast
+    cargo bench --bench spawn --no-fail-fast
     cargo bench --bench mailbox --no-fail-fast  
     cargo bench --bench hot_reload --no-fail-fast
     cargo bench --bench memory_profile --no-fail-fast

@@ -123,7 +123,7 @@ Successfully implemented a comprehensive benchmark suite for Lunatic runtime, va
 
 ```
 benches/
-├── benchmark.rs          ✅ Process spawn (23.055μs)
+├── spawn.rs              ✅ Process spawn (23.055μs)
 ├── mailbox.rs           ✅ Message passing (353ns)
 ├── hot_reload.rs        ✅ Hot reload (0.76ms)
 └── memory_profile.rs    ✅ Memory profiling (66KB/process)
@@ -283,7 +283,7 @@ CORE_VALUES.md                   # Metrics (UPDATED)
 ## 📝 Deliverables Checklist
 
 ### Code
-- ✅ `benches/benchmark.rs` - Fixed Tokio runtime issue
+- ✅ `benches/spawn.rs` - Fixed Tokio runtime issue
 - ✅ `benches/hot_reload.rs` - Hot reload suite (NEW)
 - ✅ `benches/memory_profile.rs` - Memory profiling (NEW)
 - ✅ `.github/workflows/ci.yml` - CI/CD integration
@@ -307,7 +307,7 @@ CORE_VALUES.md                   # Metrics (UPDATED)
 ## 🏆 Success Criteria Met
 
 ### Original Goals
-1. ✅ Fix benchmark.rs Tokio runtime issue
+1. ✅ Fix spawn.rs Tokio runtime issue
 2. ✅ Measure actual process spawn times
 3. ✅ Measure message passing latency
 4. ✅ Document Priority 1-3 improvements

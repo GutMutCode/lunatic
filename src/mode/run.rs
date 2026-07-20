@@ -1,4 +1,7 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -116,20 +119,19 @@ async fn run_with_watch(
         env_id: u64,
     }
 
-    let mut process_info: Option<ProcessInfo> = None;
     let mut last_reload_time = tokio::time::Instant::now();
     let reload_debounce = tokio::time::Duration::from_millis(500);
 
     async fn start_process(
         runtime: &runtimes::wasmtime::WasmtimeRuntime,
-        path: &PathBuf,
+        path: &Path,
         wasm_args: &[String],
         dir: &[PathBuf],
         envs: Arc<LunaticEnvironments>,
         env: Arc<LunaticEnvironment>,
     ) -> Result<tokio::task::JoinHandle<Result<()>>> {
         let runtime_clone = runtime.clone();
-        let path_clone = path.clone();
+        let path_clone = path.to_path_buf();
         let wasm_args_clone = wasm_args.to_vec();
         let dir_clone = dir.to_vec();
 
@@ -150,7 +152,7 @@ async fn run_with_watch(
 
     let handle =
         start_process(&runtime, &path, &wasm_args, &dir, envs.clone(), env.clone()).await?;
-    process_info = Some(ProcessInfo { handle, env_id: 1 });
+    let mut process_info = Some(ProcessInfo { handle, env_id: 1 });
     info!("Initial process started with hot reload support");
 
     loop {
@@ -202,7 +204,6 @@ async fn run_with_watch(
                 match result {
                     Ok(Ok(_)) => {
                         info!("Process finished successfully");
-                        process_info = None;
                         break;
                     }
                     Ok(Err(e)) => {
@@ -215,7 +216,6 @@ async fn run_with_watch(
                     }
                     Err(e) => {
                         error!("Process panicked: {}", e);
-                        process_info = None;
                         break;
                     }
                 }
