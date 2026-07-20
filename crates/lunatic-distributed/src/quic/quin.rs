@@ -12,9 +12,7 @@ use rustls_pemfile::Item;
 use wasmtime::ResourceLimiter;
 use x509_parser::{der_parser::oid, oid_registry::asn1_rs::Utf8String, prelude::FromDer};
 
-use crate::{
-    CertAttrs, DistributedCtx,
-};
+use crate::{CertAttrs, DistributedCtx};
 
 #[derive(Clone)]
 pub struct Client {
@@ -42,6 +40,27 @@ impl Client {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         Err(anyhow!("Failed to connect to {name} at {addr}"))
+    }
+
+    /// Send one complete distributed protocol message over an authenticated QUIC stream.
+    pub async fn send_message(
+        &self,
+        addr: SocketAddr,
+        name: &str,
+        message_id: u64,
+        data: Bytes,
+    ) -> Result<()> {
+        let conn = self._connect(addr, name).await?;
+        let mut stream = conn.open_uni().await?;
+        let mut header = Vec::with_capacity(24);
+        header.extend_from_slice(&message_id.to_le_bytes());
+        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        let mut chunks = [Bytes::from(header), data];
+        stream.write_all_chunks(&mut chunks).await?;
+        stream.finish().await?;
+        Ok(())
     }
 }
 
@@ -170,6 +189,67 @@ where
     Err(anyhow!("Node server exited"))
 }
 
+/// Run the registry-only side of the node protocol.
+///
+/// This uses the same mutual-TLS connection, framing, and `Request` decoding as
+/// the full node server and is useful for focused cluster tests and registry-only
+/// deployments.
+pub async fn handle_registry_server(
+    quic_server: &mut Endpoint,
+    client: distributed::Client,
+) -> Result<()> {
+    while let Some(conn) = quic_server.accept().await {
+        let client = client.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_quic_connection_registry(client, conn).await {
+                log::warn!("Registry QUIC connection failed: {error}");
+            }
+        });
+    }
+    Err(anyhow!("Registry server exited"))
+}
+
+async fn handle_quic_connection_registry(
+    client: distributed::Client,
+    conn: Connecting,
+) -> Result<()> {
+    let conn = conn.await?;
+    get_cert_attrs(&conn)?;
+    loop {
+        match conn.accept_uni().await {
+            Ok(recv) => {
+                tokio::spawn(handle_quic_stream_registry(client.clone(), recv));
+            }
+            Err(ConnectionError::LocallyClosed) => break,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+async fn handle_quic_stream_registry(client: distributed::Client, recv: quinn::RecvStream) {
+    let mut recv_ctx = RecvCtx {
+        recv,
+        chunks: DashMap::new(),
+    };
+    while let Ok((_msg_id, bytes)) = read_next_stream_message(&mut recv_ctx).await {
+        match distributed::message::deserialize_message::<distributed::message::Request>(&bytes) {
+            Ok(distributed::message::Request::Registry { node_id, message }) => {
+                if let Err(error) = client.handle_registry_message(node_id, message).await {
+                    log::warn!("Error handling registry coordination message: {error}");
+                }
+            }
+            Ok(other) => {
+                log::debug!(
+                    "Registry-only server ignored {} distributed request",
+                    other.kind()
+                );
+            }
+            Err(error) => log::debug!("Error deserializing registry request: {error}"),
+        }
+    }
+}
+
 pub struct NodeEnvPermission(pub Option<HashSet<u64>>);
 
 impl NodeEnvPermission {
@@ -248,7 +328,9 @@ async fn handle_quic_stream_node<T, E>(
     };
     log::trace!("distributed::server::handle_quic_stream started");
     while let Ok((msg_id, bytes)) = read_next_stream_message(&mut recv_ctx).await {
-        if let Ok(request) = distributed::message::deserialize_message::<distributed::message::Request>(&bytes) {
+        if let Ok(request) =
+            distributed::message::deserialize_message::<distributed::message::Request>(&bytes)
+        {
             distributed::server::handle_message(
                 ctx.clone(),
                 msg_id,

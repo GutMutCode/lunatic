@@ -29,6 +29,31 @@ pub struct InnerClient {
 }
 
 impl Client {
+    /// Construct a client from an already-known static node topology.
+    ///
+    /// This avoids an HTTP control-plane dependency for embedded deployments and
+    /// deterministic node-to-node protocol tests.
+    #[doc(hidden)]
+    pub fn from_static_nodes(reg: Registration, node_id: u64, nodes: Vec<NodeInfo>) -> Self {
+        let node_ids = nodes.iter().map(|node| node.id).collect();
+        let node_map = DashMap::new();
+        for node in nodes {
+            node_map.insert(node.id, node);
+        }
+        Self {
+            inner: Arc::new(InnerClient {
+                reg,
+                node_id,
+                http_client: HttpClient::new(),
+                next_message_id: AtomicU64::new(1),
+                next_query_id: AtomicU64::new(1),
+                node_queries: DashMap::new(),
+                nodes: node_map,
+                node_ids: RwLock::new(node_ids),
+            }),
+        }
+    }
+
     pub async fn new(
         http_client: HttpClient,
         reg: Registration,

@@ -128,6 +128,7 @@ where
             data: _,
         } => Some((*node_id, *environment_id)),
         Request::Response(_) => None,
+        Request::Registry { .. } => None,
     };
     if let Some((node_id, env_id)) = env_id {
         if let Some(ref allowed_envs) = node_permissions.0 {
@@ -248,6 +249,12 @@ where
         Request::Response(response) => {
             log::trace!("distributed::server process Response");
             ctx.node_client.recv_response(response).await;
+        }
+        Request::Registry { node_id, message } => {
+            log::trace!("distributed::server process Registry");
+            ctx.node_client
+                .handle_registry_message(node_id, message)
+                .await?;
         }
     };
     Ok(())

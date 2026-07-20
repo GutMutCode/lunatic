@@ -2,6 +2,7 @@ use super::global_process_id::GlobalProcessId;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Registered name for a process in the distributed registry
@@ -52,7 +53,7 @@ pub struct RegistryEntry {
 /// Supports both local and global name registration, mirroring Erlang's
 /// registry semantics:
 /// - Local registration: name is unique within the node
-/// - Global registration: name is unique across the entire cluster
+/// - Global entries: the local view of names committed cluster-wide
 ///
 /// Example:
 /// ```ignore
@@ -62,7 +63,7 @@ pub struct RegistryEntry {
 /// registry.register_local("logger", gpid)?;
 ///
 /// // Register globally (requires coordination)
-/// registry.register_global("database_manager", gpid)?;
+/// registry.register_global("database_manager", gpid)?; // local storage primitive
 ///
 /// // Lookup by name
 /// if let Some(entry) = registry.lookup("logger") {
@@ -120,36 +121,74 @@ impl DistributedRegistry {
         Ok(())
     }
 
-    /// Register a process with a global name (cluster-wide)
+    /// Insert a process into this node's global registry view.
     ///
-    /// Returns an error if the name is already registered globally
+    /// Returns an error if the name is already present locally. Cluster callers
+    /// should use [`super::Client::register_global`] so success waits for quorum.
     ///
-    /// Note: In a production system, this should coordinate with other nodes
-    /// via the control plane to ensure uniqueness across the cluster
+    /// This method remains public as a low-level storage primitive and for
+    /// single-node use.
     pub fn register_global(
         &self,
         name: impl Into<ProcessName>,
         global_pid: GlobalProcessId,
     ) -> Result<()> {
         let name = name.into();
-
-        if self.global.contains_key(&name) {
-            return Err(anyhow!(
-                "Name '{}' already registered globally",
-                name.as_str()
-            ));
-        }
-
         let entry = RegistryEntry {
             global_pid,
             scope: RegistrationScope::Global,
             registered_at: current_timestamp_ms(),
         };
+        self.insert_global_if_absent(name, entry)
+    }
 
-        self.global.insert(name.clone(), entry);
-        self.add_reverse_mapping(global_pid, name);
+    /// Apply a committed cluster registration.
+    ///
+    /// The elected registry coordinator is authoritative, so a committed value
+    /// replaces stale state left behind by a partition.
+    pub(crate) fn apply_global(
+        &self,
+        name: impl Into<ProcessName>,
+        global_pid: GlobalProcessId,
+        registered_at: u64,
+    ) {
+        let name = name.into();
+        if let Some(previous) = self.global.insert(
+            name.clone(),
+            RegistryEntry {
+                global_pid,
+                scope: RegistrationScope::Global,
+                registered_at,
+            },
+        ) {
+            if previous.global_pid != global_pid {
+                self.remove_reverse_mapping(previous.global_pid, &name);
+            }
+        }
+        self.add_reverse_mapping_once(global_pid, name);
+    }
 
-        Ok(())
+    /// Replace global state with an authoritative coordinator snapshot.
+    pub(crate) fn replace_global_snapshot(&self, entries: Vec<(String, GlobalProcessId, u64)>) {
+        let incoming_names: HashSet<ProcessName> = entries
+            .iter()
+            .map(|(name, _, _)| ProcessName::new(name.clone()))
+            .collect();
+
+        let stale_names: Vec<ProcessName> = self
+            .global_names()
+            .into_iter()
+            .filter(|name| !incoming_names.contains(name))
+            .collect();
+        for name in stale_names {
+            if let Some((_, entry)) = self.global.remove(&name) {
+                self.remove_reverse_mapping(entry.global_pid, &name);
+            }
+        }
+
+        for (name, global_pid, registered_at) in entries {
+            self.apply_global(name, global_pid, registered_at);
+        }
     }
 
     /// Unregister a process name
@@ -251,11 +290,32 @@ impl DistributedRegistry {
 
     // Internal helpers
 
+    fn insert_global_if_absent(&self, name: ProcessName, entry: RegistryEntry) -> Result<()> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.global.entry(name.clone()) {
+            Entry::Occupied(_) => Err(anyhow!(
+                "Name '{}' already registered globally",
+                name.as_str()
+            )),
+            Entry::Vacant(slot) => {
+                let global_pid = entry.global_pid;
+                slot.insert(entry);
+                self.add_reverse_mapping_once(global_pid, name);
+                Ok(())
+            }
+        }
+    }
+
     fn add_reverse_mapping(&self, global_pid: GlobalProcessId, name: ProcessName) {
-        self.reverse
-            .entry(global_pid)
-            .or_default()
-            .push(name);
+        self.reverse.entry(global_pid).or_default().push(name);
+    }
+
+    fn add_reverse_mapping_once(&self, global_pid: GlobalProcessId, name: ProcessName) {
+        let mut names = self.reverse.entry(global_pid).or_default();
+        if !names.contains(&name) {
+            names.push(name);
+        }
     }
 
     fn remove_reverse_mapping(&self, global_pid: GlobalProcessId, name: &ProcessName) {

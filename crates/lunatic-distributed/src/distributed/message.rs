@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use super::registry_coordination::RegistryCoordinationMessage;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Spawn(Spawn),
@@ -12,6 +14,10 @@ pub enum Request {
         data: Vec<u8>,
     },
     Response(Response),
+    Registry {
+        node_id: u64,
+        message: RegistryCoordinationMessage,
+    },
 }
 
 impl Request {
@@ -20,6 +26,7 @@ impl Request {
             Request::Spawn(_) => "Spawn",
             Request::Message { .. } => "Message",
             Request::Response(_) => "Response",
+            Request::Registry { .. } => "Registry",
         }
     }
 }

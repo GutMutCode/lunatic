@@ -22,7 +22,7 @@ use crate::{
     control,
     distributed::message::{Request, ResponseContent, Spawn},
     distributed::registry::DistributedRegistry,
-    distributed::registry_coordination::RegistryCoordinator,
+    distributed::registry_coordination::{RegistryCoordinationMessage, RegistryCoordinator},
     quic,
 };
 
@@ -126,8 +126,10 @@ impl Client {
                 coordinator,
             }),
         };
+        client.inner.coordinator.attach_client(&client);
         tokio::spawn(congestion::congestion_control_worker(client.clone()));
         tokio::spawn(process_responses(client.clone(), recv));
+        tokio::spawn(registry_sync_worker(client.clone()));
         client
     }
 
@@ -139,6 +141,60 @@ impl Client {
     /// Get a reference to the registry coordinator
     pub fn coordinator(&self) -> &RegistryCoordinator {
         &self.inner.coordinator
+    }
+
+    pub(crate) fn registry_node_ids(&self) -> Vec<u64> {
+        self.inner.control_client.node_ids()
+    }
+
+    /// Register a cluster-wide process name through the registry quorum.
+    pub async fn register_global(
+        &self,
+        name: impl Into<super::registry::ProcessName>,
+        global_pid: super::GlobalProcessId,
+    ) -> Result<()> {
+        self.inner
+            .coordinator
+            .register_global_coordinated(name, global_pid, self.inner.control_client.node_count())
+            .await
+    }
+
+    /// Pull an authoritative registry snapshot from the cluster coordinator.
+    pub async fn synchronize_registry(&self) -> Result<()> {
+        self.inner.coordinator.synchronize_from_coordinator().await
+    }
+
+    pub(crate) async fn send_registry_coordination(
+        &self,
+        node_id: u64,
+        coordination: RegistryCoordinationMessage,
+    ) -> Result<()> {
+        let node = self
+            .inner
+            .control_client
+            .node_info(node_id)
+            .ok_or_else(|| anyhow!("Registry target node {node_id} does not exist"))?;
+        let message = Request::Registry {
+            node_id: self.node_id.0,
+            message: coordination,
+        };
+        let data = message::serialize_message(&message)?;
+        let message_id = self.next_message_id().0;
+        self.inner
+            .node_client
+            .send_message(node.address, &node.name, message_id, data.into())
+            .await
+    }
+
+    pub async fn handle_registry_message(
+        &self,
+        source_node_id: u64,
+        message: RegistryCoordinationMessage,
+    ) -> Result<()> {
+        self.inner
+            .coordinator
+            .handle_message(source_node_id, message)
+            .await
     }
 
     fn next_message_id(&self) -> MessageId {
@@ -230,8 +286,9 @@ impl Client {
             tag: params.tag,
             data: params.data,
         };
-        let data = message::serialize_message(&message)
-            .unwrap_or_else(|_| unreachable!("lunatic::distributed::client::send serialize_message"));
+        let data = message::serialize_message(&message).unwrap_or_else(|_| {
+            unreachable!("lunatic::distributed::client::send serialize_message")
+        });
         self.new_message(
             params.env,
             params.src,
@@ -245,8 +302,9 @@ impl Client {
     // Send distributed spawn message
     pub async fn spawn(&self, params: SpawnParams) -> Result<MessageId> {
         let message = Request::Spawn(params.spawn);
-        let data = message::serialize_message(&message)
-            .unwrap_or_else(|_| unreachable!("lunatic::distributed::client::spawn serialize_message"));
+        let data = message::serialize_message(&message).unwrap_or_else(|_| {
+            unreachable!("lunatic::distributed::client::spawn serialize_message")
+        });
         let message_id = self
             .new_message(
                 params.env,
@@ -265,8 +323,9 @@ impl Client {
     // Send distributed response message
     pub async fn send_response(&self, params: ResponseParams) -> Result<MessageId> {
         let message = Request::Response(params.response);
-        let data = message::serialize_message(&message)
-            .unwrap_or_else(|_| unreachable!("lunatic::distributed::client::send_response serialize_message"));
+        let data = message::serialize_message(&message).unwrap_or_else(|_| {
+            unreachable!("lunatic::distributed::client::send_response serialize_message")
+        });
         self.new_message(
             EnvironmentId(0),
             ProcessId(0),
@@ -297,6 +356,17 @@ impl Client {
             .await;
         self.inner.responses.remove(&message_id);
         Ok(response)
+    }
+}
+
+async fn registry_sync_worker(client: Client) -> ! {
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        if let Err(error) = client.synchronize_registry().await {
+            log::trace!("Periodic registry synchronization failed: {error}");
+        }
     }
 }
 
