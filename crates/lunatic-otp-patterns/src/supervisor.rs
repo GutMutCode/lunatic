@@ -7,6 +7,15 @@
 //!
 //! ```ignore
 //! use lunatic_otp_patterns::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec};
+//! use lunatic_process::{env::Environment, spawn_native, Process};
+//! use std::{future, sync::Arc};
+//!
+//! fn start_worker(environment: Arc<dyn Environment>) -> Result<Arc<dyn Process>, String> {
+//!     let (_join, process) = spawn_native(environment, |_process, _mailbox| async move {
+//!         future::pending::<anyhow::Result<()>>().await
+//!     });
+//!     Ok(Arc::new(process))
+//! }
 //!
 //! let spec = SupervisorSpec {
 //!     strategy: RestartStrategy::OneForOne,
@@ -15,26 +24,41 @@
 //!     children: vec![
 //!         ChildSpec {
 //!             id: "worker1".to_string(),
-//!             start: WorkerModule::start,
+//!             start: start_worker,
 //!             restart: RestartPolicy::Permanent,
 //!             shutdown: ShutdownPolicy::Timeout(5000),
 //!         },
 //!         ChildSpec {
 //!             id: "worker2".to_string(),
-//!             start: WorkerModule::start,
+//!             start: start_worker,
 //!             restart: RestartPolicy::Transient,
 //!             shutdown: ShutdownPolicy::Brutal,
 //!         },
 //!     ],
 //! };
 //!
-//! let supervisor = Supervisor::start(spec)?;
+//! let mut supervisor = Supervisor::new(spec);
+//! supervisor.start_children()?;
 //! ```
 
 use anyhow::Result;
+use lunatic_process::{
+    env::{Environment, LunaticEnvironment},
+    Process, Signal,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fmt::Debug;
+use std::{
+    collections::HashMap,
+    fmt::{self, Debug},
+    sync::Arc,
+    thread,
+    time::{Duration, Instant},
+};
+
+const BRUTAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Function used to start a child in the supervisor's Lunatic environment.
+pub type ChildStart = fn(Arc<dyn Environment>) -> Result<Arc<dyn Process>, String>;
 
 /// Supervisor specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +113,7 @@ pub struct ChildSpec {
     /// Module and function to start the child
     #[serde(skip)]
     #[serde(default = "default_start_fn")] // Function pointers can't be serialized
-    pub start: fn() -> Result<u64, String>,
+    pub start: ChildStart,
 
     /// Restart policy
     pub restart: RestartPolicy,
@@ -103,8 +127,8 @@ pub struct ChildSpec {
 }
 
 // Default start function for serialization
-fn default_start_fn() -> fn() -> Result<u64, String> {
-    || Err("No start function provided".to_string())
+fn default_start_fn() -> ChildStart {
+    |_| Err("No start function provided".to_string())
 }
 
 /// Restart policy for child processes
@@ -137,46 +161,40 @@ pub enum ShutdownPolicy {
 
     /// Timeout in milliseconds
     ///
-    /// Child is given time to shut down gracefully. If it doesn't
-    /// terminate within the timeout, it is killed.
+    /// Maximum time to wait for the runtime to acknowledge process termination.
     Timeout(u64),
 
     /// Infinite timeout (wait forever)
     ///
-    /// Supervisor waits indefinitely for child to terminate gracefully.
+    /// Supervisor waits indefinitely for the runtime to unregister the child.
     /// Use with caution - can block supervisor shutdown.
     Infinity,
 }
 
 /// Child process type
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChildType {
     /// Worker process (default)
+    #[default]
     Worker,
 
     /// Supervisor process
     Supervisor,
 }
 
-impl Default for ChildType {
-    fn default() -> Self {
-        ChildType::Worker
-    }
-}
-
 /// Supervisor state
-#[derive(Debug)]
 pub struct Supervisor {
     spec: SupervisorSpec,
+    environment: Arc<dyn Environment>,
     children: HashMap<String, ChildState>,
     restart_history: Vec<RestartEvent>,
 }
 
 /// Child process state
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ChildState {
     spec: ChildSpec,
-    process_id: Option<u64>,
+    process: Option<Arc<dyn Process>>,
     restart_count: u32,
 }
 
@@ -187,30 +205,73 @@ struct RestartEvent {
     child_id: String,
 }
 
+impl Debug for ChildState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChildState")
+            .field("spec", &self.spec)
+            .field(
+                "process_id",
+                &self.process.as_ref().map(|process| process.id()),
+            )
+            .field("restart_count", &self.restart_count)
+            .finish()
+    }
+}
+
+impl Debug for Supervisor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Supervisor")
+            .field("spec", &self.spec)
+            .field("environment_id", &self.environment.id())
+            .field("children", &self.children)
+            .field("restart_history", &self.restart_history)
+            .finish()
+    }
+}
+
 impl Supervisor {
     /// Create a new supervisor with the given specification
     pub fn new(spec: SupervisorSpec) -> Self {
-        let children = HashMap::new();
-        let restart_history = Vec::new();
+        Self::with_environment(spec, Arc::new(LunaticEnvironment::new(0)))
+    }
 
-        Supervisor {
+    /// Create a supervisor that starts and manages children in `environment`.
+    pub fn with_environment(spec: SupervisorSpec, environment: Arc<dyn Environment>) -> Self {
+        Self {
             spec,
-            children,
-            restart_history,
+            environment,
+            children: HashMap::new(),
+            restart_history: Vec::new(),
         }
     }
 
     /// Start all child processes
     pub fn start_children(&mut self) -> Result<(), String> {
         let child_ids: Vec<String> = self.spec.children.iter().map(|c| c.id.clone()).collect();
+        let mut started: Vec<String> = Vec::with_capacity(child_ids.len());
+
         for child_id in &child_ids {
-            self.start_child(child_id)?;
+            if let Err(error) = self.start_child(child_id) {
+                for started_child_id in started.iter().rev() {
+                    let _ = self.stop_child(started_child_id);
+                }
+                return Err(error);
+            }
+            started.push(child_id.clone());
         }
         Ok(())
     }
 
     /// Start a specific child process
     pub fn start_child(&mut self, child_id: &str) -> Result<u64, String> {
+        self.start_child_internal(child_id, false)
+    }
+
+    fn start_child_internal(&mut self, child_id: &str, is_restart: bool) -> Result<u64, String> {
+        ensure_multi_thread_runtime()?;
+
         let child_spec = self
             .spec
             .children
@@ -219,17 +280,50 @@ impl Supervisor {
             .ok_or_else(|| format!("Child '{}' not found", child_id))?
             .clone();
 
-        let process_id =
-            (child_spec.start)().map_err(|e| format!("Failed to start child: {}", e))?;
+        if let Some(state) = self.children.get_mut(child_id) {
+            if let Some(process) = state.process.as_ref() {
+                if self.environment.get_process(process.id()).is_some() {
+                    return Err(format!(
+                        "Child '{}' is already running as process {}",
+                        child_id,
+                        process.id()
+                    ));
+                }
+            }
+            state.process = None;
+        }
 
-        self.children.insert(
-            child_id.to_string(),
-            ChildState {
-                spec: child_spec,
-                process_id: Some(process_id),
-                restart_count: 0,
-            },
-        );
+        let process = (child_spec.start)(self.environment.clone())
+            .map_err(|error| format!("Failed to start child '{}': {}", child_id, error))?;
+        let process_id = process.id();
+
+        if self.environment.get_process(process_id).is_none() {
+            process.send(Signal::Kill);
+            return Err(format!(
+                "Child '{}' start function returned unregistered process {}",
+                child_id, process_id
+            ));
+        }
+
+        match self.children.get_mut(child_id) {
+            Some(state) => {
+                state.spec = child_spec;
+                state.process = Some(process);
+                if is_restart {
+                    state.restart_count = state.restart_count.saturating_add(1);
+                }
+            }
+            None => {
+                self.children.insert(
+                    child_id.to_string(),
+                    ChildState {
+                        spec: child_spec,
+                        process: Some(process),
+                        restart_count: u32::from(is_restart),
+                    },
+                );
+            }
+        }
 
         Ok(process_id)
     }
@@ -249,180 +343,181 @@ impl Supervisor {
         };
 
         if !should_restart {
-            // Mark child as stopped
-            if let Some(state) = self.children.get_mut(child_id) {
-                state.process_id = None;
-            }
-            return Ok(());
+            return self.stop_child(child_id);
         }
 
-        // Apply restart strategy
-        match self.spec.strategy {
-            RestartStrategy::OneForOne => {
-                self.restart_child(child_id)?;
+        let child_ids = match self.spec.strategy {
+            RestartStrategy::OneForOne | RestartStrategy::SimpleOneForOne => {
+                vec![child_id.to_string()]
             }
-            RestartStrategy::OneForAll => {
-                self.restart_all_children()?;
-            }
+            RestartStrategy::OneForAll => self
+                .spec
+                .children
+                .iter()
+                .filter(|child| {
+                    child.id == child_id
+                        || self
+                            .children
+                            .get(&child.id)
+                            .and_then(|state| state.process.as_ref())
+                            .is_some()
+                })
+                .map(|child| child.id.clone())
+                .collect(),
             RestartStrategy::RestForOne => {
-                self.restart_from_child(child_id)?;
+                let failed_index = self
+                    .spec
+                    .children
+                    .iter()
+                    .position(|child| child.id == child_id)
+                    .ok_or_else(|| format!("Child '{}' not found", child_id))?;
+                self.spec.children[failed_index..]
+                    .iter()
+                    .filter(|child| {
+                        child.id == child_id
+                            || self
+                                .children
+                                .get(&child.id)
+                                .and_then(|state| state.process.as_ref())
+                                .is_some()
+                    })
+                    .map(|child| child.id.clone())
+                    .collect()
             }
-            RestartStrategy::SimpleOneForOne => {
-                self.restart_child(child_id)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Restart a specific child
-    fn restart_child(&mut self, child_id: &str) -> Result<(), String> {
-        // Check restart intensity
-        self.check_restart_intensity()?;
-
-        // Record restart event
-        self.restart_history.push(RestartEvent {
-            timestamp: current_timestamp_secs(),
-            child_id: child_id.to_string(),
-        });
-
-        // Stop child if running
-        self.stop_child(child_id)?;
-
-        // Start child
-        self.start_child(child_id)?;
-
-        Ok(())
-    }
-
-    /// Restart all children
-    fn restart_all_children(&mut self) -> Result<(), String> {
-        let child_ids: Vec<String> = self.children.keys().cloned().collect();
-
-        for child_id in &child_ids {
-            self.stop_child(child_id)?;
-        }
-
-        for child_id in &child_ids {
-            self.start_child(child_id)?;
-        }
-
-        Ok(())
-    }
-
-    /// Restart child and all children started after it
-    fn restart_from_child(&mut self, failed_child_id: &str) -> Result<(), String> {
-        // Check restart intensity before proceeding
-        self.check_restart_intensity()?;
-
-        // Find index of failed child
-        let failed_index = self
-            .spec
-            .children
-            .iter()
-            .position(|c| c.id == failed_child_id)
-            .ok_or_else(|| format!("Child '{}' not found", failed_child_id))?;
-
-        // Collect child IDs to avoid borrow conflicts
-        let child_ids: Vec<String> = self.spec.children[failed_index..]
-            .iter()
-            .map(|c| c.id.clone())
-            .collect();
-
-        // Stop all children from failed_index onwards
-        for child_id in &child_ids {
-            self.stop_child(child_id)?;
-        }
-
-        // Restart all children from failed_index onwards
-        for child_id in &child_ids {
-            self.start_child(child_id)?;
-            // Log restart event for each restarted child
-            self.log_restart_event(child_id);
-        }
-
-        Ok(())
-    }
-
-    /// Log a restart event for audit purposes
-    fn log_restart_event(&mut self, child_id: &str) {
-        let event = RestartEvent {
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            child_id: child_id.to_string(),
         };
 
-        self.restart_history.push(event.clone());
+        self.restart_children(&child_ids)
+    }
 
-        // Keep only recent history (last 100 events)
-        if self.restart_history.len() > 100 {
-            self.restart_history.remove(0);
+    fn restart_children(&mut self, child_ids: &[String]) -> Result<(), String> {
+        self.reserve_restart_events(child_ids)?;
+
+        for child_id in child_ids.iter().rev() {
+            self.stop_child(child_id)?;
         }
 
-        // Log restart event
-        println!(
-            "SUPERVISOR: Child '{}' restarted at timestamp {}",
-            child_id, event.timestamp
-        );
+        let mut restarted: Vec<String> = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids {
+            if let Err(error) = self.start_child_internal(child_id, true) {
+                for restarted_child_id in restarted.iter().rev() {
+                    let _ = self.stop_child(restarted_child_id);
+                }
+                return Err(error);
+            }
+            restarted.push(child_id.clone());
+        }
+
+        Ok(())
     }
 
     /// Stop a child process
     fn stop_child(&mut self, child_id: &str) -> Result<(), String> {
-        if let Some(state) = self.children.get_mut(child_id) {
-            if let Some(process_id) = state.process_id {
-                // Kill process based on shutdown policy
-                match state.spec.shutdown {
-                    ShutdownPolicy::Brutal => {
-                        // Immediate kill - in real implementation would call lunatic::process::kill
-                        // For now, just mark as stopped
-                        state.process_id = None;
-                    }
-                    ShutdownPolicy::Timeout(_ms) => {
-                        // Graceful shutdown with timeout
-                        // In real implementation: send shutdown message and wait
-                        state.process_id = None;
-                    }
-                    ShutdownPolicy::Infinity => {
-                        // Wait forever for graceful shutdown
-                        // In real implementation: send shutdown message and wait indefinitely
-                        state.process_id = None;
-                    }
-                }
+        ensure_multi_thread_runtime()?;
+
+        let (process, shutdown) = {
+            let state = self
+                .children
+                .get(child_id)
+                .ok_or_else(|| format!("Child '{}' not started", child_id))?;
+            (state.process.clone(), state.spec.shutdown)
+        };
+        let Some(process) = process else {
+            return Ok(());
+        };
+        let process_id = process.id();
+
+        if self.environment.get_process(process_id).is_none() {
+            if let Some(state) = self.children.get_mut(child_id) {
+                state.process = None;
             }
+            return Ok(());
         }
 
+        process.send(Signal::Kill);
+        let timeout = match shutdown {
+            ShutdownPolicy::Brutal => Some(BRUTAL_SHUTDOWN_TIMEOUT),
+            ShutdownPolicy::Timeout(milliseconds) => Some(Duration::from_millis(milliseconds)),
+            ShutdownPolicy::Infinity => None,
+        };
+        self.wait_for_process_exit(child_id, process_id, timeout)?;
+
+        if let Some(state) = self.children.get_mut(child_id) {
+            state.process = None;
+        }
         Ok(())
     }
 
-    /// Check if restart intensity limit is exceeded
-    fn check_restart_intensity(&mut self) -> Result<(), String> {
+    fn wait_for_process_exit(
+        &self,
+        child_id: &str,
+        process_id: u64,
+        timeout: Option<Duration>,
+    ) -> Result<(), String> {
+        let started = Instant::now();
+        while self.environment.get_process(process_id).is_some() {
+            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                return Err(format!(
+                    "Timed out stopping child '{}' process {}",
+                    child_id, process_id
+                ));
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+
+    /// Stop every active child in reverse start order.
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        let child_ids: Vec<String> = self
+            .spec
+            .children
+            .iter()
+            .map(|child| child.id.clone())
+            .collect();
+        for child_id in child_ids.iter().rev() {
+            if self.children.contains_key(child_id) {
+                self.stop_child(child_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reserve restart intensity for a complete strategy operation.
+    fn reserve_restart_events(&mut self, child_ids: &[String]) -> Result<(), String> {
         let now = current_timestamp_secs();
         let window_start = now.saturating_sub(self.spec.max_seconds as u64);
 
-        // Remove old events outside window
         self.restart_history
             .retain(|event| event.timestamp >= window_start);
 
-        // Check if limit exceeded
-        if self.restart_history.len() >= self.spec.max_restarts as usize {
+        let attempted_total = self.restart_history.len() + child_ids.len();
+        if attempted_total > self.spec.max_restarts as usize {
             return Err(format!(
-                "Restart intensity limit exceeded: {} restarts in {} seconds",
-                self.spec.max_restarts, self.spec.max_seconds
+                "Restart intensity limit exceeded: {} existing + {} requested restarts in {} seconds (max {})",
+                self.restart_history.len(),
+                child_ids.len(),
+                self.spec.max_seconds,
+                self.spec.max_restarts
             ));
         }
 
+        self.restart_history
+            .extend(child_ids.iter().map(|child_id| RestartEvent {
+                timestamp: now,
+                child_id: child_id.clone(),
+            }));
         Ok(())
     }
 
     /// Get child process state
     pub fn which_children(&self) -> Vec<ChildInfo> {
-        self.children
+        self.spec
+            .children
             .iter()
-            .map(|(id, state)| ChildInfo {
-                id: id.clone(),
-                process_id: state.process_id,
+            .filter_map(|spec| self.children.get(&spec.id).map(|state| (spec, state)))
+            .map(|(spec, state)| ChildInfo {
+                id: spec.id.clone(),
+                process_id: state.process.as_ref().map(|process| process.id()),
                 child_type: state.spec.child_type,
                 restart_count: state.restart_count,
             })
@@ -447,8 +542,12 @@ impl Supervisor {
         }
 
         // Count active processes from the children map
-        for (_, state) in &self.children {
-            if state.process_id.is_some() {
+        for state in self.children.values() {
+            if state
+                .process
+                .as_ref()
+                .is_some_and(|process| self.environment.get_process(process.id()).is_some())
+            {
                 active += 1;
             }
         }
@@ -459,6 +558,14 @@ impl Supervisor {
             supervisors,
             workers,
         }
+    }
+
+    /// Return restart events in chronological order for diagnostics.
+    pub fn restart_history(&self) -> Vec<(u64, String)> {
+        self.restart_history
+            .iter()
+            .map(|event| (event.timestamp, event.child_id.clone()))
+            .collect()
     }
 }
 
@@ -493,6 +600,18 @@ pub struct ChildrenCount {
     pub workers: usize,
 }
 
+fn ensure_multi_thread_runtime() -> Result<(), String> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "Supervisor requires a multi-thread Tokio runtime".to_string())?;
+    if matches!(
+        runtime.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    ) {
+        return Err("Supervisor requires a multi-thread Tokio runtime".to_string());
+    }
+    Ok(())
+}
+
 fn current_timestamp_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -503,14 +622,6 @@ fn current_timestamp_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mock_start_success() -> Result<u64, String> {
-        Ok(12345) // Mock process ID
-    }
-
-    fn mock_start_failure() -> Result<u64, String> {
-        Err("Mock failure".to_string())
-    }
 
     #[test]
     fn test_supervisor_creation() {
@@ -569,5 +680,25 @@ mod tests {
         assert_eq!(count.active, 0);
         assert_eq!(count.workers, 0);
         assert_eq!(count.supervisors, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn start_rejects_current_thread_runtime() {
+        let spec = SupervisorSpec {
+            strategy: RestartStrategy::OneForOne,
+            max_restarts: 1,
+            max_seconds: 5,
+            children: vec![ChildSpec {
+                id: "worker".to_string(),
+                start: |_| Err("should not be called".to_string()),
+                restart: RestartPolicy::Permanent,
+                shutdown: ShutdownPolicy::Brutal,
+                child_type: ChildType::Worker,
+            }],
+        };
+        let mut supervisor = Supervisor::new(spec);
+
+        let error = supervisor.start_children().unwrap_err();
+        assert!(error.contains("requires a multi-thread Tokio runtime"));
     }
 }

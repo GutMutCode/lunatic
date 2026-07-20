@@ -4,21 +4,23 @@ This crate contains Erlang/OTP-inspired callback traits and runtime adapters for
 
 ## Current implementation status
 
-GenServer is connected to Lunatic's host-side native process runtime; the other patterns remain partial:
+GenServer and Supervisor are connected to Lunatic's host-side native process runtime; the other patterns remain partial:
 
 - `GenServer::spawn` registers a native Lunatic process and consumes requests through its `MessageMailbox`.
 - `call` uses per-request correlation IDs, configurable timeouts, and propagates handler or process-exit errors.
 - `cast`, graceful `stop`, forced `kill`, `is_alive`, and termination waiting are implemented.
 - `crates/lunatic-otp-patterns/tests/gen_server_runtime.rs` exercises the public API against real native Lunatic processes.
-- Supervisor strategy bookkeeping uses caller-provided start closures and stored numeric IDs; shutdown does not terminate a Lunatic process.
+- Supervisor child starters receive the managed `Environment` and return an actual `Process` handle.
+- OneForOne, OneForAll, and RestForOne terminate old processes, restart in specification order, preserve restart counts, enforce restart intensity, and reject duplicate starts.
+- `crates/lunatic-otp-patterns/tests/supervisor_runtime.rs` exercises strategies and restart policies against real native Lunatic processes.
 - GenStatem tests drive transitions directly in memory.
-- The Rust example now uses the process-backed GenServer API.
+- The Rust examples use the process-backed GenServer and Supervisor APIs.
 
-The current GenServer adapter requires a multi-thread Tokio runtime and runs as a host-side native Lunatic process. A guest-WASM SDK adapter and named-process registration are still pending.
+The current GenServer and Supervisor adapters require a multi-thread Tokio runtime and manage host-side native Lunatic processes. Guest-WASM SDK adapters, named-process registration, and automatic Supervisor monitor-event intake are still pending.
 
 ## Overview
 
-Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate builds higher-level patterns on those primitives; GenServer now has process creation, mailbox, reply correlation, timeout, exit, and termination integration.
+Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate builds higher-level patterns on those primitives; GenServer has mailbox and lifecycle integration, while Supervisor has real process shutdown and ordered restart integration.
 
 ## Patterns
 
@@ -92,10 +94,22 @@ impl GenServer for Counter {
 
 ### Supervisor
 
-In-memory supervision strategy bookkeeping. The current implementation can invoke a supplied start closure, but it does not stop or monitor real Lunatic processes.
+Process-backed supervision with restart strategies and bounded restart intensity.
 
 ```rust
-use lunatic_otp_patterns::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec};
+use lunatic_otp_patterns::{
+    ChildSpec, ChildType, RestartPolicy, RestartStrategy, ShutdownPolicy,
+    Supervisor, SupervisorSpec,
+};
+use lunatic_process::{env::Environment, spawn_native, Process};
+use std::{future, sync::Arc};
+
+fn start_worker(environment: Arc<dyn Environment>) -> Result<Arc<dyn Process>, String> {
+    let (_join, process) = spawn_native(environment, |_process, _mailbox| async move {
+        future::pending::<anyhow::Result<()>>().await
+    });
+    Ok(Arc::new(process))
+}
 
 let spec = SupervisorSpec {
     strategy: RestartStrategy::OneForOne,
@@ -104,7 +118,7 @@ let spec = SupervisorSpec {
     children: vec![
         ChildSpec {
             id: "worker1".to_string(),
-            start: || Ok(12345), // Placeholder numeric ID, not a spawned process
+            start: start_worker,
             restart: RestartPolicy::Permanent,
             shutdown: ShutdownPolicy::Timeout(5000),
             child_type: ChildType::Worker,
@@ -115,6 +129,8 @@ let spec = SupervisorSpec {
 let mut supervisor = Supervisor::new(spec);
 supervisor.start_children()?;
 ```
+
+Call `handle_child_exit` after receiving a child exit notification. `shutdown` terminates active children in reverse specification order. The public example is `examples/rust/src/supervisor_example.rs`.
 
 ### GenStatem
 
@@ -160,20 +176,21 @@ impl GenStatem for DoorState {
 The current host-side flow is:
 
 1. Implement the trait for your server/state machine
-2. Enter a multi-thread Tokio runtime and call `GenServer::spawn`
+2. Enter a multi-thread Tokio runtime and call `GenServer::spawn` or `Supervisor::start_children`
 3. Use mailbox-backed call/cast messages and correlated replies
-4. Stop or kill the process through its handle
+4. For Supervisor children, pass the supplied environment to the child spawn function and report exit reasons through `handle_child_exit`
+5. Stop or kill the process through its handle or Supervisor
 
-`examples/rust/src/gen_server_example.rs` demonstrates this path. It is not yet a guest-WASM binding: guest SDK host imports and cross-language message compatibility remain separate follow-up work.
+`examples/rust/src/gen_server_example.rs` and `examples/rust/src/supervisor_example.rs` demonstrate these paths. They are not yet guest-WASM bindings: guest SDK host imports and cross-language message compatibility remain separate follow-up work.
 
 ## Core Values Compliance
 
-The API is intended to align with Lunatic's core values. Claims below distinguish the connected GenServer path from the still-partial patterns:
+The API is intended to align with Lunatic's core values. Claims below distinguish the connected GenServer and Supervisor paths from the still-partial patterns:
 
 - **Fast, Robust, and Scalable**: GenServer uses lightweight native Lunatic processes; end-to-end performance thresholds are not yet established
 - **Language Independence**: Pure Rust with serde serialization
 - **Security Through Isolation**: The native process is registered in a Lunatic environment; this is not a Wasm sandbox boundary
-- **Fault Tolerance**: GenServer exit/error handling exists; Supervisor recovery of real processes is pending
+- **Fault Tolerance**: GenServer exit/error handling and Supervisor process replacement are implemented; automatic monitor-event intake is pending
 - **Asynchronous by Default**: Casts use mailbox delivery; synchronous calls add correlated replies and timeouts
 - **Erlang-Inspired**: Callback and strategy APIs are modeled after OTP
 

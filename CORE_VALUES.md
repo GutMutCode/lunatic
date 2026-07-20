@@ -200,7 +200,7 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - ✅ Process links
 - ✅ Process monitors
 - ✅ Death notifications
-- ⚠️  Supervisor patterns (application-level, not runtime)
+- ⚠️ Supervisor restart strategies manage real host-side Lunatic processes; automatic monitor-event intake and guest-WASM adapters remain pending
 
 ### Distribution
 
@@ -242,8 +242,9 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 **Lunatic Implementation Status:**
 - ✅ GenServer native process spawn, mailbox call/cast, correlated replies, timeout, stop, kill, and handler-error propagation are connected and covered by process-level integration tests
 - ⚠️ The current GenServer adapter is host-side and requires a multi-thread Tokio runtime; guest-WASM bindings and named registry integration remain pending
-- ❌ Supervisor shutdown and restart bookkeeping does not yet terminate or restart real Lunatic processes
-- 📝 The Rust example exercises the native process path; additional-language runtime integrations are still needed
+- ✅ Supervisor OneForOne, OneForAll, RestForOne, restart policies, intensity limits, duplicate-start prevention, and shutdown are connected to real native Lunatic processes
+- ⚠️ Supervisor exit events must currently be forwarded through `handle_child_exit`; automatic monitor-event intake and guest-WASM integration remain pending
+- 📝 The Rust examples exercise the GenServer and Supervisor native process paths; additional-language runtime integrations are still needed
 
 ---
 
@@ -331,7 +332,7 @@ When designing or reviewing features, ask:
 - [x] Process isolation (100% guaranteed)
 - [x] Hot reload state preservation
 - [ ] 99.999% uptime (application-dependent)
-- [ ] Automatic failure recovery via OTP supervisors (links/monitors exist; supervisor runtime integration is pending)
+- [ ] Automatic failure recovery via OTP supervisors (real process restart is implemented; automatic monitor-event intake is pending)
 
 ### Developer Experience
 - [x] Multi-language support

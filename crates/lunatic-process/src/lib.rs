@@ -487,63 +487,65 @@ where
     F: Future<Output = Result<()>> + Send + 'static,
 {
     trace!("Native process {} spawned", id);
-    let fut = AssertUnwindSafe(fut).catch_unwind();
-    tokio::pin!(fut);
-
     let mut die_when_link_dies = true;
     let mut links = HashMap::new();
     let mut monitors = HashMap::new();
     let mut signal_mailbox = signal_mailbox.lock().await;
     let mut has_sender = true;
 
-    let result = loop {
-        tokio::select! {
-            biased;
-            signal = signal_mailbox.recv(), if has_sender => {
-                match signal {
-                    Some(Signal::Message(message)) => message_mailbox.push(message),
-                    Some(Signal::DieWhenLinkDies(value)) => die_when_link_dies = value,
-                    Some(Signal::Link(tag, process)) => {
-                        links.insert(process.id(), (process, tag));
-                    }
-                    Some(Signal::UnLink { process_id }) => {
-                        links.remove(&process_id);
-                    }
-                    Some(Signal::LinkDied(process_id, tag, reason)) => {
-                        links.remove(&process_id);
-                        match reason {
-                            DeathReason::Failure | DeathReason::NoProcess if die_when_link_dies => {
-                                break Finished::KillSignal;
-                            }
-                            DeathReason::Failure | DeathReason::NoProcess => {
-                                message_mailbox.push(Message::LinkDied(tag));
-                            }
-                            DeathReason::Normal => {}
+    let result = {
+        let fut = AssertUnwindSafe(fut).catch_unwind();
+        tokio::pin!(fut);
+
+        loop {
+            tokio::select! {
+                biased;
+                signal = signal_mailbox.recv(), if has_sender => {
+                    match signal {
+                        Some(Signal::Message(message)) => message_mailbox.push(message),
+                        Some(Signal::DieWhenLinkDies(value)) => die_when_link_dies = value,
+                        Some(Signal::Link(tag, process)) => {
+                            links.insert(process.id(), (process, tag));
                         }
+                        Some(Signal::UnLink { process_id }) => {
+                            links.remove(&process_id);
+                        }
+                        Some(Signal::LinkDied(process_id, tag, reason)) => {
+                            links.remove(&process_id);
+                            match reason {
+                                DeathReason::Failure | DeathReason::NoProcess if die_when_link_dies => {
+                                    break Finished::KillSignal;
+                                }
+                                DeathReason::Failure | DeathReason::NoProcess => {
+                                    message_mailbox.push(Message::LinkDied(tag));
+                                }
+                                DeathReason::Normal => {}
+                            }
+                        }
+                        Some(Signal::Monitor(process)) => {
+                            monitors.insert(process.id(), process);
+                        }
+                        Some(Signal::StopMonitoring { process_id }) => {
+                            monitors.remove(&process_id);
+                        }
+                        Some(Signal::ProcessDied(process_id)) => {
+                            message_mailbox.push(Message::ProcessDied(process_id));
+                        }
+                        Some(Signal::Kill) => break Finished::KillSignal,
+                        Some(Signal::HotReload { .. }) => {
+                            warn!("Hot reload is not supported for native process {}", id);
+                        }
+                        Some(Signal::Rollback { .. }) => {
+                            warn!("Rollback is not supported for native process {}", id);
+                        }
+                        None => has_sender = false,
                     }
-                    Some(Signal::Monitor(process)) => {
-                        monitors.insert(process.id(), process);
-                    }
-                    Some(Signal::StopMonitoring { process_id }) => {
-                        monitors.remove(&process_id);
-                    }
-                    Some(Signal::ProcessDied(process_id)) => {
-                        message_mailbox.push(Message::ProcessDied(process_id));
-                    }
-                    Some(Signal::Kill) => break Finished::KillSignal,
-                    Some(Signal::HotReload { .. }) => {
-                        warn!("Hot reload is not supported for native process {}", id);
-                    }
-                    Some(Signal::Rollback { .. }) => {
-                        warn!("Rollback is not supported for native process {}", id);
-                    }
-                    None => has_sender = false,
                 }
-            }
-            output = &mut fut => {
-                match output {
-                    Ok(result) => break Finished::Normal(result),
-                    Err(payload) => break Finished::Panicked(format_panic_payload(payload)),
+                output = &mut fut => {
+                    match output {
+                        Ok(result) => break Finished::Normal(result),
+                        Err(payload) => break Finished::Panicked(format_panic_payload(payload)),
+                    }
                 }
             }
         }

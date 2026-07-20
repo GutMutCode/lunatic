@@ -66,10 +66,19 @@ impl GenServer for Counter {
 
 ### Supervisor - Process Supervision
 
-**Supervisor** monitors child processes and handles failures with restart strategies.
+**Supervisor** manages real child process handles and applies restart strategies when an exit reason is forwarded to `handle_child_exit`.
 
 ```rust
 use lunatic_otp_patterns::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec};
+use lunatic_process::{env::Environment, spawn_native, Process};
+use std::{future, sync::Arc};
+
+fn start_worker(environment: Arc<dyn Environment>) -> Result<Arc<dyn Process>, String> {
+    let (_join, process) = spawn_native(environment, |_process, _mailbox| async move {
+        future::pending::<anyhow::Result<()>>().await
+    });
+    Ok(Arc::new(process))
+}
 
 let spec = SupervisorSpec {
     strategy: RestartStrategy::OneForOne,
@@ -78,7 +87,7 @@ let spec = SupervisorSpec {
     children: vec![
         ChildSpec {
             id: "worker1".to_string(),
-            start: || Ok(spawn_worker()),
+            start: start_worker,
             restart: RestartPolicy::Permanent,
             shutdown: ShutdownPolicy::Brutal,
             child_type: Default::default(),
@@ -86,12 +95,13 @@ let spec = SupervisorSpec {
     ],
 };
 
-let supervisor = Supervisor::new(spec);
+let mut supervisor = Supervisor::new(spec);
+supervisor.start_children()?;
 ```
 
 ### Key Features
 
-- ✅ **Fault Tolerance**: Automatic process restart on failures
+- ✅ **Fault Tolerance**: Ordered process replacement with bounded restart intensity after exit notification
 - ✅ **Concurrency**: Message-passing between processes
 - ✅ **State Management**: Safe mutable state handling
 - ✅ **Error Propagation**: Structured error handling with `OtpError`
@@ -165,13 +175,13 @@ pub enum MyMessage {
 
 **Error:** `ChildStartFailure`
 
-**Solution:** Check your child start function returns a valid process ID:
+**Solution:** Check your child start function uses the supplied environment and returns a registered process handle:
 
 ```rust
 ChildSpec {
-    start: || {
-        // Ensure this returns Ok(process_id)
-        spawn_my_process()
+    start: |environment| {
+        // Ensure this returns an Arc<dyn Process> registered in `environment`.
+        spawn_my_process(environment)
     },
     // ...
 }
@@ -583,14 +593,16 @@ let spec = SupervisorSpec {
     children: vec![
         ChildSpec {
             id: "worker1".to_string(),
-            start: WorkerModule::start,
+            start: start_worker,
             restart: RestartPolicy::Permanent,
             shutdown: ShutdownPolicy::Timeout(5000),
+            child_type: ChildType::Worker,
         },
     ],
 };
 
-let supervisor = Supervisor::start(spec)?;
+let mut supervisor = Supervisor::new(spec);
+supervisor.start_children()?;
 ```
 
 **Go (manual implementation):**

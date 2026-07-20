@@ -116,7 +116,7 @@ fn test_supervisor_basic() {
         max_seconds: 5,
         children: vec![ChildSpec {
             id: "test_child".to_string(),
-            start: || Ok(12345), // Mock process ID
+            start: |_| Err("not started in bookkeeping test".to_string()),
             restart: RestartPolicy::Permanent,
             shutdown: ShutdownPolicy::Timeout(5000),
             child_type: ChildType::Worker,

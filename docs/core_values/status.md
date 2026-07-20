@@ -98,12 +98,12 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 
 | Area | Verified implementation | Not verified or not implemented | Executable evidence |
 | --- | --- | --- | --- |
-| OTP | GenServer native process spawn, mailbox call/cast, correlated replies, timeout, graceful stop, kill and handler-error propagation; callback/state-machine bookkeeping | Supervisor still stores numeric IDs without terminating/restarting real processes; GenStatem/GenEvent remain in-memory; guest-WASM adapter not implemented | `cargo test -p lunatic-otp-patterns` (32 tests pass, including 4 real-process integration tests) |
+| OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process shutdown, OneForOne/OneForAll/RestForOne, restart policies, intensity limits and persistent restart counts | Supervisor automatic monitor-event intake; GenStatem/GenEvent remain in-memory; guest-WASM adapters not implemented | `cargo test -p lunatic-otp-patterns` (38 tests pass, including 9 real-process integration tests) |
 | TLS streams | Snapshot variants, metadata capture, serialization | Live TCP+TLS reconnect and restored guest resource handle | `cargo test --test tls_stream_reconnection` (6 snapshot/serialization tests pass) |
 | Global registry | In-memory registry operations and coordination handler transitions | Control/QUIC transport wiring, quorum wait, live concurrent registration, partition recovery | `cargo test -p lunatic-distributed --test registry_coordination` (8 manually orchestrated tests pass) |
 | QUIC benchmark | Real loopback mTLS QUIC connection and stream echo | Lunatic distributed client/server routing and multi-node behavior | `cargo bench --bench distributed_messaging --no-run` builds the executable benchmark |
 
-These commands were executed on Windows against the reviewed baseline on 2026-07-20. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor, GenStatem, GenEvent, TLS, registry, or distributed messaging gaps.
+These commands were executed on Windows against the reviewed baseline on 2026-07-20. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem, GenEvent, TLS, registry, or distributed messaging gaps.
 
 ## Known Documentation Deltas
 - Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
@@ -112,16 +112,18 @@ These commands were executed on Windows against the reviewed baseline on 2026-07
 - Evidence: `GenServer::spawn` uses `lunatic_process::spawn_native`, registers the process in a `LunaticEnvironment`, and consumes serialized call/cast/stop messages from its `MessageMailbox` (`crates/lunatic-otp-patterns/src/gen_server.rs`, `crates/lunatic-process/src/lib.rs`).
 - Evidence: call replies use unique request IDs with pending-reply correlation, configurable timeout cleanup, and process-exit wakeups. Graceful stop runs `terminate`; kill and fatal cast errors remove the process and reject later messages.
 - Evidence: `crates/lunatic-otp-patterns/tests/gen_server_runtime.rs` verifies call response, cast state changes, timeout recovery, error propagation, graceful stop, and kill using actual native Lunatic processes.
-- Limitation: Supervisor stop/restart paths clear or replace stored IDs but do not invoke Lunatic process termination (`crates/lunatic-otp-patterns/src/supervisor.rs:371-396`).
+- Evidence: Supervisor child starters receive its `Environment` and return actual `Process` handles. Strategy restarts preflight intensity, stop affected processes in reverse specification order, restart in forward order, preserve per-child restart counts, and roll back partial batch starts (`crates/lunatic-otp-patterns/src/supervisor.rs`).
+- Evidence: `crates/lunatic-otp-patterns/tests/supervisor_runtime.rs` verifies actual-process replacement and removal for OneForOne, OneForAll and RestForOne, all restart policies, restart intensity rejection, persistent counts, ordered restart, duplicate-start rejection, and shutdown.
+- Limitation: Supervisor child exit notifications must currently be forwarded to `handle_child_exit`; automatic monitor-event intake is not yet implemented.
 - Limitation: the current GenServer adapter is host-side and requires a multi-thread Tokio runtime. It does not yet expose the same abstraction through guest-WASM SDK host imports, and `GenServerConfig::name` is metadata rather than registry registration.
-- Gap: connect Supervisor, GenStatem, and GenEvent to the process runtime before claiming complete OTP runtime coverage.
+- Gap: connect Supervisor monitor intake, GenStatem, and GenEvent to the process runtime before claiming complete OTP runtime coverage.
 
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
 2. TLS listeners are migratable with certificate/key preservation; implement and integration-test TLS client reconnection before marking active stream recovery complete.
 3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
-5. Connect Supervisor strategies, GenStatem, and GenEvent to real Lunatic processes; add a guest-WASM GenServer adapter and named registration.
+5. Connect Supervisor monitor-event intake, GenStatem, and GenEvent to real Lunatic processes; add guest-WASM adapters and GenServer named registration.
 6. Carry registry coordination messages over the control/QUIC transport and test quorum behavior with real nodes.
 7. Add structured audit logging for privileged host operations to close the remaining security gap.
 

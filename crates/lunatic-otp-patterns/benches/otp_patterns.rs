@@ -3,6 +3,7 @@
 //! These benchmarks measure the performance of OTP pattern operations
 //! to ensure they meet the fast performance requirements.
 
+use anyhow::Result;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use lunatic_otp_patterns::{
     ChildSpec, GenServer, RestartPolicy, RestartStrategy, ShutdownPolicy, Supervisor,
@@ -87,7 +88,9 @@ fn bench_otp_patterns(c: &mut Criterion) {
     let mut counter2 = BenchCounter::init();
     c.bench_function("gen_server_cast_increment", |b| {
         b.iter(|| {
-            black_box(counter.handle_cast(BenchRequest::Increment).unwrap());
+            counter2
+                .handle_cast(black_box(BenchRequest::Increment))
+                .unwrap();
         })
     });
 
@@ -98,7 +101,7 @@ fn bench_otp_patterns(c: &mut Criterion) {
         max_seconds: 5,
         children: vec![ChildSpec {
             id: "child1".to_string(),
-            start: || Ok(12345), // Mock process ID
+            start: |_| Err("not started in creation benchmark".to_string()),
             restart: RestartPolicy::Permanent,
             shutdown: ShutdownPolicy::Brutal,
             child_type: Default::default(),

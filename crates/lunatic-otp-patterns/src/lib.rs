@@ -25,6 +25,6 @@ pub use gen_statem::{
     GenStatem, GenStatemHandle, StateData, StatemMessage, StopReason, TransitionResult,
 };
 pub use supervisor::{
-    ChildInfo, ChildSpec, ChildType, ChildrenCount, ExitReason, RestartPolicy, RestartStrategy,
-    ShutdownPolicy, Supervisor, SupervisorSpec,
+    ChildInfo, ChildSpec, ChildStart, ChildType, ChildrenCount, ExitReason, RestartPolicy,
+    RestartStrategy, ShutdownPolicy, Supervisor, SupervisorSpec,
 };

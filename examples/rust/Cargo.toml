@@ -18,9 +18,14 @@ path = "src/echo_server.rs"
 name = "gen_server_example"
 path = "src/gen_server_example.rs"
 
+[[bin]]
+name = "supervisor_example"
+path = "src/supervisor_example.rs"
+
 [dependencies]
-# Add lunatic-otp-patterns for the GenServer example
+# Add OTP patterns and the host-side process runtime for examples
 lunatic-otp-patterns = { path = "../../crates/lunatic-otp-patterns" }
+lunatic-process = { path = "../../crates/lunatic-process" }
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
