@@ -1906,9 +1906,9 @@ name = "lunatic-otp-patterns"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bincode",
  "criterion 0.5.1",
- "lunatic-messaging-api",
- "lunatic-process-api",
+ "lunatic-process",
  "serde",
  "serde_json",
  "tokio",

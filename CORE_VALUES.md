@@ -240,10 +240,10 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Dynamic children management
 
 **Lunatic Implementation Status:**
-- ⚠️  Rust callback traits, message envelopes, and in-memory strategy logic exist in `lunatic-otp-patterns`
-- ❌ `GenServer::spawn`, `GenServerHandle::call`, and `cast` are not connected to Lunatic processes or mailboxes
+- ✅ GenServer native process spawn, mailbox call/cast, correlated replies, timeout, stop, kill, and handler-error propagation are connected and covered by process-level integration tests
+- ⚠️ The current GenServer adapter is host-side and requires a multi-thread Tokio runtime; guest-WASM bindings and named registry integration remain pending
 - ❌ Supervisor shutdown and restart bookkeeping does not yet terminate or restart real Lunatic processes
-- 📝 Rust examples exercise callbacks directly; runtime and additional-language integrations are still needed
+- 📝 The Rust example exercises the native process path; additional-language runtime integrations are still needed
 
 ---
 

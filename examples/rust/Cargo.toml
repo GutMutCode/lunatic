@@ -21,7 +21,9 @@ path = "src/gen_server_example.rs"
 [dependencies]
 # Add lunatic-otp-patterns for the GenServer example
 lunatic-otp-patterns = { path = "../../crates/lunatic-otp-patterns" }
+anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [profile.release]
 opt-level = "z"  # Optimize for size

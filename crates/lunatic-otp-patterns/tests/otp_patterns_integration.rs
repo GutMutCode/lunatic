@@ -96,10 +96,14 @@ fn test_gen_server_basic() {
     }
 
     // Test handle_cast
-    counter.handle_cast(CounterRequest::Increment);
+    counter
+        .handle_cast(CounterRequest::Increment)
+        .expect("increment cast should succeed");
     assert_eq!(counter.count, 2);
 
-    counter.handle_cast(CounterRequest::Set(42));
+    counter
+        .handle_cast(CounterRequest::Set(42))
+        .expect("set cast should succeed");
     assert_eq!(counter.count, 42);
 }
 

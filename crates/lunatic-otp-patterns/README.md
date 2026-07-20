@@ -1,28 +1,30 @@
 # Lunatic OTP Patterns
 
-This crate contains Erlang/OTP-inspired callback traits, message envelopes, and in-memory strategy logic intended for future use with Lunatic WASM processes.
+This crate contains Erlang/OTP-inspired callback traits and runtime adapters for Lunatic processes.
 
 ## Current implementation status
 
-The crate is an API and algorithm scaffold, not a connected OTP runtime:
+GenServer is connected to Lunatic's host-side native process runtime; the other patterns remain partial:
 
-- `GenServer` callback traits and message serialization are implemented.
-- `GenServer::spawn`, `GenServerHandle::call`, and `cast` return explicit “not yet implemented” errors.
+- `GenServer::spawn` registers a native Lunatic process and consumes requests through its `MessageMailbox`.
+- `call` uses per-request correlation IDs, configurable timeouts, and propagates handler or process-exit errors.
+- `cast`, graceful `stop`, forced `kill`, `is_alive`, and termination waiting are implemented.
+- `crates/lunatic-otp-patterns/tests/gen_server_runtime.rs` exercises the public API against real native Lunatic processes.
 - Supervisor strategy bookkeeping uses caller-provided start closures and stored numeric IDs; shutdown does not terminate a Lunatic process.
 - GenStatem tests drive transitions directly in memory.
-- The Rust example invokes callbacks directly; its process-based usage block is pseudo-code.
+- The Rust example now uses the process-backed GenServer API.
 
-Use the crate to evaluate the proposed APIs, not as evidence of process-level fault tolerance.
+The current GenServer adapter requires a multi-thread Tokio runtime and runs as a host-side native Lunatic process. A guest-WASM SDK adapter and named-process registration are still pending.
 
 ## Overview
 
-Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate sketches higher-level abstractions that still need process creation, mailbox, reply, timeout, exit, and termination integration.
+Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate builds higher-level patterns on those primitives; GenServer now has process creation, mailbox, reply correlation, timeout, exit, and termination integration.
 
 ## Patterns
 
 ### GenServer
 
-Callback and message types for a stateful server pattern. Synchronous/asynchronous process communication is not wired yet.
+Process-backed stateful server pattern with synchronous calls and asynchronous casts.
 
 ```rust
 use lunatic_otp_patterns::{GenServer, GenServerConfig};
@@ -153,25 +155,26 @@ impl GenStatem for DoorState {
 }
 ```
 
-## Usage in WASM
+## Runtime boundary
 
-The intended future WASM flow is:
+The current host-side flow is:
 
 1. Implement the trait for your server/state machine
-2. Spawn a Lunatic process through the future runtime adapter
+2. Enter a multi-thread Tokio runtime and call `GenServer::spawn`
 3. Use mailbox-backed call/cast messages and correlated replies
+4. Stop or kill the process through its handle
 
-Steps 2 and 3 are not implemented by this crate. `examples/rust/src/gen_server_example.rs` is a callback-only example and labels process usage as pseudo-code.
+`examples/rust/src/gen_server_example.rs` demonstrates this path. It is not yet a guest-WASM binding: guest SDK host imports and cross-language message compatibility remain separate follow-up work.
 
 ## Core Values Compliance
 
-The proposed API is intended to align with Lunatic's core values, but the following are design goals rather than current runtime guarantees:
+The API is intended to align with Lunatic's core values. Claims below distinguish the connected GenServer path from the still-partial patterns:
 
-- **Fast, Robust, and Scalable**: Intended to use lightweight processes with supervision
+- **Fast, Robust, and Scalable**: GenServer uses lightweight native Lunatic processes; end-to-end performance thresholds are not yet established
 - **Language Independence**: Pure Rust with serde serialization
-- **Security Through Isolation**: Intended to inherit Lunatic process isolation once connected
-- **Fault Tolerance**: Restart strategy logic exists; real process recovery is pending
-- **Asynchronous by Default**: Message envelopes exist; mailbox transport is pending
+- **Security Through Isolation**: The native process is registered in a Lunatic environment; this is not a Wasm sandbox boundary
+- **Fault Tolerance**: GenServer exit/error handling exists; Supervisor recovery of real processes is pending
+- **Asynchronous by Default**: Casts use mailbox delivery; synchronous calls add correlated replies and timeouts
 - **Erlang-Inspired**: Callback and strategy APIs are modeled after OTP
 
 ## License

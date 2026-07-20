@@ -37,86 +37,53 @@ impl GenServer for Counter {
         Counter { count: 0 }
     }
 
-    fn handle_call(&mut self, request: Self::Call) -> Self::CallReply {
+    fn handle_call(&mut self, request: Self::Call) -> anyhow::Result<Self::CallReply> {
         match request {
             CounterRequest::Increment => {
                 self.count += 1;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
             CounterRequest::Decrement => {
                 self.count -= 1;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
-            CounterRequest::Get => CounterResponse::Value(self.count),
+            CounterRequest::Get => Ok(CounterResponse::Value(self.count)),
             CounterRequest::Set(value) => {
                 self.count = value;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
         }
     }
 
-    fn handle_cast(&mut self, request: Self::Cast) {
+    fn handle_cast(&mut self, request: Self::Cast) -> anyhow::Result<()> {
         match request {
             CounterRequest::Increment => self.count += 1,
             CounterRequest::Decrement => self.count -= 1,
             CounterRequest::Get => {} // Cast ignores response
             CounterRequest::Set(value) => self.count = value,
         }
+        Ok(())
     }
 }
 
-// Example usage (would be called from _start in real WASM module)
-pub fn example_usage() {
-    // Note: In real WASM code, this would spawn actual processes
-    // For now, this is just a demonstration of the API
-
-    // Create a counter instance for testing
-    let mut counter = Counter::init();
-    assert_eq!(counter.count, 0);
-
-    // Test handle_call
-    let response = counter.handle_call(CounterRequest::Increment);
-    assert!(matches!(response, CounterResponse::Ok));
-    assert_eq!(counter.count, 1);
-
-    let response = counter.handle_call(CounterRequest::Get);
-    match response {
-        CounterResponse::Value(v) => assert_eq!(v, 1),
-        _ => panic!("Expected Value"),
-    }
-
-    // Test handle_cast
-    counter.handle_cast(CounterRequest::Increment);
-    assert_eq!(counter.count, 2);
-
-    counter.handle_cast(CounterRequest::Set(42));
-    assert_eq!(counter.count, 42);
-
-    println!("GenServer example completed successfully!");
-}
-
-// Example of how this would be used in real WASM code (pseudo-code)
-/*
-#[no_mangle]
-pub extern "C" fn _start() {
-    // Spawn a GenServer process
+pub fn example_usage() -> anyhow::Result<()> {
     let config = GenServerConfig::default();
-    let handle = Counter::spawn(config).expect("Failed to spawn GenServer");
+    let handle = Counter::spawn(config)?;
 
-    // Send some messages
-    handle.call(CounterRequest::Increment).unwrap();
-    let CounterResponse::Value(count) = handle.call(CounterRequest::Get).unwrap();
-    println!("Counter value: {}", count);
+    handle.cast(CounterRequest::Increment)?;
+    handle.cast(CounterRequest::Set(41))?;
+    handle.cast(CounterRequest::Increment)?;
 
-    handle.cast(CounterRequest::Set(100)).unwrap();
+    match handle.call(CounterRequest::Get)? {
+        CounterResponse::Value(count) => println!("Counter value: {count}"),
+        CounterResponse::Ok => unreachable!("Get always returns a value"),
+    }
+
+    handle.stop(lunatic_otp_patterns::TerminateReason::Normal)?;
+    Ok(())
 }
-*/
 
-#[no_mangle]
-pub extern "C" fn run_gen_server_example() {
-    example_usage();
-}
-
-fn main() {
-    // Required for compilation but not called in WASM
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    example_usage()
 }

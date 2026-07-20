@@ -357,6 +357,41 @@ where
     (join, process)
 }
 
+/// Spawns a native Lunatic process whose future returns no Wasm process state.
+///
+/// Unlike [`spawn`], this entry point is intended for host-side process
+/// abstractions that still need Lunatic mailboxes, signals, links, monitors and
+/// lifecycle handling, but do not own a Wasmtime [`ProcessState`]. The process
+/// is registered in the supplied environment for the duration of its task.
+pub fn spawn_native<F, K>(
+    env: Arc<dyn Environment>,
+    func: F,
+) -> (JoinHandle<Result<()>>, NativeProcess)
+where
+    K: Future<Output = Result<()>> + Send + 'static,
+    F: FnOnce(NativeProcess, MessageMailbox) -> K,
+{
+    let id = env.get_next_process_id();
+    let (signal_sender, signal_mailbox) = unbounded_channel::<Signal>();
+    let message_mailbox = MessageMailbox::default();
+    let process = NativeProcess {
+        id,
+        signal_mailbox: signal_sender,
+    };
+    let fut = func(process.clone(), message_mailbox.clone());
+    let signal_mailbox = Arc::new(Mutex::new(signal_mailbox));
+
+    env.add_process(id, Arc::new(process.clone()));
+    let join = tokio::task::spawn(run_native_process(
+        fut,
+        id,
+        env,
+        signal_mailbox,
+        message_mailbox,
+    ));
+    (join, process)
+}
+
 impl Process for NativeProcess {
     fn id(&self) -> u64 {
         self.id
@@ -439,6 +474,101 @@ pub enum Finished<R> {
     Normal(R),
     KillSignal,
     Panicked(String),
+}
+
+async fn run_native_process<F>(
+    fut: F,
+    id: u64,
+    env: Arc<dyn Environment>,
+    signal_mailbox: Arc<Mutex<UnboundedReceiver<Signal>>>,
+    message_mailbox: MessageMailbox,
+) -> Result<()>
+where
+    F: Future<Output = Result<()>> + Send + 'static,
+{
+    trace!("Native process {} spawned", id);
+    let fut = AssertUnwindSafe(fut).catch_unwind();
+    tokio::pin!(fut);
+
+    let mut die_when_link_dies = true;
+    let mut links = HashMap::new();
+    let mut monitors = HashMap::new();
+    let mut signal_mailbox = signal_mailbox.lock().await;
+    let mut has_sender = true;
+
+    let result = loop {
+        tokio::select! {
+            biased;
+            signal = signal_mailbox.recv(), if has_sender => {
+                match signal {
+                    Some(Signal::Message(message)) => message_mailbox.push(message),
+                    Some(Signal::DieWhenLinkDies(value)) => die_when_link_dies = value,
+                    Some(Signal::Link(tag, process)) => {
+                        links.insert(process.id(), (process, tag));
+                    }
+                    Some(Signal::UnLink { process_id }) => {
+                        links.remove(&process_id);
+                    }
+                    Some(Signal::LinkDied(process_id, tag, reason)) => {
+                        links.remove(&process_id);
+                        match reason {
+                            DeathReason::Failure | DeathReason::NoProcess if die_when_link_dies => {
+                                break Finished::KillSignal;
+                            }
+                            DeathReason::Failure | DeathReason::NoProcess => {
+                                message_mailbox.push(Message::LinkDied(tag));
+                            }
+                            DeathReason::Normal => {}
+                        }
+                    }
+                    Some(Signal::Monitor(process)) => {
+                        monitors.insert(process.id(), process);
+                    }
+                    Some(Signal::StopMonitoring { process_id }) => {
+                        monitors.remove(&process_id);
+                    }
+                    Some(Signal::ProcessDied(process_id)) => {
+                        message_mailbox.push(Message::ProcessDied(process_id));
+                    }
+                    Some(Signal::Kill) => break Finished::KillSignal,
+                    Some(Signal::HotReload { .. }) => {
+                        warn!("Hot reload is not supported for native process {}", id);
+                    }
+                    Some(Signal::Rollback { .. }) => {
+                        warn!("Rollback is not supported for native process {}", id);
+                    }
+                    None => has_sender = false,
+                }
+            }
+            output = &mut fut => {
+                match output {
+                    Ok(result) => break Finished::Normal(result),
+                    Err(payload) => break Finished::Panicked(format_panic_payload(payload)),
+                }
+            }
+        }
+    };
+
+    env.remove_process(id);
+
+    let (result, death_reason) = match result {
+        Finished::Normal(Ok(())) => (Ok(()), DeathReason::Normal),
+        Finished::Normal(Err(error)) => (Err(error), DeathReason::Failure),
+        Finished::KillSignal => (Err(anyhow!("Process killed")), DeathReason::Failure),
+        Finished::Panicked(message) => (
+            Err(anyhow!("Process panicked: {message}")),
+            DeathReason::Failure,
+        ),
+    };
+
+    for monitor in monitors.values() {
+        monitor.send(Signal::ProcessDied(id));
+    }
+    for (linked_process, tag) in links.values() {
+        linked_process.send(Signal::LinkDied(id, *tag, death_reason));
+    }
+
+    result
 }
 
 /// Enum containing a process name if available, otherwise its ID.
