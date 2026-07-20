@@ -7,10 +7,10 @@ notes-*.md
 publish.sh
 control_server.db
 
-# Examples build artifacts
-examples/assemblyscript/build/
-examples/assemblyscript/node_modules/
-examples/assemblyscript/package-lock.json
-examples/rust/Cargo.lock
-examples/rust/target/
+# Example dependency and build artifacts. Lockfiles remain tracked for reproducible builds.
+examples/*/build/
+examples/*/node_modules/
+examples/*/target/
+examples/*/.zig-cache/
+examples/*/zig-out/
 examples/go/*_example
