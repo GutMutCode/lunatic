@@ -53,9 +53,9 @@ BENCHES: Dict[str, BenchConfig] = {
                 threshold_us=400.0,
                 warn_us=200.0,
             ),
-            "distributed_quic_round_trip": BenchTarget(
-                threshold_us=50_000.0,
-                warn_us=25_000.0,
+            "distributed_quic_message_dispatch_2kb": BenchTarget(
+                threshold_us=5_000.0,
+                warn_us=1_000.0,
             ),
         },
     ),
@@ -106,7 +106,12 @@ def run_bench(name: str, config: BenchConfig) -> Tuple[str, List[BenchResult]]:
         "--",
         *config.cli_args,
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
     stdout = proc.stdout
     stderr = proc.stderr
 
@@ -176,7 +181,7 @@ def parse_results(lines: Iterable[str]) -> List[BenchResult]:
 
 
 def build_summary(entries: List[Tuple[str, BenchResult, BenchTarget]]) -> str:
-    rows = ["| Bench | p95 (µs) | Limit (µs) |", "| --- | --- | --- |"]
+    rows = ["| Bench | Upper bound (µs) | Limit (µs) |", "| --- | --- | --- |"]
     for bench_id, result, target in entries:
         rows.append(
             f"| {bench_id} | {result.upper_bound_us:.3f} | {target.threshold_us:.3f} |"
@@ -185,10 +190,24 @@ def build_summary(entries: List[Tuple[str, BenchResult, BenchTarget]]) -> str:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
     failed = False
     summary_entries: List[Tuple[str, BenchResult, BenchTarget]] = []
+    requested_benches = sys.argv[1:]
+    unknown_benches = set(requested_benches) - set(BENCHES)
+    if unknown_benches:
+        raise ValueError(
+            f"Unknown bench selection: {sorted(unknown_benches)}. "
+            f"Available benches: {sorted(BENCHES)}"
+        )
+    selected_benches = requested_benches or list(BENCHES)
 
-    for bench_name, config in BENCHES.items():
+    for bench_name in selected_benches:
+        config = BENCHES[bench_name]
         stdout, results = run_bench(bench_name, config)
 
         # Index results by bench label

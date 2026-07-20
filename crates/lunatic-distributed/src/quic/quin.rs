@@ -1,4 +1,4 @@
-use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashSet, future::Future, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -13,6 +13,8 @@ use wasmtime::ResourceLimiter;
 use x509_parser::{der_parser::oid, oid_registry::asn1_rs::Utf8String, prelude::FromDer};
 
 use crate::{CertAttrs, DistributedCtx};
+
+pub const MESSAGE_CHUNK_SIZE: usize = 1024;
 
 #[derive(Clone)]
 pub struct Client {
@@ -52,16 +54,53 @@ impl Client {
     ) -> Result<()> {
         let conn = self._connect(addr, name).await?;
         let mut stream = conn.open_uni().await?;
-        let mut header = Vec::with_capacity(24);
-        header.extend_from_slice(&message_id.to_le_bytes());
-        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        header.extend_from_slice(&0u64.to_le_bytes());
-        header.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        let mut chunks = [Bytes::from(header), data];
-        stream.write_all_chunks(&mut chunks).await?;
+        write_message(&mut stream, message_id, data).await?;
         stream.finish().await?;
         Ok(())
     }
+}
+
+pub(crate) fn frame_message_chunk(
+    message_id: u64,
+    message_size: u32,
+    chunk_id: u64,
+    data: Bytes,
+) -> [Bytes; 2] {
+    let mut header = Vec::with_capacity(24);
+    header.extend_from_slice(&message_id.to_le_bytes());
+    header.extend_from_slice(&message_size.to_le_bytes());
+    header.extend_from_slice(&chunk_id.to_le_bytes());
+    header.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    [Bytes::from(header), data]
+}
+
+/// Write a serialized distributed request using the production chunk framing.
+pub async fn write_message(
+    stream: &mut quinn::SendStream,
+    message_id: u64,
+    data: Bytes,
+) -> Result<()> {
+    let message_size =
+        u32::try_from(data.len()).map_err(|_| anyhow!("Distributed message is too large"))?;
+    let chunk_count = data.len().max(1).div_ceil(MESSAGE_CHUNK_SIZE);
+    let mut framed = Vec::with_capacity(chunk_count * 2);
+
+    if data.is_empty() {
+        framed.extend(frame_message_chunk(message_id, message_size, 0, data));
+    } else {
+        for (chunk_id, offset) in (0..data.len()).step_by(MESSAGE_CHUNK_SIZE).enumerate() {
+            let end = (offset + MESSAGE_CHUNK_SIZE).min(data.len());
+            framed.extend(frame_message_chunk(
+                message_id,
+                message_size,
+                chunk_id as u64,
+                data.slice(offset..end),
+            ));
+        }
+    }
+
+    stream.write_all_chunks(&mut framed).await?;
+    Ok(())
 }
 
 fn get_cert_attrs(conn: &Connection) -> Result<CertAttrs> {
@@ -228,26 +267,25 @@ async fn handle_quic_connection_registry(
 }
 
 async fn handle_quic_stream_registry(client: distributed::Client, recv: quinn::RecvStream) {
-    let mut recv_ctx = RecvCtx {
-        recv,
-        chunks: DashMap::new(),
-    };
-    while let Ok((_msg_id, bytes)) = read_next_stream_message(&mut recv_ctx).await {
-        match distributed::message::deserialize_message::<distributed::message::Request>(&bytes) {
-            Ok(distributed::message::Request::Registry { node_id, message }) => {
-                if let Err(error) = client.handle_registry_message(node_id, message).await {
-                    log::warn!("Error handling registry coordination message: {error}");
+    handle_request_stream(recv, move |_msg_id, request| {
+        let client = client.clone();
+        async move {
+            match request {
+                distributed::message::Request::Registry { node_id, message } => {
+                    if let Err(error) = client.handle_registry_message(node_id, message).await {
+                        log::warn!("Error handling registry coordination message: {error}");
+                    }
+                }
+                other => {
+                    log::debug!(
+                        "Registry-only server ignored {} distributed request",
+                        other.kind()
+                    );
                 }
             }
-            Ok(other) => {
-                log::debug!(
-                    "Registry-only server ignored {} distributed request",
-                    other.kind()
-                );
-            }
-            Err(error) => log::debug!("Error deserializing registry request: {error}"),
         }
-    }
+    })
+    .await;
 }
 
 pub struct NodeEnvPermission(pub Option<HashSet<u64>>);
@@ -322,26 +360,15 @@ async fn handle_quic_stream_node<T, E>(
         + 'static,
     E: Environment + 'static,
 {
-    let mut recv_ctx = RecvCtx {
-        recv,
-        chunks: DashMap::new(),
-    };
     log::trace!("distributed::server::handle_quic_stream started");
-    while let Ok((msg_id, bytes)) = read_next_stream_message(&mut recv_ctx).await {
-        if let Ok(request) =
-            distributed::message::deserialize_message::<distributed::message::Request>(&bytes)
-        {
-            distributed::server::handle_message(
-                ctx.clone(),
-                msg_id,
-                request,
-                node_permissions.clone(),
-            )
-            .await;
-        } else {
-            log::debug!("Error deserializing request");
+    handle_request_stream(recv, move |msg_id, request| {
+        let ctx = ctx.clone();
+        let node_permissions = node_permissions.clone();
+        async move {
+            distributed::server::handle_message(ctx, msg_id, request, node_permissions).await;
         }
-    }
+    })
+    .await;
     log::trace!("distributed::server::handle_quic_stream finished");
 }
 
@@ -417,6 +444,24 @@ async fn read_next_stream_message(ctx: &mut RecvCtx) -> Result<(u64, Bytes)> {
                 continue;
             }
             None => unreachable!("Message must exists at all times"),
+        }
+    }
+}
+
+/// Reassemble, decode, and dispatch requests from a production node stream.
+pub async fn handle_request_stream<F, Fut>(recv: quinn::RecvStream, mut dispatch: F)
+where
+    F: FnMut(u64, distributed::message::Request) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut recv_ctx = RecvCtx {
+        recv,
+        chunks: DashMap::new(),
+    };
+    while let Ok((msg_id, bytes)) = read_next_stream_message(&mut recv_ctx).await {
+        match distributed::message::deserialize_message::<distributed::message::Request>(&bytes) {
+            Ok(request) => dispatch(msg_id, request).await,
+            Err(error) => log::debug!("Error deserializing distributed request: {error}"),
         }
     }
 }

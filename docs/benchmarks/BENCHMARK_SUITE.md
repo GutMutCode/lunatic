@@ -13,13 +13,13 @@ Lunatic's benchmark suite provides comprehensive performance measurements across
 2. **Message Passing** (`mailbox.rs`) - Mailbox and selective receive
 3. **Hot Reload** (`hot_reload.rs`) - End-to-end hot code reloading
 4. **Memory Profile** (`memory_profile.rs`) - Memory overhead and scalability
-5. **Distributed Transport** (`distributed_messaging.rs`) - Request serialization plus a local mTLS QUIC echo
+5. **Distributed Transport** (`distributed_messaging.rs`) - Request serialization plus production-framed local mTLS QUIC dispatch
 
 ### Distributed benchmark boundary
 
-`distributed_quic_round_trip` creates a real QUIC client and server on `127.0.0.1`, opens bidirectional streams, and echoes a 512-byte payload. It validates the QUIC/mTLS transport primitive and is suitable for a loopback latency ceiling.
+`distributed_quic_message_dispatch_2kb` creates a real QUIC client and server on the OS-native loopback address and validates the generated server certificate against its `ctrl.lunatic.cloud` DNS identity. Each timed iteration serializes a 2 KiB `Request::Message`, writes it to a persistent unidirectional stream using production 1 KiB chunk framing, reassembles and decodes it with the production receive path, and waits for the decoded request to cross a dispatch callback.
 
-It does **not** exercise Lunatic's `distributed::Client`, message chunking, process delivery, registry lookup, control-plane node discovery, multiple machines, or partition behavior. It must not be described as an end-to-end distributed process messaging benchmark.
+The benchmark covers MessagePack, chunking/framing, loopback QUIC, reassembly, decoding, and the server dispatch boundary. It does **not** deliver into a live process mailbox or exercise registry lookup, control-plane node discovery, multiple machines, or partition behavior, so it must not be described as a full end-to-end distributed process benchmark.
 
 ---
 
@@ -34,7 +34,7 @@ cargo bench --bench benchmark      # Process spawn
 cargo bench --bench mailbox        # Message passing
 cargo bench --bench hot_reload     # Hot reload
 cargo bench --bench memory_profile # Memory profiling
-cargo bench --bench distributed_messaging # Serialization + loopback QUIC
+cargo bench --bench distributed_messaging # Serialization + production-framed loopback QUIC
 
 # View HTML reports
 open target/criterion/report/index.html

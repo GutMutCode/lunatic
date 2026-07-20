@@ -66,7 +66,7 @@ pub struct MessageChunk {
 }
 
 // TODO: move to configuration
-const CHUNK_SIZE: usize = 1024;
+const CHUNK_SIZE: usize = quic::MESSAGE_CHUNK_SIZE;
 
 pub async fn congestion_control_worker(state: distributed::Client) -> ! {
     state.inner.has_messages.notified().await;
@@ -281,13 +281,7 @@ async fn stream_task(mut state: StreamTask) {
         let mut data: Vec<bytes::Bytes> = chunks
             .iter()
             .flat_map(|c| {
-                let mut buf = Vec::new();
-                buf.extend(c.message_id.to_le_bytes().as_ref());
-                buf.extend(c.message_size.to_le_bytes().as_ref());
-                buf.extend(c.chunk_id.to_le_bytes().as_ref());
-                buf.extend((c.data.len() as u32).to_le_bytes().as_ref());
-                // buf.extend(&c.data);
-                vec![bytes::Bytes::from(buf), c.data.clone()]
+                quic::frame_message_chunk(c.message_id, c.message_size, c.chunk_id, c.data.clone())
             })
             .collect();
         // Try to send data

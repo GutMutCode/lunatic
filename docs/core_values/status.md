@@ -11,7 +11,7 @@ An item is complete only when the production path is connected and an executable
 
 | Focus | Status | Highlights |
 | --- | --- | --- |
-| Fast | Partial | Global epoch preemption and hot-reload snapshots are implemented; distributed serialization and a loopback QUIC transport benchmark exist, but the benchmark does not traverse Lunatic node message routing. |
+| Fast | Partial | Global epoch preemption and hot-reload snapshots are implemented; distributed serialization and a production-framed loopback QUIC dispatch benchmark exist, but live process-mailbox delivery is not benchmarked. |
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
@@ -32,8 +32,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: Messaging round-trip benches execute in CI to monitor mailbox latency (`benches/messaging.rs:1`, `.github/workflows/ci.yml:64`).
 - Evidence: Distributed encode/decode costs are tracked via the new Criterion suite (`benches/distributed_messaging.rs:1`, `scripts/check_bench_thresholds.py:45`).
 - Evidence: Control-plane node lookup latency is captured to baseline cross-node registration calls (`benches/distributed_latency.rs:1`, `scripts/check_bench_thresholds.py:52`).
-- Evidence: `distributed_quic_round_trip` opens a real mTLS QUIC connection over `127.0.0.1`, creates bidirectional streams, and measures a 512-byte echo (`benches/distributed_messaging.rs:19-184`). CI builds/runs the benchmark and applies a latency ceiling (`.github/workflows/ci.yml:66`, `scripts/check_bench_thresholds.py:45-60`).
-- Gap: the echo server is benchmark-local and does not exercise `distributed::Client`, message chunking, process delivery, registry lookup, control-plane discovery, multiple nodes, or network partitions. A full Lunatic distributed-message round trip remains unverified.
+- Evidence: `distributed_quic_message_dispatch_2kb` opens a real mTLS connection over the OS-native loopback address, validates the generated server certificate against `ctrl.lunatic.cloud`, serializes a 2 KiB `Request::Message`, and sends it over the same persistent unidirectional stream, 1 KiB chunk framing, reassembly, MessagePack decode, and dispatch-callback path used by production node messaging (`benches/distributed_messaging.rs`, `crates/lunatic-distributed/src/quic/quin.rs`, `crates/lunatic-distributed/src/congestion/mod.rs`). CI runs the benchmark and applies a latency ceiling (`.github/workflows/ci.yml:66`, `scripts/check_bench_thresholds.py:45-60`).
+- Gap: the benchmark stops at the decoded-request dispatch boundary. It does not deliver into a live process mailbox or exercise registry lookup, control-plane discovery, multiple nodes, or network partitions. A full Lunatic distributed-process message round trip remains unverified.
 
 ### Robust
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
@@ -102,7 +102,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 | OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process lifecycle and restart strategies; GenEvent exact-target and isolated concurrent fan-out | Supervisor automatic monitor-event intake; GenStatem/GenEvent process-runtime adapters; guest-WASM adapters | `cargo test -p lunatic-otp-patterns` (41 tests pass, including 9 real-process integration tests and 5 GenEvent contract tests) |
 | TLS streams | Live in-process transfer with preserved session, guest ID and timeouts; metadata serialization contract | Serialized/cross-process active-stream restoration | `cargo test --lib state::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`; `cargo test --test tls_stream_migration_contract` |
 | Global registry | In-memory registry operations and coordination handler transitions | Control/QUIC transport wiring, quorum wait, live concurrent registration, partition recovery | `cargo test -p lunatic-distributed --test registry_coordination` (8 manually orchestrated tests pass) |
-| QUIC benchmark | Real loopback mTLS QUIC connection and stream echo | Lunatic distributed client/server routing and multi-node behavior | `cargo bench --bench distributed_messaging --no-run` builds the executable benchmark |
+| QUIC benchmark | Real loopback mTLS, production uni-stream chunk framing, reassembly, MessagePack decode, and request dispatch boundary | Live process-mailbox delivery and multi-node behavior | `cargo bench --bench distributed_messaging` executes the measured path; `python scripts/check_bench_thresholds.py distributed_messaging` enforces its ceiling |
 
 These commands were executed on Windows against the reviewed baseline on 2026-07-21. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem/GenEvent process-runtime adapters, serialized TLS recovery, registry, or distributed messaging gaps.
 

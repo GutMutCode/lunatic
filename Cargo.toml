@@ -109,6 +109,14 @@ name = "memory_profile"
 harness = false
 name = "instance_pool"
 
+[[bench]]
+harness = false
+name = "distributed_messaging"
+
+[[bench]]
+harness = false
+name = "distributed_latency"
+
 [workspace]
 members = [
     "crates/hash-map-id",
