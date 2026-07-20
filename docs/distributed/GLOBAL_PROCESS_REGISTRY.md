@@ -1,14 +1,14 @@
 # Global Process Registry & Location Transparency
 
-**Status**: ✅ Implemented
+**Status**: ⚠️ In-memory registry and global address types implemented; runtime routing and coordination pending
 **Date**: 2025-10-07
-**Purpose**: Enable Erlang-style location-transparent process addressing across distributed Lunatic nodes
+**Purpose**: Provide the data model and lookup APIs needed for future Erlang-style location-transparent process addressing
 
 ---
 
 ## Overview
 
-The Global Process Registry provides **location transparency** for distributed processes, closing the gap identified in `docs/core_values/status.md:88`:
+The Global Process Registry provides the **address representation and in-memory lookup foundation** for distributed processes. It does not yet close the runtime location-transparency gap identified in `docs/core_values/status.md`:
 
 > "no distributed OTP equivalents beyond `lunatic-distributed`, which lacks coverage"
 
@@ -37,7 +37,7 @@ pub struct GlobalProcessId {
 ```
 
 **Key Features:**
-- **Location Transparency**: Send messages to any process regardless of node
+- **Location-Aware Addressing**: Represent the node, environment, and process in one value
 - **Compact Encoding**: u128 representation for efficient storage
 - **Erlang Compatibility**: Matches Erlang's `{Node, Pid}` semantics
 
@@ -56,7 +56,8 @@ let gpid = GlobalProcessId::new(
 if gpid.is_local(current_node_id) {
     // Send locally
 } else {
-    // Route to remote node
+    // A caller must route to the remote node; registry lookup is not wired
+    // into the Lunatic messaging path yet.
 }
 
 // Compact encoding for network transfer
@@ -73,7 +74,7 @@ let decoded = GlobalProcessId::from_compact(compact);
 ```rust
 pub struct DistributedRegistry {
     local: Arc<DashMap<ProcessName, RegistryEntry>>,   // Node-local names
-    global: Arc<DashMap<ProcessName, RegistryEntry>>,  // Cluster-wide names
+    global: Arc<DashMap<ProcessName, RegistryEntry>>,  // Intended global scope; local map
     reverse: Arc<DashMap<GlobalProcessId, Vec<ProcessName>>>, // Reverse lookup
 }
 ```
@@ -101,20 +102,21 @@ if let Some(entry) = registry.lookup("logger") {
 - Per-node resource managers
 - Node-local coordinators
 
-#### Global Registration (Cluster-Wide)
+#### Intended Global Registration Scope
 
-Names are unique **across the entire cluster**:
+Names passed to `register_global` are unique only within that `DistributedRegistry` instance. No cluster synchronization occurs:
 
 ```rust
 registry.register_global("database_manager", gpid)?;
 
-// Any node can lookup
+// Only this registry instance can look up the entry until an external
+// coordination path propagates it.
 if let Some(entry) = registry.lookup_global("database_manager") {
-    // Send message to database manager (regardless of which node it's on)
+    println!("Database manager address: {}", entry.global_pid);
 }
 ```
 
-**Use Cases:**
+**Intended use cases after coordination is connected:**
 - Singleton services (database connection pool, metrics aggregator)
 - Cluster-wide coordinators
 - Global state managers
@@ -133,7 +135,7 @@ fn register_local(
     global_pid: GlobalProcessId,
 ) -> Result<()>
 
-/// Register globally (cluster-wide)
+/// Register in this registry instance's global namespace
 fn register_global(
     &self,
     name: impl Into<ProcessName>,
@@ -197,13 +199,12 @@ let db_pid = GlobalProcessId::new(1, 1, 102);
 registry.register_global("logger", logger_pid)?;
 registry.register_global("database", db_pid)?;
 
-// Lookup by name (location transparency)
+// Lookup by name in this client's local registry object
 if let Some(entry) = registry.lookup("logger") {
-    // Send message to logger regardless of which node it's on
     println!("Logger at {}", entry.global_pid);
 }
 
-// Process crash - automatic cleanup
+// Cleanup is explicit; process-exit handling does not call this automatically.
 registry.unregister_process(logger_pid);
 assert!(registry.lookup("logger").is_none());
 ```
@@ -230,7 +231,7 @@ assert!(registry.lookup("worker").is_some());
 assert!(registry.lookup("primary_worker").is_some());
 ```
 
-### Example 3: Cross-Node Service Discovery
+### Example 3: Cross-Node Routing After External Synchronization
 
 ```rust
 // Node 1: Register service
@@ -238,8 +239,12 @@ let node1_registry = client1.registry();
 let service_pid = GlobalProcessId::new(1, 1, 300);
 node1_registry.register_global("auth_service", service_pid)?;
 
-// Node 2: Discover service
+// Node 2 does not receive the entry automatically.
 let node2_registry = client2.registry();
+assert!(node2_registry.lookup_global("auth_service").is_none());
+
+// After an external coordination layer applies the entry to node 2:
+node2_registry.register_global("auth_service", service_pid)?;
 if let Some(entry) = node2_registry.lookup_global("auth_service") {
     // Found service on node 1
     assert_eq!(entry.global_pid.node_id(), 1);
@@ -260,7 +265,7 @@ if let Some(entry) = node2_registry.lookup_global("auth_service") {
 
 ## Integration with Distributed Client
 
-The registry is **automatically integrated** into the distributed client:
+Each distributed client owns a registry object and exposes it through `registry()`. Message sending does not perform registry lookup automatically:
 
 ```rust
 pub struct Client {
@@ -292,7 +297,7 @@ let registry = client.registry();
 let gpid = GlobalProcessId::new(node_id, env_id, pid);
 registry.register_local("my_service", gpid)?;
 
-// Lookup and send message
+// The caller performs lookup and translates the GlobalProcessId into SendParams.
 if let Some(entry) = registry.lookup("target_service") {
     client.send(SendParams {
         node: NodeId(entry.global_pid.node_id()),
@@ -329,12 +334,12 @@ cargo test --test distributed_registry --package lunatic-distributed
 - ✅ Global registration and lookup
 - ✅ Duplicate registration prevention
 - ✅ Unregister by name
-- ✅ Unregister by process (automatic cleanup)
+- ✅ Unregister-by-process helper (cleanup must be invoked explicitly)
 - ✅ Reverse lookup (process → names)
 - ✅ Scoped lookups (local-only, global-only)
 - ✅ Registration timestamps
 - ✅ Erlang-style workflows
-- ✅ Cross-node identification
+- ✅ Node ID distinguishes `GlobalProcessId` values
 
 **Results:**
 ```
@@ -385,7 +390,7 @@ global:unregister_name(database).
 // Lunatic: Register locally
 registry.register_local("logger", gpid)?;
 
-// Lunatic: Register globally
+// Lunatic: Register in the current registry's global namespace
 registry.register_global("database", gpid)?;
 
 // Lunatic: Lookup
@@ -405,7 +410,7 @@ registry.unregister("database")?;
 | Global registration | `global:register_name/2` | `register_global` |
 | Lookup | `whereis/1` | `lookup` |
 | Process ID format | `Pid` (opaque) | `GlobalProcessId` (explicit node/env/pid) |
-| Automatic cleanup | On process exit | `unregister_process(gpid)` |
+| Automatic cleanup | On process exit | Manual `unregister_process(gpid)` helper; not wired to process exit |
 | Multi-alias | Not supported | ✅ Supported via reverse map |
 
 ---
@@ -569,13 +574,13 @@ registry.unregister_process(gpid);
 
 ## Conclusion
 
-**The Global Process Registry brings Erlang-style location transparency to Lunatic**, enabling:
+The Global Process Registry establishes part of the foundation for Erlang-style location transparency:
 
-1. ✅ **Transparent Process Addressing**: Send messages to any process by name, regardless of node
-2. ✅ **Dual Scoping**: Local (node-scoped) and global (cluster-wide) name registration
+1. ⚠️ **Global address representation**: Identify a process by node, environment, and process ID; transparent routing is pending
+2. ⚠️ **Dual namespace maps**: Local and global maps exist within one registry instance; cluster-wide synchronization is pending
 3. ✅ **Reverse Lookup**: Find all names for a given process
-4. ✅ **Automatic Cleanup**: Unregister all names when process terminates
-5. ✅ **Erlang Parity**: Matches `register/whereis` and `global:register_name/whereis_name` semantics
+4. ⚠️ **Cleanup helper**: Unregister all names for a process when explicitly called; process-exit integration is pending
+5. ⚠️ **Erlang-inspired APIs**: Similar map operations exist, but cluster-wide semantics are not yet provided
 
 ### Status
 
@@ -584,7 +589,8 @@ registry.unregister_process(gpid);
 - ✅ Local registration: Fully functional
 - ✅ Global registration: Functional (local coordination only)
 - ✅ Test suite: 14 tests covering all major features
-- ⚠️  Cross-node global coordination: Future enhancement
+- ❌ Registry lookup is not connected to message routing
+- ❌ Cross-node global coordination transport is not implemented
 
 ### Next Steps
 
@@ -593,4 +599,4 @@ registry.unregister_process(gpid);
 3. Implement name monitoring and notifications
 4. Add TTL-based registration expiration
 
-**Gap Status**: ✅ **MAJOR PROGRESS** - Distributed process registry infrastructure complete; cross-node coordination planned for next phase.
+**Gap Status**: ⚠️ **FOUNDATION ONLY** — data structures and local operations are implemented; transport integration and real multi-node tests remain required.

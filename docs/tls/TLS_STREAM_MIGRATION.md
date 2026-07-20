@@ -1,6 +1,6 @@
 # TLS Stream Migration Strategy
 
-**Status**: Implemented
+**Status**: ⚠️ Partial — metadata capture implemented, automatic reconnection pending
 **Date**: 2025-10-07
 **Related**: `CORE_VALUES.md` - Fault Tolerance & High Availability
 
@@ -45,8 +45,8 @@ TLS 1.3 session resumption (RFC 8446) was evaluated but rejected for the followi
 
 ### Chosen Strategy: Reconnection Metadata
 
-**Client Connections** → Automatic reconnection
-**Server Connections** → Graceful shutdown (client-initiated reconnect)
+**Client Connections** → Reconnection metadata capture only; the runtime currently logs but does not reconnect
+**Server Connections** → Closure metadata; the external client must initiate a new connection
 
 This aligns with **Erlang's approach**: network state is transient and rebuilt after code upgrades.
 
@@ -109,7 +109,7 @@ warn!("TLS client stream to {}:{} cannot be automatically reconnected yet",
 ### 2. TLS Server Streams (Inbound)
 
 #### Snapshot Phase
-Server-accepted connections are marked for graceful shutdown:
+Server-accepted connection snapshots record a graceful-shutdown intent:
 
 ```rust
 ResourceSnapshot::TlsServerConnection {
@@ -374,7 +374,7 @@ test test_tls_client_snapshot_serialization ... ok
 - ✅ Serialization/deserialization
 - ✅ Timeout preservation
 - ✅ Custom certificate metadata
-- ✅ Graceful server connection handling
+- ✅ Server closure metadata
 
 ### Integration Tests
 
@@ -394,7 +394,7 @@ test test_tls_stream_non_migratable ... ok  # Now outdated
 
 ### Internal
 - `CORE_VALUES.md`: Fault Tolerance & High Availability principles
-- `docs/core_values/status.md`: Compliance status (TLS migration gap closed)
+- `docs/core_values/status.md`: Canonical status and the still-open automatic reconnect gap
 - `docs/security/AUDIT_LOGGING_PERSISTENCE.md`: TLS event logging
 - `crates/lunatic-networking-api/src/tls_tcp.rs`: TLS API implementation
 - `crates/lunatic-process/src/resource_migration.rs`: Snapshot data structures
@@ -420,8 +420,8 @@ test test_tls_stream_non_migratable ... ok  # Now outdated
 
 ## Conclusion
 
-Lunatic's TLS stream migration strategy prioritizes **security** and **simplicity** over perfect transparency. By capturing reconnection metadata for client streams and gracefully closing server streams, we enable hot reload while maintaining cryptographic integrity.
+Lunatic's TLS stream migration strategy prioritizes **security** and **simplicity** over perfect transparency. The current implementation captures client reconnection metadata and records the server-side closure requirement without serializing cryptographic session state.
 
-This approach mirrors Erlang/OTP's proven pattern: transient network state is rebuilt after code upgrades, with supervision trees handling reconnection logic at the application level.
+Applications can use that information as the basis for their own reconnect policy, but Lunatic's OTP abstractions are not yet connected to real processes and do not currently provide an automatic supervision-based recovery path.
 
 **Status**: Infrastructure complete, automatic reconnection pending dependency integration.

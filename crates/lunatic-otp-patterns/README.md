@@ -1,19 +1,32 @@
 # Lunatic OTP Patterns
 
-This crate provides Erlang/OTP-inspired behavior patterns for Lunatic WASM processes, enabling fault-tolerant and scalable application development.
+This crate contains Erlang/OTP-inspired callback traits, message envelopes, and in-memory strategy logic intended for future use with Lunatic WASM processes.
+
+## Current implementation status
+
+The crate is an API and algorithm scaffold, not a connected OTP runtime:
+
+- `GenServer` callback traits and message serialization are implemented.
+- `GenServer::spawn`, `GenServerHandle::call`, and `cast` return explicit “not yet implemented” errors.
+- Supervisor strategy bookkeeping uses caller-provided start closures and stored numeric IDs; shutdown does not terminate a Lunatic process.
+- GenStatem tests drive transitions directly in memory.
+- The Rust example invokes callbacks directly; its process-based usage block is pseudo-code.
+
+Use the crate to evaluate the proposed APIs, not as evidence of process-level fault tolerance.
 
 ## Overview
 
-Lunatic implements the actor model inspired by Erlang/BEAM, and this crate provides higher-level abstractions that make it easier to build robust distributed systems.
+Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate sketches higher-level abstractions that still need process creation, mailbox, reply, timeout, exit, and termination integration.
 
 ## Patterns
 
 ### GenServer
 
-Generic server pattern for implementing stateful server processes with synchronous and asynchronous message handling.
+Callback and message types for a stateful server pattern. Synchronous/asynchronous process communication is not wired yet.
 
 ```rust
 use lunatic_otp_patterns::{GenServer, GenServerConfig};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,29 +58,39 @@ impl GenServer for Counter {
         Counter { count: 0 }
     }
 
-    fn handle_call(&mut self, request: Self::Call) -> Self::CallReply {
+    fn handle_call(&mut self, request: Self::Call) -> Result<Self::CallReply> {
         match request {
             CounterRequest::Increment => {
                 self.count += 1;
-                CounterResponse::Ok
+                Ok(CounterResponse::Ok)
             }
-            CounterRequest::Get => CounterResponse::Value(self.count),
-            // ... other handlers
+            CounterRequest::Decrement => {
+                self.count -= 1;
+                Ok(CounterResponse::Ok)
+            }
+            CounterRequest::Get => Ok(CounterResponse::Value(self.count)),
+            CounterRequest::Set(value) => {
+                self.count = value;
+                Ok(CounterResponse::Ok)
+            }
         }
     }
 
-    fn handle_cast(&mut self, request: Self::Cast) {
+    fn handle_cast(&mut self, request: Self::Cast) -> Result<()> {
         match request {
             CounterRequest::Increment => self.count += 1,
-            // ... other handlers
+            CounterRequest::Decrement => self.count -= 1,
+            CounterRequest::Get => {}
+            CounterRequest::Set(value) => self.count = value,
         }
+        Ok(())
     }
 }
 ```
 
 ### Supervisor
 
-Process supervision with configurable restart strategies for building fault-tolerant systems.
+In-memory supervision strategy bookkeeping. The current implementation can invoke a supplied start closure, but it does not stop or monitor real Lunatic processes.
 
 ```rust
 use lunatic_otp_patterns::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec};
@@ -79,7 +102,7 @@ let spec = SupervisorSpec {
     children: vec![
         ChildSpec {
             id: "worker1".to_string(),
-            start: || Ok(12345), // Process ID
+            start: || Ok(12345), // Placeholder numeric ID, not a spawned process
             restart: RestartPolicy::Permanent,
             shutdown: ShutdownPolicy::Timeout(5000),
             child_type: ChildType::Worker,
@@ -132,24 +155,24 @@ impl GenStatem for DoorState {
 
 ## Usage in WASM
 
-These patterns are designed to be used from within WASM guest code. In a real Lunatic application, you would:
+The intended future WASM flow is:
 
 1. Implement the trait for your server/state machine
-2. Spawn processes using the Lunatic runtime APIs
-3. Use message passing for communication
+2. Spawn a Lunatic process through the future runtime adapter
+3. Use mailbox-backed call/cast messages and correlated replies
 
-See `examples/rust/src/gen_server_example.rs` for a complete example.
+Steps 2 and 3 are not implemented by this crate. `examples/rust/src/gen_server_example.rs` is a callback-only example and labels process usage as pseudo-code.
 
 ## Core Values Compliance
 
-This crate adheres to Lunatic's core values:
+The proposed API is intended to align with Lunatic's core values, but the following are design goals rather than current runtime guarantees:
 
-- **Fast, Robust, and Scalable**: Lightweight processes with supervision
+- **Fast, Robust, and Scalable**: Intended to use lightweight processes with supervision
 - **Language Independence**: Pure Rust with serde serialization
-- **Security Through Isolation**: Process-based isolation
-- **Fault Tolerance**: Supervisor patterns and restart strategies
-- **Asynchronous by Default**: Message-passing concurrency
-- **Erlang-Inspired**: Direct implementation of OTP patterns
+- **Security Through Isolation**: Intended to inherit Lunatic process isolation once connected
+- **Fault Tolerance**: Restart strategy logic exists; real process recovery is pending
+- **Asynchronous by Default**: Message envelopes exist; mailbox transport is pending
+- **Erlang-Inspired**: Callback and strategy APIs are modeled after OTP
 
 ## License
 

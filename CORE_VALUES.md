@@ -217,8 +217,8 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 
 **Lunatic Implementation Status:**
 - ⚠️  Distributed messaging (lunatic-distributed crate)
-- ❌ Transparent process IDs across nodes
-- ❌ Global registry
+- ⚠️  `GlobalProcessId` and in-memory distributed registry data structures exist, but name lookup is not wired into the runtime messaging path
+- ❌ Cross-node registry coordination over the control/QUIC transport
 - ❌ Distributed hot reload (Phase 10)
 
 ### OTP Patterns
@@ -240,9 +240,10 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Dynamic children management
 
 **Lunatic Implementation Status:**
-- ✅ Guest library implemented (`lunatic-otp-patterns` crate)
-- ✅ Reference implementation in Rust with examples
-- 📝 Additional language implementations needed
+- ⚠️  Rust callback traits, message envelopes, and in-memory strategy logic exist in `lunatic-otp-patterns`
+- ❌ `GenServer::spawn`, `GenServerHandle::call`, and `cast` are not connected to Lunatic processes or mailboxes
+- ❌ Supervisor shutdown and restart bookkeeping does not yet terminate or restart real Lunatic processes
+- 📝 Rust examples exercise callbacks directly; runtime and additional-language integrations are still needed
 
 ---
 
@@ -330,7 +331,7 @@ When designing or reviewing features, ask:
 - [x] Process isolation (100% guaranteed)
 - [x] Hot reload state preservation
 - [ ] 99.999% uptime (application-dependent)
-- [x] Automatic failure recovery (via supervisors)
+- [ ] Automatic failure recovery via OTP supervisors (links/monitors exist; supervisor runtime integration is pending)
 
 ### Developer Experience
 - [x] Multi-language support

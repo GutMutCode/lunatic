@@ -1,22 +1,24 @@
 # Core Values Compliance Status
 
-Generated: 2025-10-07  
-Commit: d5da4150f2d8c02597a73d02a23831e910c9c9ff (workspace)
+Reviewed: 2026-07-20
+Reviewed baseline: `bb6d9b51ef65780f2baf29fa508b5db0e12e5d68`
 
 This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
+
+An item is complete only when the production path is connected and an executable test exercises that path. Data structures, callback logic, serialization tests, loopback transport tests, and manually orchestrated handler tests are reported as partial evidence rather than end-to-end completion.
 
 ## Status at a Glance
 
 | Focus | Status | Highlights |
 | --- | --- | --- |
-| Fast | Partial | Global epoch preemption and hot-reload snapshots implemented; distributed encode/decode and QUIC round-trip benches guard latency budgets. |
+| Fast | Partial | Global epoch preemption and hot-reload snapshots are implemented; distributed serialization and a loopback QUIC transport benchmark exist, but the benchmark does not traverse Lunatic node message routing. |
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
-| Security Through Isolation | Strong | Capability checks enforced; network listeners auto-restore while TLS streams remain explicitly non-migratable until session resumption lands. |
-| Fault Tolerance & HA | Partial | Hot reload pipeline and supervisor signals work, but cross-node reload and rollback policies still speculative. |
+| Security Through Isolation | Strong | Capability checks and listener restoration are implemented; TLS stream snapshots preserve reconnection metadata, but the runtime does not reconnect active TLS streams. |
+| Fault Tolerance & HA | Partial | Hot reload plus links/monitors work; OTP process supervision and cross-node registry coordination are not connected to live runtime paths. |
 | Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
-| Erlang-Inspired | Partial | Links, monitors, registry, and hot reload mirror OTP ideas; distribution, tooling, and OTP-equivalent libraries lag. |
+| Erlang-Inspired | Partial | Links, monitors, local registry structures, and OTP callback traits mirror Erlang concepts; live OTP process integration and coordinated global registration remain open. |
 
 Status values: **Strong** (implemented with validation), **Partial** (major elements shipped but measurable gaps), **Emerging** (initial scaffolding only).
 
@@ -30,8 +32,8 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: Messaging round-trip benches execute in CI to monitor mailbox latency (`benches/messaging.rs:1`, `.github/workflows/ci.yml:64`).
 - Evidence: Distributed encode/decode costs are tracked via the new Criterion suite (`benches/distributed_messaging.rs:1`, `scripts/check_bench_thresholds.py:45`).
 - Evidence: Control-plane node lookup latency is captured to baseline cross-node registration calls (`benches/distributed_latency.rs:1`, `scripts/check_bench_thresholds.py:52`).
-- Evidence: QUIC round-trip latency is now benchmarked via `distributed_quic_round_trip` to catch regressions in encrypted messaging (`benches/distributed_messaging.rs:166`, `scripts/check_bench_thresholds.py:56`).
-- ✅ ~~Gap: expand coverage from control-plane requests to full QUIC messaging round-trips across nodes.~~ **RESOLVED**: the QUIC echo harness exercises mTLS client/server streams to validate end-to-end latency.
+- Evidence: `distributed_quic_round_trip` opens a real mTLS QUIC connection over `127.0.0.1`, creates bidirectional streams, and measures a 512-byte echo (`benches/distributed_messaging.rs:19-184`). CI builds/runs the benchmark and applies a latency ceiling (`.github/workflows/ci.yml:66`, `scripts/check_bench_thresholds.py:45-60`).
+- Gap: the echo server is benchmark-local and does not exercise `distributed::Client`, message chunking, process delivery, registry lookup, control-plane discovery, multiple nodes, or network partitions. A full Lunatic distributed-message round trip remains unverified.
 
 ### Robust
 - Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
@@ -59,12 +61,12 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
 - Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
 - Evidence: TLS listeners remain migratable with certificate/key preservation (`src/state.rs:455-488`).
-- Evidence: **TLS client streams now capture reconnection metadata** for hot reload support - server name, port, custom certificates, and timeouts are preserved (`src/state.rs:319-347`, `crates/lunatic-networking-api/src/tls_tcp.rs:425-438`).
-- Evidence: **TLS server streams use graceful shutdown strategy** - connections are marked for closure during hot reload, allowing clients to reconnect (`src/state.rs:338-346`, `crates/lunatic-process/src/resource_migration.rs:25-29`).
+- Evidence: TLS client stream snapshots capture server name, port, custom certificates, and timeouts (`src/state.rs:319-347`, `crates/lunatic-networking-api/src/tls_tcp.rs:425-438`).
+- Evidence: TLS server stream snapshots record that the connection must close and be re-established by the client (`src/state.rs:338-346`, `crates/lunatic-process/src/resource_migration.rs:25-29`).
 - Evidence: Comprehensive TLS migration documentation covers security rationale and operational behavior (`docs/tls/TLS_STREAM_MIGRATION.md`).
 - Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:113`). Implementation documented in `docs/security/AUDIT_LOGGING.md`.
 - Evidence: **Comprehensive audit logging persistence guide** - Production-ready documentation covering OpenTelemetry, syslog, and container logging architectures with storage recommendations, compliance checklists, and alerting strategies (`docs/security/AUDIT_LOGGING_PERSISTENCE.md`).
-- ✅ ~~Gap: TLS active streams remain non-migratable until resumable session support lands~~ **RESOLVED**: TLS client streams capture reconnection metadata (server name, port, certificates, timeouts) for automatic reconnection after hot reload. Server streams gracefully close, allowing client-initiated reconnection. Implementation aligns with Erlang's proven approach: transient network state is rebuilt after code upgrades.
+- Gap: `restore_resource_snapshot` only logs the saved client endpoint and explicitly reports that automatic reconnection is not implemented (`src/state.rs:490-510`). `tests/tls_stream_reconnection.rs` validates snapshot data and serialization, not a live TLS reconnect after hot reload.
 
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).
@@ -85,39 +87,46 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: messaging, monitors, and process registry mirror OTP patterns (`crates/lunatic-process/src/lib.rs:559`).
 - Evidence: hot reload uses module versioning and memory snapshots similar to BEAM upgrades (`crates/lunatic-process/src/hot_reload.rs:397`).
 - Evidence: per-environment registry supports name-based lookup (`src/state.rs:190`).
-- Evidence: **GlobalProcessId provides location transparency** - node-aware process addressing with compact u128 encoding (`crates/lunatic-distributed/src/distributed/global_process_id.rs`).
-- Evidence: **DistributedRegistry implements Erlang-style process registration** - supports both local (node-scoped) and global (cluster-wide) name registration with reverse lookup (`crates/lunatic-distributed/src/distributed/registry.rs`).
-- Evidence: **Comprehensive registry test suite** - 14 tests validate registration, lookup, cleanup, and Erlang-style workflows (`crates/lunatic-distributed/tests/distributed_registry.rs`).
-- Evidence: **RegistryCoordinator implements cross-node coordination** - majority-based consensus protocol for global name registration with conflict resolution and split-brain prevention (`crates/lunatic-distributed/src/distributed/registry_coordination.rs`).
-- Evidence: **Cross-node coordination test suite** - 16 tests (8 unit + 8 integration) validate majority consensus, conflict detection, node failure cleanup, and registry synchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
-- ✅ ~~Gap: no distributed OTP equivalents beyond `lunatic-distributed`, which lacks coverage~~ **RESOLVED**: Global process registry with full cross-node coordination. Implements majority-based consensus (prevents split-brain), conflict resolution (timestamp-based), node failure cleanup, and new node synchronization. Documentation in `docs/distributed/GLOBAL_REGISTRY_COORDINATION.md`.
+- Evidence: `GlobalProcessId` represents node/environment/process coordinates and supports compact encoding (`crates/lunatic-distributed/src/distributed/global_process_id.rs`).
+- Evidence: `DistributedRegistry` provides concurrent in-memory local/global maps and reverse lookup (`crates/lunatic-distributed/src/distributed/registry.rs`).
+- Evidence: `RegistryCoordinator` defines coordination messages and handler-side response aggregation (`crates/lunatic-distributed/src/distributed/registry_coordination.rs`).
+- Evidence: registry tests validate map operations, serialization, and manually orchestrated handler transitions (`crates/lunatic-distributed/tests/distributed_registry.rs`, `crates/lunatic-distributed/tests/registry_coordination.rs`).
+- Gap: multi-node `register_global_coordinated` stores a pending request and returns without sending a request or waiting for a quorum (`crates/lunatic-distributed/src/distributed/registry_coordination.rs:128-175`). Coordination messages are not carried by the existing distributed request/response transport, and the integration tests invoke handlers directly rather than running networked nodes.
 - Gap: tooling (tracing, dashboards) referenced in `CORE_VALUES.md` not implemented.
 
 ## Validation and Test Coverage
-- `cargo test instance_pool_reports_hit_rate -- --nocapture` validates pooling telemetry; `cargo test resource_limits -- --nocapture` covers quota enforcement. Legacy compiler warnings (unused imports/fields) persist and should be triaged separately.
-- No automated benchmark or fuzzing jobs are executed in CI for the metrics listed in `CORE_VALUES.md`.
+
+| Area | Verified implementation | Not verified or not implemented | Executable evidence |
+| --- | --- | --- | --- |
+| OTP | Callback traits, message serialization, in-memory state transitions and restart bookkeeping | Process spawn, mailbox call/cast, real process termination/restart, runtime timeout behavior | `cargo test -p lunatic-otp-patterns` (21 tests pass; tests call callbacks or mock process IDs) |
+| TLS streams | Snapshot variants, metadata capture, serialization | Live TCP+TLS reconnect and restored guest resource handle | `cargo test --test tls_stream_reconnection` (6 snapshot/serialization tests pass) |
+| Global registry | In-memory registry operations and coordination handler transitions | Control/QUIC transport wiring, quorum wait, live concurrent registration, partition recovery | `cargo test -p lunatic-distributed --test registry_coordination` (8 manually orchestrated tests pass) |
+| QUIC benchmark | Real loopback mTLS QUIC connection and stream echo | Lunatic distributed client/server routing and multi-node behavior | `cargo bench --bench distributed_messaging --no-run` builds the executable benchmark |
+
+These commands were executed on Windows against the reviewed baseline on 2026-07-20. Passing scaffold-level tests must not be used as evidence that the missing production path is complete.
 
 ## Known Documentation Deltas
 - Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
 
 ## OTP Patterns Implementation
-- Evidence: Complete OTP patterns library implemented in `lunatic-otp-patterns` crate with GenServer, Supervisor, and GenStatem traits.
-- Evidence: Comprehensive Rust example demonstrating GenServer usage (`examples/rust/src/gen_server_example.rs`).
-- Evidence: Type-safe message handling with serde serialization for cross-language compatibility.
-- Evidence: Supervisor restart strategies (OneForOne, OneForAll, RestForOne) with configurable intensity limits.
-- Evidence: Finite state machine support with event-driven transitions and state data management.
-- ✅ ~~Gap: OTP patterns were guest library responsibility with no reference implementations~~ **RESOLVED**: Full OTP patterns implementation with traits, examples, and documentation.
+- Evidence: `lunatic-otp-patterns` contains GenServer and GenStatem callback traits, serializable message envelopes, an in-memory GenEvent manager, and Supervisor strategy bookkeeping.
+- Evidence: unit/integration tests exercise callbacks, serialization, and mock process IDs.
+- Limitation: `GenServer::spawn`, `GenServerHandle::call`, and `GenServerHandle::cast` return explicit “not yet implemented” errors (`crates/lunatic-otp-patterns/src/gen_server.rs:115-126`, `:190-205`).
+- Limitation: Supervisor stop/restart paths clear or replace stored IDs but do not invoke Lunatic process termination (`crates/lunatic-otp-patterns/src/supervisor.rs:371-396`).
+- Limitation: the Rust example calls handlers directly and labels real process usage as pseudo-code (`examples/rust/src/gen_server_example.rs:68-113`).
+- Gap: connect these abstractions to Lunatic process creation, mailboxes, replies, timeouts, exit notifications, and termination before claiming an OTP runtime implementation.
 
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
-2. ✅ ~~Extend resource migration to cover TLS streams~~ **COMPLETED**: TLS listeners now fully migratable with certificate/key preservation (`src/state.rs:431-464`, `tests/tls_resource_migration.rs`). TLS streams correctly marked as non-migratable due to cryptographic session state.
+2. TLS listeners are migratable with certificate/key preservation; implement and integration-test TLS client reconnection before marking active stream recovery complete.
 3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
-5. ✅ ~~Implement OTP patterns (GenServer, Supervisor, GenStatem)~~ **COMPLETED**: Full OTP patterns library with traits, examples, and integration tests.
-6. Add structured audit logging for privileged host operations to close the remaining security gap.
+5. Connect OTP traits and Supervisor strategies to real Lunatic processes and add process-level integration tests.
+6. Carry registry coordination messages over the control/QUIC transport and test quorum behavior with real nodes.
+7. Add structured audit logging for privileged host operations to close the remaining security gap.
 
 ## Related Resources
 - `CORE_VALUES.md` – source principles and metrics.
-- `docs/CORE_VALUES_COMPLIANCE_REPORT.md` – archived scorecard (now points here).
-- `docs/BENCHMARK_RESULTS.md` – historical benchmark notes; not authoritative.
+- `docs/core_values/CORE_VALUES_COMPLIANCE_REPORT.md` – archived scorecard (now points here).
+- `docs/benchmarks/BENCHMARK_RESULTS.md` – historical benchmark notes; not authoritative.
 - `PRIORITY_IMPROVEMENTS.md` – roadmap items derived from prior compliance reviews.

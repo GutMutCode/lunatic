@@ -1,8 +1,8 @@
 # TLS Stream Migration Implementation Summary
 
 **Date**: 2025-10-07
-**Status**: ✅ Complete (Metadata Capture Phase)
-**Core Values Gap Closed**: Security Through Isolation + Fault Tolerance & High Availability
+**Status**: ⚠️ Metadata capture implemented; automatic reconnection not implemented
+**Core Values Status**: Partial evidence for resource recovery; the active-stream recovery gap remains open
 
 ---
 
@@ -87,7 +87,7 @@ ResourceSnapshot::TlsServerConnection {
   - Future enhancement roadmap
 
 **Updated:**
-- `docs/core_values/status.md`: Closed TLS migration gap
+- `docs/core_values/status.md`: Records the implemented snapshot boundary and remaining reconnect gap
 
 ---
 
@@ -161,15 +161,14 @@ test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 - **Custom certificates preserved** → mTLS and private CA support
 - **Audit logging** → `tls_stream_reconnect` events tracked
 
-### ✅ Fault Tolerance & High Availability
+### ⚠️ Fault Tolerance & High Availability
 - **TLS listeners survive hot reload** → Zero-downtime for new connections
 - **Client reconnection metadata** → Automatic recovery path (when implemented)
-- **Graceful server connection handling** → Predictable client behavior
+- **Server closure metadata** → Records why an inbound connection cannot be restored; no drain is implemented
 
-### ✅ Erlang-Inspired, WebAssembly-Native
+### ⚠️ Erlang-Inspired, WebAssembly-Native
 - **Matches BEAM philosophy**: Transient network state is rebuilt after upgrades
-- **Supervision tree compatible**: Application-level reconnection logic
-- **Proven at scale**: WhatsApp used same approach for 900M users
+- **Application responsibility**: Reconnection must currently be implemented and tested outside this runtime path
 
 ---
 
@@ -233,9 +232,9 @@ webpki-roots = "0.25"
 - ✅ No session keys serialized
 - ✅ No plaintext secrets in snapshots
 - ✅ Custom certificates preserved (required for mTLS)
-- ✅ Audit logging for reconnection events
-- ✅ Forward secrecy maintained (new handshake after reload)
-- ✅ Complies with PCI-DSS key rotation requirements
+- ❌ No `tls_stream_reconnect` audit event is emitted by the current restore path
+- ⚠️ A future fresh handshake can preserve forward secrecy; no handshake occurs during restore today
+- ⚠️ PCI-DSS compliance has not been assessed by these tests
 - ✅ No replay attack vectors introduced
 
 ---
@@ -292,9 +291,9 @@ loop {
 
 ## Conclusion
 
-**TLS stream migration is now production-ready** for workloads that can tolerate brief connection drops during hot reload (typical for microservices, APIs, background workers).
+TLS stream snapshot metadata is usable by workloads that already own and test their reconnect behavior. Lunatic itself does not yet turn that metadata into a new TCP connection, TLS handshake, or restored guest resource handle.
 
-**Key Achievement**: Closed the final gap in Lunatic's hot reload story without compromising security or introducing complex session resumption logic.
+**Key Achievement**: Captured the information needed for a future safe reconnect path without serializing cryptographic session state.
 
 **Philosophy Alignment**: Following Erlang's proven pattern of treating network connections as transient state that is rebuilt after code upgrades, not preserved at all costs.
 
@@ -306,6 +305,6 @@ loop {
 
 ---
 
-**Implementation Status**: ✅ Complete
-**Core Values Compliance**: ✅ Aligned
-**Production Ready**: ✅ Yes (with documented client reconnection requirement)
+**Implementation Status**: ⚠️ Partial (snapshot and metadata only)
+**Core Values Compliance**: ⚠️ Partial
+**Production Ready**: ❌ Not for transparent TLS stream recovery; applications must currently detect the dropped connection and reconnect themselves

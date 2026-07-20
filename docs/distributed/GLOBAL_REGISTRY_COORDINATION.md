@@ -1,8 +1,8 @@
 # Global Process Registry Cross-Node Coordination
 
-**Status**: ✅ Implemented
+**Status**: ⚠️ Protocol state machine implemented; network transport integration pending
 **Date**: 2025-10-07
-**Purpose**: Enable true cluster-wide global name registration with conflict resolution
+**Purpose**: Define the state and messages required for cluster-wide global name registration with conflict resolution
 
 ---
 
@@ -14,7 +14,7 @@ This document describes the **cross-node coordination protocol** for the global 
 > "Global registration: Functional (local coordination only)"
 > "Cross-node global coordination: Future enhancement"
 
-**Now Resolved**: Full cross-node coordination with majority-based consensus and conflict resolution.
+**Current Boundary**: The message types and handler-side state transitions exist. Multi-node `register_global_coordinated` only stores a pending request and returns; it does not send the request, wait for responses, or broadcast the resulting notification. The existing tests call handlers directly without a control-plane or QUIC connection.
 
 ---
 
@@ -22,12 +22,12 @@ This document describes the **cross-node coordination protocol** for the global 
 
 ### Coordination Protocol
 
-The `RegistryCoordinator` implements a **majority-based consensus protocol** for global name registration:
+The `RegistryCoordinator` contains the local state machine for an intended **majority-based coordination protocol**:
 
-1. **Request Phase**: Initiating node sends registration request to all other nodes
-2. **Vote Phase**: Each node checks for conflicts and responds (accept/reject)
-3. **Commit Phase**: If majority accepts, initiator broadcasts notification
-4. **Apply Phase**: All nodes apply the registration to their local registries
+1. **Request Phase**: The transport must send a registration request to all other nodes — not wired
+2. **Vote Phase**: Handler methods can check for conflicts and create accept/reject responses
+3. **Commit Phase**: Response aggregation can create a notification after enough successes, but no caller drives this over the network
+4. **Apply Phase**: Handler methods can apply a notification to a node-local registry
 
 ```
 Node 1 (initiator)    Node 2               Node 3
@@ -89,13 +89,14 @@ assert!(registry.lookup_global("service").is_some());
 
 ### Multi-Node Global Registration
 
-For multi-node clusters, coordination is required:
+The following is an API-level orchestration sketch, not a currently connected runtime flow:
 
 ```rust
 // Node 1: Initiate registration
 let gpid = GlobalProcessId::new(1, 1, 100);
 coordinator1.register_global_coordinated("database", gpid, 3).await?;
-// Internally creates pending request, waits for majority
+// Current behavior: creates pending state and returns immediately.
+// It does not return a request message or wait for a majority.
 
 // Node 2 & 3: Handle request
 let response = coordinator2.handle_register_request(
@@ -114,7 +115,8 @@ match response {
 }
 
 // Node 1: Collect responses
-// (implementation sends responses via control plane/QUIC)
+// A future transport integration must serialize, send, receive, and dispatch
+// RegistryCoordinationMessage values. The current implementation does not.
 
 // Node 1: Broadcast notification after majority
 coordinator1.handle_register_notify("database".to_string(), gpid, timestamp).await?;
@@ -128,7 +130,7 @@ coordinator3.handle_register_notify("database".to_string(), gpid, timestamp).awa
 
 ### Conflict Resolution
 
-When a conflict is detected, the newer registration wins (timestamp-based):
+The current request handler detects an existing-name conflict and reports it. It does not select a winner, compare timestamps, or converge conflicting registries:
 
 ```rust
 // Node 2 already has "cache_manager" registered
@@ -147,7 +149,8 @@ let response = coordinator2.handle_register_request(
 // Response indicates conflict
 match response {
     GlobalRegisterResponse { result: AlreadyRegistered { existing_gpid, registered_at }, .. } => {
-        // Node 1 can retry with different name or resolve conflict
+        // The caller can retry with a different name. Automatic resolution is
+        // not implemented.
         assert_eq!(existing_gpid, gpid2);
     }
     _ => {}
@@ -156,15 +159,14 @@ match response {
 
 ### New Node Joining Cluster
 
-When a new node joins, it synchronizes global registry state:
+Synchronization handlers can export and apply registry state when an external caller invokes them. Node-join detection and message delivery are not connected:
 
 ```rust
 // Node 4 (new) joins cluster
 let registry4 = Arc::new(DistributedRegistry::new(4));
 let coordinator4 = Arc::new(RegistryCoordinator::new(registry4.clone(), 4));
 
-// Request sync from existing node (e.g., Node 1)
-// (request sent via control plane)
+// A future transport layer must send a request to an existing node.
 
 // Node 1: Handle sync request
 let response = coordinator1.handle_sync_request(request_id, 4).await;
@@ -183,13 +185,11 @@ assert_eq!(registry4.global_count(), registry1.global_count());
 
 ### Node Failure Cleanup
 
-When a node fails, its global registrations are cleaned up:
+The cleanup helper removes entries for a supplied node ID. Failure detection and cluster-wide invocation are not implemented:
 
 ```rust
 // Node 2 fails
-// Detect failure via heartbeat timeout
-
-// All nodes clean up Node 2's registrations
+// An external failure detector would need to call this on each node.
 let cleaned_names = coordinator1.cleanup_node_registrations(2).await;
 
 println!("Cleaned up {} services from failed node 2", cleaned_names.len());
@@ -279,7 +279,7 @@ impl RegistryCoordinator {
 
 ## Integration with Distributed Client
 
-The coordinator is automatically integrated into the distributed client:
+The distributed client constructs and exposes a coordinator, but does not dispatch coordination messages or call it from the message transport:
 
 ```rust
 pub struct Client {
@@ -308,7 +308,8 @@ let client = Client::new(node_id, control_client, quic_client);
 // Access coordinator
 let coordinator = client.coordinator();
 
-// Register with coordination
+// Multi-node calls currently create pending state and return Ok immediately.
+// They neither register the name nor contact peers.
 let gpid = GlobalProcessId::new(node_id, env_id, pid);
 coordinator.register_global_coordinated("service", gpid, node_count).await?;
 ```
@@ -333,7 +334,7 @@ Tests:
 - ✅ `test_handle_sync_request`
 - ✅ `test_handle_sync_response`
 
-### Integration Tests (8 tests in `tests/registry_coordination.rs`)
+### Handler Integration Tests (8 tests in `tests/registry_coordination.rs`)
 
 ```bash
 cargo test --test registry_coordination --package lunatic-distributed
@@ -349,6 +350,8 @@ Tests:
 - ✅ `test_unregistration_workflow`
 - ✅ `test_three_node_cluster_simulation`
 
+These tests instantiate multiple registry/coordinator objects in one process and call handler methods directly. They do not open sockets, dispatch `RegistryCoordinationMessage`, wait for a real quorum, or run independent Lunatic nodes.
+
 **Results:**
 ```
 running 8 tests
@@ -361,6 +364,8 @@ test result: ok. 8 passed; 0 failed
 ## Performance Characteristics
 
 ### Registration Latency
+
+The following values are design estimates. No multi-node registry transport benchmark currently measures them.
 
 | Scenario | Latency | Notes |
 |----------|---------|-------|
@@ -398,7 +403,7 @@ For 5-node cluster: **12 messages** per registration
 
 **Problem**: Network partition creates two separate clusters
 
-**Solution**: Majority-based consensus prevents both sides from accepting registrations
+**Intended solution**: a connected majority protocol could prevent both sides from accepting registrations. The current runtime cannot provide this guarantee because coordination messages are not transported.
 
 Example (5-node cluster splits 2-3):
 ```
@@ -411,10 +416,10 @@ Partition A rejects all requests (not enough nodes)
 
 ### Conflict Resolution Strategy
 
-When conflicts occur (e.g., network partition heals):
-1. **Timestamp-based**: Newer registration wins
-2. **Node ID tiebreaker**: Lower node ID wins if timestamps equal
-3. **Broadcast resolution**: All nodes updated with winning entry
+Conflict convergence remains a design item:
+1. Existing-name requests can return `AlreadyRegistered`.
+2. `handle_register_notify` currently ignores the supplied timestamp and ignores duplicate-registration errors.
+3. No timestamp comparison, node-ID tiebreaker, or broadcast convergence path is implemented.
 
 ### Node Failure Detection
 
@@ -497,9 +502,9 @@ coordinator.handle_unregister_notify("database".to_string()).await?;
 
 | Feature | Erlang `global` | Lunatic `RegistryCoordinator` |
 |---------|----------------|-------------------------------|
-| Coordination | Built-in Erlang distribution | Explicit majority protocol |
-| Conflict resolution | Last writer wins | Timestamp + node ID |
-| Network protocol | Erlang term format | MessagePack serialization |
+| Coordination | Built-in Erlang distribution | Local coordination state machine; transport pending |
+| Conflict resolution | Last writer wins | Conflict response type only |
+| Network protocol | Erlang term format | Coordination messages are serializable but not dispatched |
 | Failure detection | `net_kernel` monitoring | Heartbeat (planned) |
 | Persistence | In-memory only | In-memory (disk planned) |
 
@@ -507,25 +512,13 @@ coordinator.handle_unregister_notify("database".to_string()).await?;
 
 ## Troubleshooting
 
-### Issue: Registration Hangs
+### Issue: Multi-Node Registration Returns Before Registration Exists
 
-**Symptom**: `register_global_coordinated` never completes
+**Symptom**: `register_global_coordinated(..., node_count > 1)` returns `Ok(())`, but `lookup_global` still returns `None`.
 
-**Possible Causes:**
-1. Not enough nodes online (can't achieve majority)
-2. Network partition
-3. Coordinator not receiving responses
+**Cause:** This is the current implementation boundary. The method stores private pending state but does not expose/send a request or wait for responses.
 
-**Debug:**
-```rust
-// Check how many nodes are online
-let node_count = control_client.node_count();
-println!("Nodes online: {}", node_count);
-
-// Ensure majority is possible
-let required = (node_count / 2) + 1;
-println!("Required responses: {}", required);
-```
+**Required fix:** Return or dispatch a request message, route responses back to `handle_register_response`, await a terminal result with timeout/cancellation, and broadcast/apply the commit notification.
 
 ### Issue: Conflicts Not Detected
 
@@ -577,25 +570,26 @@ if !node.is_alive() {
 
 ## Conclusion
 
-**Cross-node registry coordination is now fully implemented**, enabling true cluster-wide global name registration with:
+The repository contains the registry data model and coordination state-machine building blocks:
 
-1. ✅ **Majority-Based Consensus**: Prevents split-brain scenarios
-2. ✅ **Conflict Resolution**: Timestamp + node ID tiebreaking
-3. ✅ **Node Failure Handling**: Automatic cleanup of stale registrations
-4. ✅ **New Node Synchronization**: Full state transfer on join
-5. ✅ **Idempotent Operations**: Safe to replay notifications
-6. ✅ **Test Coverage**: 16 tests (8 unit + 8 integration)
+1. ✅ **Response aggregation logic**: counts successful handler responses
+2. ✅ **Conflict response types**: represents existing-name conflicts
+3. ✅ **Cleanup helper**: removes registrations when explicitly given a failed node ID
+4. ✅ **Synchronization handlers**: export and apply an in-memory snapshot
+5. ✅ **Idempotent notification handlers**: tolerate repeated local application
+6. ⚠️ **Test coverage**: unit and integration tests manually orchestrate these handlers; they do not run networked nodes
 
 ### Status Summary
 
 - ✅ Basic distributed registry (local coordination)
-- ✅ GlobalProcessId with location transparency
-- ✅ Cross-node coordination protocol
-- ✅ Conflict detection and resolution
-- ✅ Node failure cleanup
-- ✅ New node synchronization
+- ✅ `GlobalProcessId` address representation
+- ⚠️ Cross-node coordination state machine
+- ❌ Control/QUIC serialization and dispatch
+- ❌ Quorum wait in the public registration call
+- ❌ Live split-brain/conflict-resolution guarantee
+- ⚠️ Node failure cleanup and new-node synchronization helpers require an external caller
 - ⚠️  Persistent storage (future)
 - ⚠️  Raft integration (future)
 - ⚠️  Heartbeat monitoring (future)
 
-**Gap Status**: ✅ **FULLY RESOLVED** - Cross-node global coordination complete with majority consensus and comprehensive testing.
+**Gap Status**: ❌ **OPEN** — connect coordination messages to the distributed transport and validate concurrent registration, quorum, partition, recovery, and convergence with real nodes.

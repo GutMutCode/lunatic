@@ -1,7 +1,7 @@
 # Lunatic Benchmark Suite
 
-**Last Updated**: October 6, 2025  
-**Benchmark Count**: 4 suites, 20+ individual benchmarks
+**Last Updated**: July 20, 2026
+**Coverage**: Core runtime suites plus targeted instance-pool, messaging, distributed-serialization, QUIC-transport, and control-plane benches
 
 ---
 
@@ -13,6 +13,13 @@ Lunatic's benchmark suite provides comprehensive performance measurements across
 2. **Message Passing** (`mailbox.rs`) - Mailbox and selective receive
 3. **Hot Reload** (`hot_reload.rs`) - End-to-end hot code reloading
 4. **Memory Profile** (`memory_profile.rs`) - Memory overhead and scalability
+5. **Distributed Transport** (`distributed_messaging.rs`) - Request serialization plus a local mTLS QUIC echo
+
+### Distributed benchmark boundary
+
+`distributed_quic_round_trip` creates a real QUIC client and server on `127.0.0.1`, opens bidirectional streams, and echoes a 512-byte payload. It validates the QUIC/mTLS transport primitive and is suitable for a loopback latency ceiling.
+
+It does **not** exercise Lunatic's `distributed::Client`, message chunking, process delivery, registry lookup, control-plane node discovery, multiple machines, or partition behavior. It must not be described as an end-to-end distributed process messaging benchmark.
 
 ---
 
@@ -27,6 +34,7 @@ cargo bench --bench benchmark      # Process spawn
 cargo bench --bench mailbox        # Message passing
 cargo bench --bench hot_reload     # Hot reload
 cargo bench --bench memory_profile # Memory profiling
+cargo bench --bench distributed_messaging # Serialization + loopback QUIC
 
 # View HTML reports
 open target/criterion/report/index.html
@@ -158,6 +166,7 @@ spawn process           time:   [22.971 µs 23.055 µs 23.139 µs]
     cargo bench --bench mailbox --no-fail-fast  
     cargo bench --bench hot_reload --no-fail-fast
     cargo bench --bench memory_profile --no-fail-fast
+    cargo bench --bench distributed_messaging --no-fail-fast
 ```
 
 **Features**:
@@ -322,7 +331,7 @@ let runtime = rt.block_on(async {
 ## Future Benchmarks
 
 ### Planned
-1. ⏳ Distributed messaging latency
+1. ⏳ End-to-end distributed process messaging through real node routing
 2. ⏳ Supervisor overhead
 3. ⏳ Link/Monitor performance
 4. ⏳ Resource limit enforcement overhead
@@ -341,7 +350,7 @@ let runtime = rt.block_on(async {
 - [Criterion.rs Documentation](https://bheisler.github.io/criterion.rs/book/)
 - [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) - Analysis & predictions
 - [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Actual measurements
-- [CORE_VALUES.md](../CORE_VALUES.md) - Performance targets
+- [CORE_VALUES.md](../../CORE_VALUES.md) - Performance targets
 
 ---
 
