@@ -92,45 +92,52 @@ where
         .take()
         .ok_or_else(|| anyhow!("No instance available for hot reload"))?;
 
-    let mut resource_snapshot = None;
-    let memory_snapshot = old_instance.snapshot_memory()?;
-    if let Some(resources) = old_instance.state().capture_resource_snapshot()? {
-        resource_snapshot = Some(resources);
-    }
-    let mailbox_snapshot = old_instance.state().message_mailbox().snapshot();
+    let reload_result = async {
+        let memory_snapshot = old_instance.snapshot_memory()?;
+        let mailbox_snapshot = old_instance.state().message_mailbox().snapshot();
 
-    log::info!(
-        "Captured {} bytes of memory and {} messages",
-        memory_snapshot.memory.len(),
-        mailbox_snapshot.len()
-    );
+        log::info!(
+            "Captured {} bytes of memory and {} messages",
+            memory_snapshot.memory.len(),
+            mailbox_snapshot.len()
+        );
 
-    let runtime = old_instance.state().runtime().clone();
-    let config = old_instance.state().config().clone();
-    let new_state = old_instance.state().new_state(new_module.clone(), config)?;
+        let runtime = old_instance.state().runtime().clone();
+        let config = old_instance.state().config().clone();
+        let new_state = old_instance.state().new_state(new_module.clone(), config)?;
+        let mut new_instance = runtime.instantiate(&new_module, new_state).await?;
 
-    let mut new_instance = runtime.instantiate(&new_module, new_state).await?;
-
-    new_instance.restore_memory(&memory_snapshot)?;
-    new_instance
-        .state_mut()
-        .message_mailbox()
-        .restore(mailbox_snapshot);
-
-    if let Some(resources) = resource_snapshot {
-        if let Err(err) = new_instance
+        new_instance.restore_memory(&memory_snapshot)?;
+        new_instance
             .state_mut()
-            .restore_resource_snapshot(resources)
-        {
-            log::warn!("Failed to restore resources during hot reload: {}", err);
+            .message_mailbox()
+            .restore(mailbox_snapshot);
+
+        let transfer_report = old_instance
+            .state_mut()
+            .transfer_runtime_resources_to(new_instance.state_mut())?;
+
+        Ok::<_, anyhow::Error>((new_instance, transfer_report))
+    }
+    .await;
+
+    match reload_result {
+        Ok((new_instance, transfer_report)) => {
+            log::info!(
+                "Transferred {} live runtime resource(s), including {} TLS stream(s) and {} TLS listener(s)",
+                transfer_report.total(),
+                transfer_report.tls_streams,
+                transfer_report.tls_listeners
+            );
+            *instance_guard = Some(new_instance);
+            log::info!("Hot reload completed successfully");
+            Ok(())
+        }
+        Err(error) => {
+            *instance_guard = Some(old_instance);
+            Err(error)
         }
     }
-
-    log::info!("Hot reload completed successfully");
-
-    *instance_guard = Some(new_instance);
-
-    Ok(())
 }
 
 /// Context for managing process execution and hot reload state

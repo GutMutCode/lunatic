@@ -17,7 +17,9 @@ use lunatic_error_api::ErrorCtx;
 use webpki::TrustAnchor;
 
 use crate::dns::DnsIterator;
-use crate::{socket_address, NetworkingCtx, TlsConnection, TlsListener, TlsReconnectionInfo};
+use crate::{
+    socket_address, NetworkingCtx, TlsClientConnectionMetadata, TlsConnection, TlsListener,
+};
 use tokio_rustls::rustls::{self, OwnedTrustAnchor};
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
@@ -424,8 +426,10 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                         .await
                         .or_trap("lunatic::networking::tls_connect::connect failed")?;
 
-                    // Store reconnection info for hot reload support
-                    let reconnection_info = TlsReconnectionInfo {
+                    // Retain descriptive client metadata for diagnostics and
+                    // serialized snapshots. In-process hot reload moves the
+                    // live stream instead of reconnecting it.
+                    let client_metadata = TlsClientConnectionMetadata {
                         server_name: socket_addr.clone(),
                         port: port as u16,
                         peer_addr,
@@ -434,9 +438,9 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                     };
 
                     let id = caller.data_mut().tls_stream_resources_mut().add(Arc::new(
-                        TlsConnection::with_reconnection_info(
+                        TlsConnection::with_client_metadata(
                             TlsStream::Client(tls_stream),
-                            reconnection_info,
+                            client_metadata,
                         ),
                     ));
                     audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));

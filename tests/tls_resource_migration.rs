@@ -86,11 +86,13 @@ async fn test_tls_listener_snapshot_serialization() -> Result<()> {
 }
 
 #[test]
-fn test_tls_stream_non_migratable() {
-    // TLS streams should report as non-migratable
+fn serialized_tls_stream_state_can_be_marked_non_migratable() {
+    // Persisted snapshots cannot contain enough state to recreate a live TLS
+    // application byte stream. In-process hot reload uses live handle transfer.
     let snapshot = ResourceSnapshot::NonMigratable {
-        resource_type: "TlsConnection".to_string(),
-        reason: "Active TLS sessions cannot be migrated due to cryptographic state".to_string(),
+        resource_type: "serialized_tls_stream".to_string(),
+        reason: "An active TLS/application byte stream cannot be recreated from a snapshot"
+            .to_string(),
     };
 
     match snapshot {
@@ -98,9 +100,8 @@ fn test_tls_stream_non_migratable() {
             resource_type,
             reason,
         } => {
-            assert_eq!(resource_type, "TlsConnection");
-            assert!(reason.contains("cryptographic state"));
-            println!("✓ TLS streams correctly marked as non-migratable");
+            assert_eq!(resource_type, "serialized_tls_stream");
+            assert!(reason.contains("cannot be recreated"));
         }
         _ => panic!("Expected NonMigratable snapshot"),
     }

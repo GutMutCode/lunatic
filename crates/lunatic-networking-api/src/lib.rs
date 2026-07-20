@@ -46,13 +46,16 @@ pub struct TlsConnection {
     pub read_timeout: Mutex<Option<Duration>>,
     pub write_timeout: Mutex<Option<Duration>>,
     pub peek_timeout: Mutex<Option<Duration>>,
-    /// Reconnection metadata for client connections (None for server-accepted connections)
-    pub reconnection_info: Option<TlsReconnectionInfo>,
+    /// Descriptive client metadata (None for server-accepted connections).
+    ///
+    /// This is useful for diagnostics and serialized snapshots, but is not
+    /// sufficient to recreate the original TLS/application byte stream.
+    pub client_metadata: Option<TlsClientConnectionMetadata>,
 }
 
-/// Metadata needed to reconnect a TLS client stream after hot reload
+/// Descriptive metadata associated with a TLS client stream.
 #[derive(Debug, Clone)]
-pub struct TlsReconnectionInfo {
+pub struct TlsClientConnectionMetadata {
     pub server_name: String,
     pub port: u16,
     pub peer_addr: Option<SocketAddr>,
@@ -78,13 +81,13 @@ impl TlsConnection {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             peek_timeout: Mutex::new(None),
-            reconnection_info: None,
+            client_metadata: None,
         }
     }
 
-    pub fn with_reconnection_info(
+    pub fn with_client_metadata(
         sock: TlsStream<TcpStream>,
-        info: TlsReconnectionInfo,
+        metadata: TlsClientConnectionMetadata,
     ) -> TlsConnection {
         let (read_half, write_half) = split(sock);
         TlsConnection {
@@ -95,7 +98,7 @@ impl TlsConnection {
             read_timeout: Mutex::new(None),
             write_timeout: Mutex::new(None),
             peek_timeout: Mutex::new(None),
-            reconnection_info: Some(info),
+            client_metadata: Some(metadata),
         }
     }
 }

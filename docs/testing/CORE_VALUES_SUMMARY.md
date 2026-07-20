@@ -106,7 +106,7 @@ cargo test --test core_values_performance
 22. No blocking without yielding anti-pattern (✅ avoided)
 23. No global singletons anti-pattern (✅ avoided)
 24. TLS listeners fully migratable (cert/key preserved)
-25. TLS client streams reconnection metadata (captured)
+25. TLS client/server streams transferred live during in-process hot reload; serialized snapshots retain metadata only
 
 ### ⚠️ Partial Compliance (4 items)
 
@@ -129,7 +129,7 @@ Every test references evidence:
 println!("   Evidence: benches/mailbox.rs shows 353ns FIFO");
 println!("   Evidence: docs/benchmarks/PERFORMANCE_ANALYSIS.md");
 println!("   Evidence: lunatic-process/src/mailbox.rs");
-println!("   Evidence: tests/tls_stream_reconnection.rs validates snapshots");
+println!("   Evidence: live TLS transfer e2e plus serialized metadata contract tests");
 ```
 
 This ensures compliance is backed by:

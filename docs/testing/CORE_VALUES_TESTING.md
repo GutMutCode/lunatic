@@ -361,7 +361,8 @@ Track improvements/regressions in `docs/core_values/status.md`.
 ### Tests
 - `tests/core_values_performance.rs`: Performance metric validation
 - `tests/core_values_compliance.rs`: Compliance checklist
-- `tests/tls_stream_reconnection.rs`: TLS migration validation (security)
+- `src/state.rs::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`: live TLS hot-reload continuity
+- `tests/tls_stream_migration_contract.rs`: serialized TLS metadata boundary
 - `tests/resource_limits.rs`: Resource quota enforcement (security)
 - `tests/instance_pool_stats.rs`: Pooling efficiency (scalability)
 

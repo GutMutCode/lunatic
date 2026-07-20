@@ -12,8 +12,12 @@ pub enum ResourceSnapshot {
     },
     /// TCP listener: store bound address
     TcpListener { local_addr: String },
-    /// TLS client connection: store reconnection metadata
-    TlsClientConnection {
+    /// Metadata describing a TLS client connection.
+    ///
+    /// This does not contain cryptographic session state and cannot recreate the
+    /// original byte stream. In-process hot reload transfers the live host
+    /// resource instead.
+    TlsClientConnectionMetadata {
         server_name: String,
         port: u16,
         peer_addr: Option<String>,
@@ -22,9 +26,11 @@ pub enum ResourceSnapshot {
         read_timeout_ms: Option<u64>,
         write_timeout_ms: Option<u64>,
     },
-    /// TLS server connection: graceful shutdown (client must reconnect)
-    TlsServerConnection {
-        graceful_shutdown: bool,
+    /// Metadata describing a server-accepted TLS connection.
+    ///
+    /// A server cannot reconnect this stream from serialized metadata.
+    TlsServerConnectionMetadata {
+        requires_peer_reconnect: bool,
         reason: String,
     },
     /// TLS listener: store bound address and certificate info
@@ -40,6 +46,39 @@ pub enum ResourceSnapshot {
         resource_type: String,
         reason: String,
     },
+}
+
+/// Counts of live host resources transferred between Wasm instances.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResourceTransferReport {
+    pub tcp_listeners: usize,
+    pub tcp_streams: usize,
+    pub tls_listeners: usize,
+    pub tls_streams: usize,
+    pub udp_sockets: usize,
+    pub dns_iterators: usize,
+}
+
+impl ResourceTransferReport {
+    pub fn from_snapshot(snapshot: &ResourceMigrationSnapshot) -> Self {
+        Self {
+            tcp_listeners: snapshot.tcp_listeners.len(),
+            tcp_streams: snapshot.tcp_streams.len(),
+            tls_listeners: snapshot.tls_listeners.len(),
+            tls_streams: snapshot.tls_streams.len(),
+            udp_sockets: snapshot.udp_sockets.len(),
+            dns_iterators: 0,
+        }
+    }
+
+    pub fn total(&self) -> usize {
+        self.tcp_listeners
+            + self.tcp_streams
+            + self.tls_listeners
+            + self.tls_streams
+            + self.udp_sockets
+            + self.dns_iterators
+    }
 }
 
 /// Collection of resource snapshots by resource ID

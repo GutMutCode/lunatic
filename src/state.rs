@@ -15,7 +15,7 @@ use lunatic_process::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntim
 use lunatic_process::state::{ConfigResources, ProcessState};
 use lunatic_process::{
     config::ProcessConfig,
-    resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot},
+    resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot, ResourceTransferReport},
     state::{SignalReceiver, SignalSender},
 };
 use lunatic_process::{mailbox::MessageMailbox, message::Message};
@@ -261,6 +261,45 @@ impl ProcessState for DefaultProcessState {
         &self.registry
     }
 
+    fn transfer_runtime_resources_to(
+        &mut self,
+        target: &mut Self,
+    ) -> Result<ResourceTransferReport> {
+        anyhow::ensure!(
+            target.resources.tcp_listeners.is_empty()
+                && target.resources.tcp_streams.is_empty()
+                && target.resources.tls_listeners.is_empty()
+                && target.resources.tls_streams.is_empty()
+                && target.resources.udp_sockets.is_empty()
+                && target.resources.dns_iterators.is_empty()
+                && target.resource_stats.open_network_connections == 0,
+            "replacement process state already owns network resources"
+        );
+
+        let report = ResourceTransferReport {
+            tcp_listeners: self.resources.tcp_listeners.len(),
+            tcp_streams: self.resources.tcp_streams.len(),
+            tls_listeners: self.resources.tls_listeners.len(),
+            tls_streams: self.resources.tls_streams.len(),
+            udp_sockets: self.resources.udp_sockets.len(),
+            dns_iterators: self.resources.dns_iterators.len(),
+        };
+
+        // Move the maps themselves so their ID seeds and live host objects are
+        // preserved. In particular, this keeps the exact TCP/TLS sessions and
+        // does not serialize cryptographic state or substitute a fresh stream.
+        target.resources.tcp_listeners = std::mem::take(&mut self.resources.tcp_listeners);
+        target.resources.tcp_streams = std::mem::take(&mut self.resources.tcp_streams);
+        target.resources.tls_listeners = std::mem::take(&mut self.resources.tls_listeners);
+        target.resources.tls_streams = std::mem::take(&mut self.resources.tls_streams);
+        target.resources.udp_sockets = std::mem::take(&mut self.resources.udp_sockets);
+        target.resources.dns_iterators = std::mem::take(&mut self.resources.dns_iterators);
+        target.resource_stats.open_network_connections =
+            std::mem::take(&mut self.resource_stats.open_network_connections);
+
+        Ok(report)
+    }
+
     fn capture_resource_snapshot(&self) -> Result<Option<ResourceMigrationSnapshot>> {
         let mut snapshot = ResourceMigrationSnapshot::new();
 
@@ -317,30 +356,32 @@ impl ProcessState for DefaultProcessState {
         }
 
         for (id, stream) in self.resources.tls_streams.iter() {
-            if let Some(reconnection_info) = &stream.reconnection_info {
-                // Client connection: capture reconnection metadata
+            if let Some(client_metadata) = &stream.client_metadata {
+                // Serialized snapshots retain descriptive metadata only. The
+                // live stream is transferred directly for in-process reloads.
                 let read_timeout = stream.read_timeout.try_lock().ok().and_then(|t| *t);
                 let write_timeout = stream.write_timeout.try_lock().ok().and_then(|t| *t);
 
                 snapshot.add_tls_stream(
                     *id,
-                    ResourceSnapshot::TlsClientConnection {
-                        server_name: reconnection_info.server_name.clone(),
-                        port: reconnection_info.port,
-                        peer_addr: reconnection_info.peer_addr.map(|a| a.to_string()),
-                        local_addr: reconnection_info.local_addr.map(|a| a.to_string()),
-                        custom_root_certs: reconnection_info.custom_root_certs.clone(),
+                    ResourceSnapshot::TlsClientConnectionMetadata {
+                        server_name: client_metadata.server_name.clone(),
+                        port: client_metadata.port,
+                        peer_addr: client_metadata.peer_addr.map(|a| a.to_string()),
+                        local_addr: client_metadata.local_addr.map(|a| a.to_string()),
+                        custom_root_certs: client_metadata.custom_root_certs.clone(),
                         read_timeout_ms: read_timeout.map(|d| d.as_millis() as u64),
                         write_timeout_ms: write_timeout.map(|d| d.as_millis() as u64),
                     },
                 );
             } else {
-                // Server-accepted connection: graceful shutdown
+                // A server-accepted stream cannot be recreated from metadata.
                 snapshot.add_tls_stream(
                     *id,
-                    ResourceSnapshot::TlsServerConnection {
-                        graceful_shutdown: true,
-                        reason: "Server-accepted TLS connections require client reconnection after hot reload".into(),
+                    ResourceSnapshot::TlsServerConnectionMetadata {
+                        requires_peer_reconnect: true,
+                        reason: "Serialized snapshots cannot restore server-accepted TLS streams"
+                            .into(),
                     },
                 );
             }
@@ -371,13 +412,34 @@ impl ProcessState for DefaultProcessState {
         }
     }
 
-    /// Restore runtime resources captured during hot reload.
+    /// Restore runtime resources from a serialized snapshot.
     ///
-    /// TLS streams are intentionally skipped because the runtime cannot yet resurface the
-    /// negotiated session keys safely. This limitation is documented in `docs/core_values/status.md`.
+    /// Serialized TLS stream entries are metadata-only and return an explicit
+    /// error. In-process hot reload uses `transfer_runtime_resources_to`
+    /// instead, preserving the live TLS session and guest resource ID.
     fn restore_resource_snapshot(&mut self, snapshot: ResourceMigrationSnapshot) -> Result<()> {
         if snapshot.is_empty() {
             return Ok(());
+        }
+
+        if let Some((id, entry)) = snapshot.tls_streams.iter().next() {
+            match entry {
+                ResourceSnapshot::TlsClientConnectionMetadata {
+                    server_name, port, ..
+                } => anyhow::bail!(
+                    "serialized TLS client stream restoration is unsupported \
+                     (resource {id}, endpoint {server_name}:{port}); metadata \
+                     cannot recreate the original TLS/application byte stream"
+                ),
+                ResourceSnapshot::TlsServerConnectionMetadata { reason, .. } => anyhow::bail!(
+                    "serialized TLS server stream restoration is unsupported \
+                     (resource {id}): {reason}"
+                ),
+                other => anyhow::bail!(
+                    "serialized TLS stream restoration is unsupported \
+                     (resource {id}, snapshot {other:?})"
+                ),
+            }
         }
 
         let handle = match Handle::try_current() {
@@ -487,38 +549,7 @@ impl ProcessState for DefaultProcessState {
             }
         }
 
-        // Restore TLS client streams via reconnection
-        for (_id, entry) in tls_streams.into_iter() {
-            match entry {
-                ResourceSnapshot::TlsClientConnection {
-                    server_name,
-                    port,
-                    custom_root_certs: _,
-                    read_timeout_ms: _,
-                    write_timeout_ms: _,
-                    ..
-                } => {
-                    // TLS stream reconnection is logged but not yet implemented
-                    // This requires importing additional dependencies (webpki, rustls_pemfile, webpki_roots)
-                    // For now, log the reconnection attempt
-                    warn!(
-                        "TLS client stream to {}:{} cannot be automatically reconnected yet - implementation pending",
-                        server_name, port
-                    );
-                }
-                ResourceSnapshot::TlsServerConnection { reason, .. } => {
-                    // Server connections cannot be restored - client must reconnect
-                    warn!(
-                        "TLS server connection dropped during hot reload: {}",
-                        reason
-                    );
-                }
-                other => warn!(
-                    "Unexpected snapshot entry for TLS stream ignored: {:?}",
-                    other
-                ),
-            }
-        }
+        debug_assert!(tls_streams.is_empty());
 
         if !tcp_streams.is_empty() {
             warn!(
@@ -810,11 +841,12 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
     }
 }
 
+#[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Duration};
 
     #[tokio::test]
     async fn import_filter_signature_matches() {
-        use std::collections::HashMap;
         use tokio::sync::RwLock;
 
         use crate::state::DefaultProcessState;
@@ -822,7 +854,6 @@ mod tests {
         use lunatic_process::env::Environment;
         use lunatic_process::runtimes::wasmtime::WasmtimeRuntime;
         use lunatic_process::wasm::spawn_wasm;
-        use std::sync::Arc;
 
         // The default configuration includes both, the "lunatic::*" and "wasi_*" namespaces.
         let config = DefaultProcessConfig::default();
@@ -851,6 +882,192 @@ mod tests {
         spawn_wasm(env, runtime, &module, state, "hello", Vec::new(), None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hot_reload_transfers_live_tls_stream_with_id_and_timeouts() -> anyhow::Result<()> {
+        use lunatic_distributed::{control::cert, distributed::server::gen_node_cert};
+        use lunatic_networking_api::{TlsClientConnectionMetadata, TlsConnection};
+        use lunatic_process::{
+            env::LunaticEnvironment, runtimes::wasmtime::WasmtimeRuntime, state::ProcessState,
+        };
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+            sync::RwLock,
+        };
+        use tokio_rustls::{
+            rustls::{
+                Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName,
+            },
+            TlsAcceptor, TlsConnector, TlsStream,
+        };
+
+        let root = cert::test_root_cert()?;
+        let server_cert = gen_node_cert("localhost")?;
+        let server_cert_der = server_cert.serialize_der_with_signer(&root)?;
+        let server_key_der = server_cert.serialize_private_key_der();
+
+        let server_config = ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![Certificate(server_cert_der)],
+                PrivateKey(server_key_der),
+            )?;
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let server_addr = listener.local_addr()?;
+        let server_task = tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await?;
+            let mut tls_stream = acceptor.accept(tcp_stream).await?;
+            let mut request = [0_u8; 4];
+            tls_stream.read_exact(&mut request).await?;
+            anyhow::ensure!(&request == b"ping", "unexpected TLS test payload");
+            tls_stream.write_all(b"pong").await?;
+            tls_stream.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let mut root_store = RootCertStore::empty();
+        root_store.add(&Certificate(root.serialize_der()?))?;
+        let client_config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(client_config));
+        let tcp_stream = TcpStream::connect(server_addr).await?;
+        let peer_addr = tcp_stream.peer_addr().ok();
+        let local_addr = tcp_stream.local_addr().ok();
+        let domain = ServerName::try_from("localhost")?;
+        let tls_stream = connector.connect(domain, tcp_stream).await?;
+        let connection = Arc::new(TlsConnection::with_client_metadata(
+            TlsStream::Client(tls_stream),
+            TlsClientConnectionMetadata {
+                server_name: "localhost".into(),
+                port: server_addr.port(),
+                peer_addr,
+                local_addr,
+                custom_root_certs: Vec::new(),
+            },
+        ));
+        *connection.read_timeout.lock().await = Some(Duration::from_secs(5));
+        *connection.write_timeout.lock().await = Some(Duration::from_secs(3));
+
+        let mut wasmtime_config = wasmtime::Config::new();
+        wasmtime_config.async_support(true).consume_fuel(true);
+        let runtime = WasmtimeRuntime::new(&wasmtime_config)?;
+        let raw_module = wat::parse_str(r#"(module (memory (export "memory") 1))"#)?;
+        let module = Arc::new(runtime.compile_module(raw_module.into())?);
+        let environment = Arc::new(LunaticEnvironment::new(0));
+        let config = Arc::new(crate::DefaultProcessConfig::default());
+        let registry = Arc::new(RwLock::new(HashMap::new()));
+        let mut old_state = super::DefaultProcessState::new(
+            environment,
+            None,
+            runtime,
+            module.clone(),
+            config.clone(),
+            registry,
+        )?;
+        let stream_id = old_state.resources.tls_streams.add(connection.clone());
+        old_state.resource_stats.open_network_connections = 1;
+        let mut replacement_state = old_state.new_state(module, config)?;
+
+        let report = old_state.transfer_runtime_resources_to(&mut replacement_state)?;
+
+        assert_eq!(report.tls_streams, 1);
+        assert_eq!(report.total(), 1);
+        assert!(old_state.resources.tls_streams.is_empty());
+        assert_eq!(old_state.resource_stats.open_network_connections, 0);
+        assert_eq!(replacement_state.resource_stats.open_network_connections, 1);
+
+        let transferred = replacement_state
+            .resources
+            .tls_streams
+            .get(stream_id)
+            .expect("the guest TLS resource ID is preserved")
+            .clone();
+        assert!(Arc::ptr_eq(&connection, &transferred));
+        assert_eq!(
+            *transferred.read_timeout.lock().await,
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            *transferred.write_timeout.lock().await,
+            Some(Duration::from_secs(3))
+        );
+
+        transferred.writer.lock().await.write_all(b"ping").await?;
+        let mut response = [0_u8; 4];
+        transferred
+            .reader
+            .lock()
+            .await
+            .read_exact(&mut response)
+            .await?;
+        assert_eq!(&response, b"pong");
+        server_task.await??;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serialized_tls_stream_restore_fails_before_partial_restoration() -> anyhow::Result<()>
+    {
+        use lunatic_process::{
+            env::LunaticEnvironment,
+            resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot},
+            runtimes::wasmtime::WasmtimeRuntime,
+            state::ProcessState,
+        };
+        use tokio::sync::RwLock;
+
+        let mut wasmtime_config = wasmtime::Config::new();
+        wasmtime_config.async_support(true).consume_fuel(true);
+        let runtime = WasmtimeRuntime::new(&wasmtime_config)?;
+        let raw_module = wat::parse_str(r#"(module (memory (export "memory") 1))"#)?;
+        let module = Arc::new(runtime.compile_module(raw_module.into())?);
+        let mut state = super::DefaultProcessState::new(
+            Arc::new(LunaticEnvironment::new(0)),
+            None,
+            runtime,
+            module,
+            Arc::new(crate::DefaultProcessConfig::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        )?;
+
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        snapshot.add_tcp_listener(
+            11,
+            ResourceSnapshot::TcpListener {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+        snapshot.add_tls_stream(
+            12,
+            ResourceSnapshot::TlsClientConnectionMetadata {
+                server_name: "api.example.com".into(),
+                port: 443,
+                peer_addr: None,
+                local_addr: None,
+                custom_root_certs: Vec::new(),
+                read_timeout_ms: None,
+                write_timeout_ms: None,
+            },
+        );
+
+        let error = state
+            .restore_resource_snapshot(snapshot)
+            .expect_err("serialized TLS stream restoration must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("serialized TLS client stream restoration is unsupported"));
+        assert!(state.resources.tcp_listeners.is_empty());
+        assert!(state.resources.tls_streams.is_empty());
+
+        Ok(())
     }
 }
 

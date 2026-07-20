@@ -1,7 +1,7 @@
 # Core Values Compliance Status
 
-Reviewed: 2026-07-20
-Reviewed baseline: `bb6d9b51ef65780f2baf29fa508b5db0e12e5d68`
+Reviewed: 2026-07-21
+Reviewed baseline: `a643f211d03129394e59df7b79fc5838678c13f7`
 
 This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
 
@@ -15,7 +15,7 @@ An item is complete only when the production path is connected and an executable
 | Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
 | Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
 | Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
-| Security Through Isolation | Strong | Capability checks and listener restoration are implemented; TLS stream snapshots preserve reconnection metadata, but the runtime does not reconnect active TLS streams. |
+| Security Through Isolation | Strong | Capability checks are enforced; in-process hot reload transfers live TLS sessions without serializing keys, while serialized TLS restoration fails explicitly. |
 | Fault Tolerance & HA | Partial | Hot reload plus links/monitors work; OTP process supervision and cross-node registry coordination are not connected to live runtime paths. |
 | Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
 | Erlang-Inspired | Partial | Links, monitors, local registry structures, and OTP callback traits mirror Erlang concepts; live OTP process integration and coordinated global registration remain open. |
@@ -60,13 +60,14 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 - Evidence: networking host calls enforce per-process quotas before creating sockets (`crates/lunatic-networking-api/src/tcp.rs:192`).
 - Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
 - Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
-- Evidence: TLS listeners remain migratable with certificate/key preservation (`src/state.rs:455-488`).
-- Evidence: TLS client stream snapshots capture server name, port, custom certificates, and timeouts (`src/state.rs:319-347`, `crates/lunatic-networking-api/src/tls_tcp.rs:425-438`).
-- Evidence: TLS server stream snapshots record that the connection must close and be re-established by the client (`src/state.rs:338-346`, `crates/lunatic-process/src/resource_migration.rs:25-29`).
-- Evidence: Comprehensive TLS migration documentation covers security rationale and operational behavior (`docs/tls/TLS_STREAM_MIGRATION.md`).
+- Evidence: in-process hot reload moves the live network resource maps into the replacement state, preserving active client/server TLS sessions, guest resource IDs, ID seeds, timeouts, listeners, and resource accounting (`src/state.rs`, `crates/lunatic-process/src/lib.rs`).
+- Evidence: the live-path test completes a real TLS handshake, transfers the exact `TlsConnection`, and successfully exchanges data after state replacement (`src/state.rs::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`).
+- Evidence: serialized snapshots use the explicitly limited `TlsClientConnectionMetadata` and `TlsServerConnectionMetadata` variants and do not serialize TLS traffic keys (`crates/lunatic-process/src/resource_migration.rs`).
+- Evidence: serialized TLS stream restoration returns an error before any partial listener/socket restoration, rather than logging and reporting success (`src/state.rs::restore_resource_snapshot`).
+- Evidence: the support boundary and security rationale are documented in `docs/tls/TLS_STREAM_MIGRATION.md`.
 - Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:113`). Implementation documented in `docs/security/AUDIT_LOGGING.md`.
 - Evidence: **Comprehensive audit logging persistence guide** - Production-ready documentation covering OpenTelemetry, syslog, and container logging architectures with storage recommendations, compliance checklists, and alerting strategies (`docs/security/AUDIT_LOGGING_PERSISTENCE.md`).
-- Gap: `restore_resource_snapshot` only logs the saved client endpoint and explicitly reports that automatic reconnection is not implemented (`src/state.rs:490-510`). `tests/tls_stream_reconnection.rs` validates snapshot data and serialization, not a live TLS reconnect after hot reload.
+- Limitation: TLS stream preservation applies only to hot reload inside the same runtime process. Persisted snapshots, host restarts, and cross-process migration cannot restore an active TLS/application byte stream; this path returns an explicit unsupported error.
 
 ## 4. Fault Tolerance & High Availability
 - Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).
@@ -99,7 +100,7 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 | Area | Verified implementation | Not verified or not implemented | Executable evidence |
 | --- | --- | --- | --- |
 | OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process shutdown, OneForOne/OneForAll/RestForOne, restart policies, intensity limits and persistent restart counts | Supervisor automatic monitor-event intake; GenStatem/GenEvent remain in-memory; guest-WASM adapters not implemented | `cargo test -p lunatic-otp-patterns` (38 tests pass, including 9 real-process integration tests) |
-| TLS streams | Snapshot variants, metadata capture, serialization | Live TCP+TLS reconnect and restored guest resource handle | `cargo test --test tls_stream_reconnection` (6 snapshot/serialization tests pass) |
+| TLS streams | Live in-process transfer with preserved session, guest ID and timeouts; metadata serialization contract | Serialized/cross-process active-stream restoration | `cargo test --lib state::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`; `cargo test --test tls_stream_migration_contract` |
 | Global registry | In-memory registry operations and coordination handler transitions | Control/QUIC transport wiring, quorum wait, live concurrent registration, partition recovery | `cargo test -p lunatic-distributed --test registry_coordination` (8 manually orchestrated tests pass) |
 | QUIC benchmark | Real loopback mTLS QUIC connection and stream echo | Lunatic distributed client/server routing and multi-node behavior | `cargo bench --bench distributed_messaging --no-run` builds the executable benchmark |
 
@@ -120,7 +121,7 @@ These commands were executed on Windows against the reviewed baseline on 2026-07
 
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
-2. TLS listeners are migratable with certificate/key preservation; implement and integration-test TLS client reconnection before marking active stream recovery complete.
+2. If cross-process TLS recovery becomes a requirement, design an explicit application-level quiesce/replay protocol; do not substitute a fresh stream behind an existing guest handle.
 3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
 4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
 5. Connect Supervisor monitor-event intake, GenStatem, and GenEvent to real Lunatic processes; add guest-WASM adapters and GenServer named registration.

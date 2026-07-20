@@ -275,9 +275,10 @@ mod fault_tolerance {
     async fn state_recovery_mechanisms() {
         println!("📸 State recovery mechanisms test");
         println!("   Requirement: Preserve state across failures/upgrades");
-        println!("   Status: ✅ Snapshots + TLS reconnection metadata");
+        println!("   Status: ✅ Live TLS transfer; serialized metadata fails explicitly");
 
-        // Evidence: tests/tls_stream_reconnection.rs validates resource snapshots
+        // Evidence: src/state.rs exercises continued I/O after live TLS transfer.
+        // tests/tls_stream_migration_contract.rs validates the serialized boundary.
     }
 }
 

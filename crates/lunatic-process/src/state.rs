@@ -11,7 +11,7 @@ use wasmtime::Linker;
 use crate::{
     config::ProcessConfig,
     mailbox::MessageMailbox,
-    resource_migration::ResourceMigrationSnapshot,
+    resource_migration::{ResourceMigrationSnapshot, ResourceTransferReport},
     runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime},
     Signal,
 };
@@ -71,5 +71,24 @@ pub trait ProcessState: Sized + crate::reloadable_state::ReloadableState {
 
     fn restore_resource_snapshot(&mut self, _snapshot: ResourceMigrationSnapshot) -> Result<()> {
         Ok(())
+    }
+
+    /// Transfer runtime-owned resources into a replacement state during an
+    /// in-process hot reload.
+    ///
+    /// The default implementation uses the serialized snapshot contract.
+    /// States that own live network resources should override this method so
+    /// opaque handles and protocol sessions can be moved without serialization.
+    /// Implementations must leave `self` unchanged when returning an error.
+    fn transfer_runtime_resources_to(
+        &mut self,
+        target: &mut Self,
+    ) -> Result<ResourceTransferReport> {
+        let Some(snapshot) = self.capture_resource_snapshot()? else {
+            return Ok(ResourceTransferReport::default());
+        };
+        let report = ResourceTransferReport::from_snapshot(&snapshot);
+        target.restore_resource_snapshot(snapshot)?;
+        Ok(report)
     }
 }
