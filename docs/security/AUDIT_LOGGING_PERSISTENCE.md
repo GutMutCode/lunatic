@@ -1,21 +1,23 @@
 # Audit Logging Persistence and Aggregation Guide
 
-This guide provides comprehensive recommendations for persisting, aggregating, and analyzing Lunatic's audit logs in production environments.
+This guide provides deployment-oriented options for persisting, aggregating, and analyzing Lunatic's current audit log records.
+
+> **Current boundary (reviewed 2026-07-21):** The runtime emits formatted `target="audit"` text only on selected successful process-spawn and network bind/accept/connect paths. It does not yet provide complete privileged-operation coverage, denial/failure events, a typed schema, redaction tests, sink guarantees, or executable log assertions. The configurations below are advisory examples, not proof of runtime completeness, compliance, or production readiness. See [`docs/core_values/status.md`](../core_values/status.md).
 
 ## Overview
 
-Lunatic emits structured audit logs for all privileged operations using the `target="audit"` log target. These logs are currently emitted to stdout/stderr but should be persisted and aggregated for:
+Selected successful operations emit formatted records using the `target="audit"` log target. Depending on the application's logger, these may be routed to stdout/stderr and can support limited investigation and capacity analysis. Broader uses below require a future complete event contract:
 
-- **Security monitoring** - Detect unauthorized access attempts
-- **Compliance auditing** - Meet regulatory requirements (SOC 2, HIPAA, etc.)
-- **Incident investigation** - Root cause analysis for security incidents
-- **Capacity planning** - Track resource usage patterns
+- **Current limited use** - Correlate the selected successful spawn/network events that are emitted
+- **Future security monitoring** - Detect unauthorized attempts only after denial/failure coverage exists
+- **Future compliance support** - Supply evidence only after schema, completeness, retention, integrity, and control requirements are independently validated
+- **Future incident investigation and capacity planning** - Expand after event coverage and field semantics are defined
 
 ## Current Implementation
 
 ### Audit Events
 
-Lunatic logs the following privileged operations:
+Lunatic currently logs selected successful paths for the following operations:
 
 | Event | Location | Details Logged |
 |-------|----------|----------------|
@@ -270,8 +272,8 @@ fn init_syslog_audit() -> Result<()> {
 - ✅ Mature, battle-tested infrastructure
 - ✅ Built-in log rotation and retention
 - ✅ Native Unix integration
-- ✅ Easy compliance (tamper-proof logs)
-- ✅ Low latency, reliable delivery
+- ⚠️ Compliance and tamper evidence require separate access, immutability, forwarding, retention, and integrity controls; ordinary syslog files are not tamper-proof
+- ⚠️ Delivery guarantees depend on the selected syslog transport, buffering, storage, and failure configuration
 
 **Disadvantages**:
 - ⚠️ Limited structure (text-based)
@@ -960,4 +962,4 @@ audit_log_sampled("tcp_connect", format!("peer={}", addr), 10);
 
 **Last Updated**: 2025-10-06
 **Maintainer**: Lunatic Security Team
-**Status**: Production Ready
+**Status**: Advisory operational guide; runtime audit coverage remains incomplete

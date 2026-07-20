@@ -1,284 +1,73 @@
-# Preemptive Hot Reload Implementation
+# Preemptive Hot Reload — Archived 2025 Design Note
 
-**Date**: October 5, 2025  
-**Status**: ✅ **IMPLEMENTED**
+Original date: 2025-10-05
 
-## Overview
+Evidence review: 2026-07-21
 
-Lunatic now supports **true preemptive hot reload** for all processes, including those running infinite loops. This is achieved by leveraging Wasmtime's **epoch interruption mechanism** combined with periodic epoch ticking.
+Status: **design and component history; live production path unverified**
 
-## Problem Solved
+This document formerly claimed that preemptive hot reload was implemented for all processes and production-ready for local use. Those claims are withdrawn. The canonical current assessment is [`docs/core_values/status.md`](../core_values/status.md).
 
-### Previous Limitation
-```
-❌ Infinite loops in _start function → Hot reload signal queued but never processed
-✅ Message-based actors → Hot reload worked (natural yield points)
-```
+## Original Design Goal
 
-### New Capability
-```
-✅ ALL processes can now be hot reloaded, regardless of execution pattern
-✅ Infinite loops, long computations, blocking operations - all supported
-```
+The intended flow combined Wasmtime async execution, fuel/epoch yield points, a file watcher, process signals, memory snapshots, signature validation, and replacement-instance construction:
 
-## Architecture
-
-### 1. Wasmtime Configuration
-
-**File**: `crates/lunatic-process/src/runtimes/wasmtime.rs:258`
-
-```rust
-pub fn default_config() -> wasmtime::Config {
-    let mut config = wasmtime::Config::new();
-    config
-        .async_support(true)
-        .consume_fuel(true)
-        .epoch_interruption(true)  // ← NEW: Enable epoch interruption
-        // ...
-    config
-}
+```text
+file change
+  -> compile candidate module
+  -> send Signal::HotReload
+  -> interrupt/yield running guest
+  -> validate signatures
+  -> snapshot state/resources
+  -> instantiate replacement
+  -> restore state/resources
+  -> acknowledge success or failure
+  -> commit version or roll back
 ```
 
-### 2. Store Configuration
+This remains a useful target architecture, but the current code does not connect and verify the entire sequence.
 
-**File**: `crates/lunatic-process/src/runtimes/wasmtime.rs:47`
+## Components Present
 
-```rust
-pub async fn instantiate<T>(...) -> Result<WasmtimeInstance<T>> {
-    let mut store = wasmtime::Store::new(&self.engine, state);
-    
-    // Existing fuel configuration
-    store.out_of_fuel_async_yield(max_fuel, UNIT_OF_COMPUTE_IN_INSTRUCTIONS);
-    
-    // NEW: Epoch interruption configuration
-    store.set_epoch_deadline(1);
-    store.epoch_deadline_async_yield_and_update(1);
-    
-    // ...
-}
-```
+- Wasmtime stores configure asynchronous fuel yielding and epoch deadlines.
+- `Signal::HotReload` and pending-reload handling structures exist.
+- Module compilation, signature-validation, registry, snapshot/restore, and resource-transfer helpers exist.
+- Watch mode can detect a file change and enqueue a reload request.
+- Unit/integration tests exercise individual reload components and manually composed memory replacement.
 
-**What this does:**
-- Every epoch tick, the WASM execution yields
-- Yield allows the process loop to check for signals
-- Hot reload signal is processed at the yield point
+Component presence is not production-path completion.
 
-### 3. Global Epoch Ticker (OPTIMIZED)
+## Current Blocking Gaps
 
-**File**: `crates/lunatic-process/src/runtimes/wasmtime.rs:20-27`
+1. **Running-instance ownership:** the guest future takes the Wasmtime instance out of `ProcessContext`. The reload handler later attempts to take an instance from that now-empty option and can return `No instance available for hot reload` (`crates/lunatic-process/src/wasm.rs`, `crates/lunatic-process/src/lib.rs`).
+2. **Epoch coverage:** each `WasmtimeRuntime` constructs an engine, but the ticker-start guard is process-global. The single ticker advances only stores associated with the first-created engine; later independently constructed engines do not receive its epoch increments (`crates/lunatic-process/src/runtimes/wasmtime.rs`).
+3. **No acknowledgement protocol:** enqueueing a signal is treated as reload success. There is no process-result acknowledgement that drives atomic commit, version lifecycle, or rollback (`crates/lunatic-process/src/hot_reload.rs`).
+4. **Rollback is not production-verified:** rollback messages can fail and are logged without recovery. Existing tests do not prove a failed live reload restoring a running guest.
+5. **Benchmark boundary:** `benches/hot_reload.rs` manually compiles/instantiates v1 and v2 and copies linear-memory bytes. It does not call the live signal path, interrupt a running guest, receive acknowledgement, commit a version, or roll back.
+6. **Resource boundary:** a directly tested same-runtime helper can move supported live resource maps, including active TLS sessions, between replacement states. It is not proven reachable through live Wasm reload. Serialized snapshot, host-restart, and cross-node restoration of active TCP/TLS streams remain unsupported.
 
-```rust
-impl WasmtimeRuntime {
-    pub fn new(config: &wasmtime::Config) -> Result<Self> {
-        let engine = wasmtime::Engine::new(config)?;
-        
-        // Start global epoch ticker once
-        if !EPOCH_TICKER_STARTED.swap(true, Ordering::SeqCst) {
-            Self::start_global_epoch_ticker(engine.clone());
-        }
-        
-        Ok(Self { engine })
-    }
+## Claims Not Established
 
-    fn start_global_epoch_ticker(engine: wasmtime::Engine) {
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(10));
-            loop {
-                interval.tick().await;
-                // Increment epoch for ALL WASM instances
-                engine.increment_epoch();
-            }
-        });
-    }
-}
-```
+The current evidence does not establish:
 
-**Key Optimization (Phase 1 Complete):**
-- ✅ **Single global ticker** instead of per-process tickers
-- ✅ **10ms fixed interval** for all processes
-- ✅ **No per-process overhead** - scales to millions of processes
-- ✅ **Automatic initialization** on first runtime creation
+- hot reload for all process types or infinite loops;
+- zero-downtime replacement of a live running Wasm process;
+- a 50–200ms or `<100ms` production response time;
+- state preservation through the public/watch-mode path;
+- atomic multi-process reload and rollback;
+- negligible CPU/memory overhead or million-process scalability;
+- production readiness.
 
-**Performance Impact:**
-- Before: N processes = N ticker tasks (O(n) overhead)
-- After: N processes = 1 ticker task (O(1) overhead)
-- Memory saved: ~4KB × N processes
+## Completion Evidence Required
 
-## How It Works
+A future completion claim must include executable tests that:
 
-### Execution Flow
+1. Keep a guest process alive and verify it is interrupted through `Signal::HotReload`.
+2. Prove state before/after replacement through the live path.
+3. Return explicit success/failure acknowledgement from every targeted process.
+4. Commit a new version only after the configured atomic condition succeeds.
+5. Restore prior code/state after compilation, validation, migration, or process failure.
+6. Exercise multiple independently constructed runtime engines.
+7. Benchmark the same live path with the tested commit, hardware, toolchain, workload, and unsupported cases recorded.
 
-```
-1. WASM process starts executing (infinite loop)
-   ↓
-2. Epoch ticker increments epoch every 10ms
-   ↓
-3. Wasmtime detects epoch deadline reached
-   ↓
-4. WASM execution yields (async yield point)
-   ↓
-5. Process loop's tokio::select! polls signals
-   ↓
-6. HotReload signal detected and processed
-   ↓
-7. perform_pending_reload() executes:
-   - Snapshot memory
-   - Create new instance
-   - Restore memory
-   - Swap instance
-   ↓
-8. Execution resumes with NEW module version
-```
-
-### Timing Analysis
-
-| Event | Timing | Notes |
-|-------|--------|-------|
-| Epoch tick | 10ms | When reload pending |
-| Epoch tick (idle) | 100ms | When no reload |
-| Yield latency | < 1ms | Wasmtime async yield |
-| Signal processing | < 1ms | Process loop |
-| Hot reload | 40-180ms | From Phase 6 benchmarks |
-| **Total response** | **50-200ms** | File change → Running new code |
-
-## Code Changes Summary
-
-### Modified Files
-
-1. **`crates/lunatic-process/src/runtimes/wasmtime.rs`**
-   - Added `epoch_interruption(true)` to config
-   - Added `set_epoch_deadline(1)` to store
-   - Added `epoch_deadline_async_yield_and_update(1)`
-   - Added `engine_handle()` method
-
-2. **`crates/lunatic-process/src/wasm.rs`**
-   - Spawn epoch ticker task
-   - Pass engine handle to ticker
-   - Adaptive tick rate (10ms vs 100ms)
-
-3. **`crates/lunatic-process/src/lib.rs`**
-   - Hot reload signal handling (existing)
-   - ProcessContext with reload tracking (existing)
-
-## Testing
-
-### Manual Test
-
-```bash
-# Terminal 1: Run process with watch mode
-cargo build
-./target/debug/lunatic run --watch examples/simple_loop.wat
-
-# Terminal 2: Modify the file
-echo '(module ...)' > examples/simple_loop_v2.wat
-cp examples/simple_loop_v2.wat examples/simple_loop.wat
-```
-
-**Expected Result:**
-```
-Running v1...
-Running v1...
-[File changed]
-[INFO] Hot reload signal sent (version 1)
-[INFO] Hot reload completed successfully
-RELOADED v2!
-RELOADED v2!
-```
-
-### Test Modules
-
-**V1** (`examples/simple_loop.wat`):
-- Infinite loop printing "Running v1..."
-- Counter increments in memory
-
-**V2** (`examples/simple_loop_v2.wat`):
-- Same structure, prints "RELOADED v2!"
-- Counter state preserved from V1
-
-## Performance Considerations
-
-### Overhead
-
-**Epoch ticking overhead:**
-- Idle: ~0.01% CPU (100ms ticks, minimal work)
-- Active reload: ~0.1% CPU (10ms ticks during reload)
-
-**Memory overhead:**
-- Engine clone: shared Arc, no duplication
-- Ticker task: ~4KB stack
-
-### Optimization Strategies
-
-1. **Adaptive tick rate** (implemented):
-   ```rust
-   if pending.lock().unwrap().is_none() {
-       tokio::time::sleep(Duration::from_millis(90)).await;
-   }
-   ```
-
-2. **Future optimization** (not implemented):
-   - Stop ticker when no ModuleRegistry
-   - Pause ticker for processes with `can_hot_reload = false`
-   - Use fuel exhaustion instead of epochs (if possible)
-
-## Comparison with Erlang
-
-| Feature | Erlang/BEAM | Lunatic (Now) |
-|---------|-------------|---------------|
-| **Hot reload support** | All processes | All processes ✅ |
-| **Mechanism** | External calls | Epoch interruption |
-| **Response time** | Immediate | 10-200ms |
-| **State preservation** | code_change/3 | Memory snapshot |
-| **Signature validation** | Runtime check | Compile-time check |
-| **Resource migration** | Automatic | Manual (Phase 7) |
-
-## Known Limitations
-
-1. **Resource migration still not implemented** (Phase 7)
-   - TCP connections
-   - File handles
-   - Database connections
-
-2. **Distributed hot reload** (Phase 10)
-   - Currently local processes only
-
-3. **Stack frame preservation**
-   - Only memory/heap preserved
-   - Call stack is reset (WASM limitation)
-
-## Future Work
-
-### Phase 7: Resource Migration
-- Add resource snapshot/restore
-- Handle TCP connection migration
-- Database connection handling
-
-### Phase 8: Optimization
-- Conditional epoch ticker (only when needed)
-- Batch reloads for multiple processes
-- Metrics and observability
-
-### Phase 9: Distributed Support
-- Cross-node epoch coordination
-- Distributed module registry
-- Network-aware reload timing
-
-## Conclusion
-
-✅ **Lunatic now supports hot reload for ALL process types**
-
-This implementation:
-- Matches Erlang's capability to reload any process
-- Uses WebAssembly's epoch interruption mechanism
-- Maintains low overhead (~0.01% CPU)
-- Responds within 200ms to file changes
-- Preserves process state across reloads
-
-**Status: Production-ready for local processes**
-
----
-
-**Next Steps:**
-1. Integrate with watch mode (automatic trigger)
-2. Add resource migration (Phase 7)
-3. Add distributed support (Phase 10)
+See [`HOT_RELOAD_ARCHITECTURE.md`](HOT_RELOAD_ARCHITECTURE.md) for the broader target design and [`../core_values/status.md`](../core_values/status.md) for current status.

@@ -1,364 +1,97 @@
-# Lunatic Performance Analysis
+# Lunatic Performance Analysis — Historical and Scope-Limited
 
-**Date**: October 6, 2025  
-**Analyzed against**: CORE_VALUES.md Performance Metrics
+Original analysis: 2025-10-06
 
----
+Evidence review: 2026-07-21
 
-## Executive Summary
+Canonical current status: [`docs/core_values/status.md`](../core_values/status.md)
 
-This document analyzes Lunatic's performance against the targets specified in `CORE_VALUES.md`. It provides baseline measurements, identifies performance bottlenecks, and tracks improvements from Priority 1-3 optimizations.
+> **Evidence scope**
+>
+> The numeric results discussed here are an October 2025 snapshot with no recorded commit identifier or reproducible hardware profile. They are not current-HEAD performance evidence.
+>
+> `benches/mailbox.rs` measures local mailbox construction, N direct pushes, and one pop—not process-to-process delivery. `benches/hot_reload.rs` manually compiles and instantiates two modules and calls memory snapshot/restore—not the live `Signal::HotReload` path. Memory and million-process figures are estimates or arithmetic projections—not RSS/heap or scale/soak measurements.
+>
+> Consequently this document does not certify `CORE_VALUES.md` targets or production readiness.
 
----
+## Target Evidence Summary
 
-## CORE_VALUES.md Performance Targets
+| Target | Historical observation | Evidence boundary | Result |
+| --- | ---: | --- | --- |
+| Process spawn `<10µs` | 23.055µs | Minimal precompiled `hello.wat` spawn-and-join harness | Recorded run missed target; current HEAD not measured here |
+| End-to-end message `<1µs` | 353.23ns | Local mailbox creation, 10 pushes, and one FIFO pop | End-to-end path not measured |
+| Live reload `<100ms` | 758.94µs | Manual compile/instantiate/registry/snapshot/restore sequence | Live path not measured |
+| Memory/process `<1KiB` | ~66KiB | Lower-bound projection including a 64KiB example linear-memory page | RSS/reachable heap not measured; projected value misses target |
+| One million live processes | ~66GiB | Arithmetic extrapolation | No scale or soak run |
 
-| Metric | Target | Current Status | Notes |
-|--------|--------|----------------|-------|
-| **Process spawn** | < 10μs | ✅ **23.055μs** | 2.3x target, excellent for WASM |
-| **Hot reload** | < 100ms | ✅ 20-100ms | Epoch-based preemptive reload |
-| **Message passing** | < 1μs | ✅ **353ns** (FIFO) | **Target exceeded!** |
-| **Memory overhead** | < 1KB/process | ⚠️ ~10-50KB | WASM instance + runtime state |
+## Component Analysis
 
----
+### Process spawning
 
-## Performance Analysis by Component
-
-### 1. Process Spawning
+`benches/spawn.rs` compiles the small module before measurement, then constructs process state, calls `spawn_wasm`, and waits for the short-lived guest to finish. The historical Criterion interval was 22.971–23.139µs with a 23.055µs mean.
 
-**Implementation**: `crates/lunatic-process/src/wasm.rs:spawn_wasm()`
-
-**Breakdown** (from actual benchmark: 23.055μs total):
-```
-Total spawn time: 23.055μs ✅ (4-20x better than estimated!)
-├── WASM module compilation: ~0μs (cached via InstancePre)
-├── WASM instantiation: ~15μs (65%)
-├── Store creation + setup: ~5μs (22%)
-└── Task spawn overhead: ~3μs (13%)
-```
-
-**Actual Benchmark Result** (October 6, 2025):
-- Mean: 23.055μs
-- Range: [22.971μs - 23.139μs]
-- Outliers: 4/100 measurements
-- Stability: Excellent (±170ns std dev)
+Useful inference: precompilation and minimal guest work can make this narrow path inexpensive relative to earlier estimates. Unknowns include current dependency behavior, representative initialization, process lifetime, concurrent spawning, and hardware variation.
 
-**Bottlenecks**:
-1. **WASM Instantiation** (`wasmtime::InstancePre::instantiate_async`): 50-100μs
-   - Memory allocation for linear memory
-   - Table initialization
-   - Global variable setup
-
-2. **Wasmtime Store Overhead**: 10-20μs
-   - Resource limiter setup
-   - Fuel configuration
-   - Epoch deadline setup
-
-**Erlang Comparison**:
-- Erlang: 1-2μs (native process creation, no WASM overhead)
-- Lunatic: 100-500μs (WASM instantiation cost)
-- **Gap**: 50-500x slower
-
-**Mitigation Strategies**:
-- ✅ Use `InstancePre` for pre-compilation (already implemented)
-- ⚠️ Pool pre-instantiated instances (future optimization)
-- ⚠️ Lazy initialization of resources (future optimization)
-
----
-
-### 2. Message Passing
-
-**Implementation**: `crates/lunatic-process/src/mailbox.rs`
-
-**Actual Benchmark Results** (October 6, 2025):
-
-**FIFO Receive (No Tags)**:
-- 10 messages: **353.23ns** ✅ (Target exceeded!)
-- 100 messages: 1.85μs
-- 1000 messages: 24.1μs
-
-**Selective Receive (With Tags)**:
-- 10 msg, 1 tag: **390.08ns**
-- 100 msg, 5 tags: 1.97μs
-- 1000 msg, 10 tags: 25.41μs
+### Local mailbox operations
 
-**Breakdown** (validated):
-```
-Message push + pop (FIFO): 353ns
-├── Lock acquisition: ~50ns
-├── Message move: ~20ns
-├── VecDeque operations: ~30ns
-├── Waker notification: ~50ns
-└── Future poll overhead: ~200ns
-```
-
-**Selective Receive Performance**:
-- **Best case** (no tags, FIFO): ~500ns
-- **Average case** (100 messages, 5 tags): ~1-5μs
-- **Worst case** (1000 messages, tag at end): ~10-50μs
-
-**Key Findings from Phase 2 Investigation**:
-- ✅ O(n*m) linear scan is **optimal for typical workloads** (<100 messages, <5 tags)
-- ✅ HashSet optimization showed **0-12% regression** in real-world patterns
-- ✅ Current implementation matches **Erlang's O(n) scanning approach**
-
-**Erlang Comparison**:
-- Erlang: Sub-microsecond message passing (native mailbox)
-- Lunatic: **353ns-25μs** (measured)
-- **Gap**: ✅ **Comparable for small mailboxes**, linear scaling for large queues (expected)
-
----
-
-### 3. Hot Code Reloading
+`benches/mailbox.rs` creates and fills one mailbox inside every iteration and removes one item. The historical results ranged from 353.23ns for the ten-item FIFO fixture to about 25.4µs for a 1,000-item selective fixture.
 
-**Implementation**: `crates/lunatic-process/src/lib.rs:perform_pending_reload()`
-
-**Breakdown** (from integration test observations):
-```
-Total hot reload: ~20-100ms
-├── Module compilation: ~5-20ms (WAT parsing + WASM compilation)
-├── Signature validation: ~1-5ms
-├── Memory snapshot: ~1-10ms (depends on memory size)
-├── New instance creation: ~1-5ms (InstancePre)
-├── Memory restore: ~1-10ms
-├── Mailbox snapshot/restore: ~100μs-1ms
-└── Instance swap: ~10-100μs
-```
-
-**Performance Characteristics**:
-- ✅ **Sub-100ms target achieved** for typical modules
-- ✅ Epoch-based preemption ensures fairness
-- ✅ Memory snapshot is O(n) in linear memory size
-- ⚠️ Large modules (>10MB memory) may exceed 100ms
+The measurements characterize local queue construction/push/search/pop cost for those fixtures. They exclude guest host-call overhead, serialization, scheduling, sender/receiver handoff, contention, bounded-queue behavior, and transport. They therefore cannot establish end-to-end message latency or production workload optimality.
 
-**Erlang Comparison**:
-- Erlang: Milliseconds for code_change callback
-- Lunatic: 20-100ms (includes WASM compilation + memory copy)
-- **Gap**: Comparable, Lunatic slightly slower due to WASM overhead
+### Live hot reload
 
----
+Production live-reload latency was not measured by the October 2025 suite. The benchmark named `hot_reload_FULL_CYCLE` creates fresh v1/v2 instances itself and manually transfers linear-memory bytes. It does not interrupt a running guest, deliver `Signal::HotReload`, observe process success/failure acknowledgement, commit a coordinated version, or roll back.
 
-### 4. Memory Overhead
+The historical 758.94µs value remains useful as a regression point for that manual component composition only. It cannot be reported as live hot-reload latency or as proof that the `<100ms` target is met.
 
-**Per-Process Memory**:
-```
-Total: ~10-50KB per process
-├── Wasmtime Store: ~5-10KB
-├── WASM linear memory (min): 64KB (1 page, grows as needed)
-├── Message mailbox: ~1KB (empty) + message data
-├── Signal mailbox: ~500 bytes
-├── Process state: ~1-2KB
-├── Links/monitors HashMap: ~500 bytes
-└── Runtime metadata: ~1-2KB
-```
+### Memory
 
-**Key Factors**:
-1. **WASM Linear Memory**: 64KB minimum (1 page)
-   - Erlang processes: ~300 bytes initial heap
-   - **Gap**: 200x larger due to WASM page size
+`benches/memory_profile.rs` combines Rust `size_of` values, an exported one-page Wasm memory snapshot, and arithmetic estimates. `size_of` does not include reachable heap allocations, allocator overhead, Wasmtime engine/store allocations, thread stacks, shared pages, or operating-system RSS behavior.
 
-2. **Wasmtime Overhead**: 5-10KB per Store
-   - Includes fuel tracking, resource limits, epoch state
+The 64KiB observation is the example module's exported linear-memory size. The derived ~66KiB-per-process value is a rough lower-bound model, not an actual resident-memory measurement.
 
-3. **Mailbox Overhead**:
-   - Empty: ~1KB (Arc + Mutex + VecDeque)
-   - Per message: 24-48 bytes + data
+### Scalability
 
-**Comparison**:
-- Erlang: ~300 bytes per process
-- Lunatic: ~10-50KB per process
-- **Gap**: 30-160x larger
+Stores belonging to the first-created Wasmtime engine share one epoch ticker instead of one ticker per process. That removes a per-process ticker-task growth factor within that engine, but it does not demonstrate one million processes and does not advance later independently constructed engines.
 
-**Mitigation**:
-- WASM page size is a WebAssembly limitation (64KB minimum)
-- Potential: Memory pooling for dormant processes (future)
+The memory-profile concurrency fixture constructs at most 100 state values and multiplies a Rust type size by the count. Values shown for 1,000 through one million processes were arithmetic projections. A scalability claim still requires live processes, representative mailboxes/resources, measured RSS/CPU, useful work, and a sustained soak window.
 
----
+## Historical Architecture Changes
 
-### 5. Scalability
+### Global epoch ticker
 
-**Concurrent Process Performance**:
+The first-created Wasmtime engine's stores share one epoch ticker instead of a ticker per process (`crates/lunatic-process/src/runtimes/wasmtime.rs`). The start guard is process-global even though later runtimes construct new engines, so those later engines do not receive the ticker's epoch increments. Neither behavior has been measured at million-process scale.
 
-Based on Priority 1 improvements (Global Epoch Ticker):
+### Mailbox implementation investigation
 
-| Process Count | Epoch Ticker Tasks | Memory Overhead (Tickers) | Spawn Time Impact |
-|---------------|-------------------|---------------------------|-------------------|
-| 1,000 | 1 (global) | 4KB | ✅ No overhead |
-| 10,000 | 1 (global) | 4KB | ✅ No overhead |
-| 100,000 | 1 (global) | 4KB | ✅ No overhead |
-| 1,000,000 | 1 (global) | 4KB | ✅ No overhead |
+Earlier experiments compared selective-receive data structures. The current queue remains a simple implementation with linear search characteristics. The historical microbenchmarks do not justify a universal “optimal for real-world workloads” conclusion; future decisions should use representative queue depths, tag distributions, concurrency, and bounded backpressure.
 
-**Before Priority 1** (Per-process ticker):
-- 1M processes = 1M tokio tasks = 4GB overhead
-- O(n) lock contention on `engine.increment_epoch()`
+### Resource limits
 
-**After Priority 1** (Global ticker):
-- 1M processes = 1 tokio task = 4KB overhead
-- O(1) epoch increment, no contention
+Memory/table limiting and several networking quotas are implemented. Earlier documents quoted 10–50ns or `<1%` enforcement overhead without a corresponding result in this suite; those values are unverified and are withdrawn. Performance and completeness need dedicated production-path benchmarks, especially across process/message/signal limits and handle accounting.
 
-**Theoretical Limit**:
-- **Memory bound**: 10-50KB per process → 10-50GB for 1M processes
-- **CPU bound**: Work-stealing executor scales to # of cores
-- **I/O bound**: Async I/O via Tokio, limited by OS resources
+## Current Benchmark Gaps
 
----
+The following evidence is required before the corresponding core-value target can be marked complete:
 
-## Priority Improvements Impact
+1. Live Wasm `Signal::HotReload` success, guest interruption, state verification, failure acknowledgement, and rollback timings.
+2. Local sender-to-live-receiver guest process round trips, including bounded-mailbox pressure and selective receive.
+3. Remote guest process round trips through registry lookup, routing, QUIC transport, and destination mailbox.
+4. Actual per-process RSS/reachable-heap measurements across idle and loaded workloads.
+5. Sustained process-count scale and soak tests with CPU, memory, queue depth, tail latency, failures, and recovery recorded.
+6. Contended resource-limit and capability-check overhead measurements.
 
-### ✅ Priority 1: Global Epoch Ticker
+## Benchmark Commands
 
-**Status**: Completed (`crates/lunatic-process/src/runtimes/wasmtime.rs:28-51`)
-
-**Impact**:
-- ✅ **Eliminated O(n) overhead** → O(1) constant overhead
-- ✅ **99.9999% reduction in background tasks** (1M → 1)
-- ✅ **1000x memory reduction** for epoch management (4GB → 4KB at 1M processes)
-- ✅ **Enables million-process scalability**
-
-### ✅ Priority 2: Mailbox Optimization
-
-**Status**: Investigated & Rejected (`docs/PHASE2_DECISION.md`)
-
-**Findings**:
-- ✅ Current O(n*m) implementation is **optimal for real-world workloads**
-- ✅ HashSet optimization showed **0-12% performance regression**
-- ✅ Matches Erlang's proven O(n) scanning approach
-- ✅ No changes needed
-
-**Key Insight**: "Simplicity scales better than complexity" (CORE_VALUES.md principle)
-
-### ✅ Priority 3: Syscall Resource Limits
-
-**Status**: Core Complete + Network Integrated (`docs/PHASE3_SYSCALL_LIMITS_COMPLETE.md`)
-
-**Impact**:
-- ✅ **Per-process resource limits** (table, memory, network connections)
-- ✅ **DoS prevention** via connection flooding blocked
-- ✅ **Syscall-level enforcement** infrastructure in place
-- ⚠️ File descriptor tracking deferred (WASI internal limitation)
-
-**Security Performance**:
-- Limit checks: ~10-50ns overhead per syscall
-- Negligible performance impact (<1% in typical workloads)
-
----
-
-## Benchmark Suite
-
-**Location**: `benches/`
-
-1. **`spawn.rs`**: Process spawn baseline ✅
-2. **`mailbox.rs`**: Message passing & selective receive ✅
-
-**Current Status**:
-- ✅ **All benchmarks functional** (Tokio runtime issue fixed Oct 6, 2025)
-- ✅ **CI/CD integrated** (runs on every push to Linux)
-- ✅ **Results documented** in `docs/BENCHMARK_RESULTS.md`
-
-**Running Benchmarks**:
 ```bash
-# Process spawn performance
 cargo bench --bench spawn
-
-# Message passing performance
 cargo bench --bench mailbox
-
-# All benchmarks
-cargo bench
-
-# View HTML reports
-open target/criterion/report/index.html
+cargo bench --bench messaging
+cargo bench --bench hot_reload
+cargo bench --bench memory_profile
+cargo bench --bench distributed_messaging
+cargo bench --bench distributed_latency
+cargo bench --bench instance_pool
 ```
 
----
-
-## Performance Roadmap
-
-### ✅ Completed (October 6, 2025)
-1. ✅ **Fixed spawn.rs Tokio runtime issue** (rt.block_on for WasmtimeRuntime)
-2. ✅ **Measured actual process spawn times**: **23.055μs**
-3. ✅ **Measured message passing latency**: **353ns-25μs**
-4. ✅ **Documented Priority 1-3 improvements** (this document + BENCHMARK_RESULTS.md)
-
-### Short-term (1-3 months)
-5. **Optimize WASM instantiation**:
-   - Investigate Wasmtime `InstancePre` pooling
-   - Lazy resource initialization
-   - Target: 10-50μs spawn time
-
-6. **Memory optimization**:
-   - Compact process state representation
-   - Investigate memory pooling for dormant processes
-   - Target: <5KB overhead per process
-
-### Long-term (3-6 months)
-7. **Distribution performance**:
-   - Network message passing latency
-   - Remote process spawn overhead
-   - Cross-node hot reload timing
-
-8. **Production benchmarking**:
-   - WhatsApp-scale simulations (1B messages/sec)
-   - Long-running stability tests
-   - Memory leak detection
-
----
-
-## Comparison with CORE_VALUES Targets
-
-| Component | Target | Current | Status | Priority |
-|-----------|--------|---------|--------|----------|
-| Process spawn | < 10μs | **23.055μs** ✅ | 2.3x target, excellent for WASM | Low |
-| Hot reload | < 100ms | 20-100ms ✅ | **Achieved** | - |
-| Message passing | < 1μs | **353ns** ✅ | **Target exceeded!** | - |
-| Memory overhead | < 1KB | 10-50KB ⚠️ | 10-50x larger (WASM limitation) | Low |
-| Scalability | 1M processes | ✅ | **Achieved** (Priority 1) | - |
-
-**Overall Assessment**: **9/10 Performance Score** ⬆️ (Updated Oct 6, 2025)
-
-- ✅ **Strengths**: Hot reload, scalability, **sub-microsecond message passing**, async execution
-- ✅ **Achievements**: Process spawn 4-20x faster than estimated, **message passing exceeds target**
-- ✅ **Improvements**: Priority 1-3 delivered **90% CORE_VALUES alignment** (updated from 86%)
-
----
-
-## Recommendations
-
-### High Priority
-1. **Measure actual benchmarks** - Fix Tokio runtime initialization
-2. **Optimize WASM instantiation** - Investigate InstancePre pooling
-3. **Document performance baselines** - Establish regression tests
-
-### Medium Priority
-4. **Reduce memory footprint** - Compact state representation
-5. **Message passing optimization** - Consider lockless queues for high-throughput scenarios
-6. **Hot reload edge cases** - Test large modules (>10MB memory)
-
-### Low Priority
-7. **Distributed performance** - Network latency optimization
-8. **Long-term monitoring** - Production telemetry integration
-
----
-
-## Conclusion
-
-Lunatic has achieved **strong performance in hot reload and scalability** (CORE_VALUES primary goals), with Priority 1-3 improvements delivering critical infrastructure.
-
-**Key Achievements**:
-- ✅ Sub-100ms hot reload (target met)
-- ✅ Million-process scalability (target met)
-- ✅ Optimal message passing for real-world workloads
-- ✅ Syscall-level resource enforcement
-
-**Remaining Challenges**:
-- ⚠️ Process spawn speed limited by WASM overhead (10-50x Erlang)
-- ⚠️ Memory footprint constrained by WASM page size (10-50x Erlang)
-
-**Next Steps**: Fix benchmarking infrastructure and measure actual performance metrics to validate analysis and track future optimizations.
-
----
-
-**References**:
-- CORE_VALUES.md - Lines 320-330 (Success Metrics)
-- PRIORITY_IMPROVEMENTS.md - Priority 1-3 implementation details
-- docs/PHASE2_DECISION.md - Mailbox optimization investigation
+See [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for the preserved historical numbers and [`BENCHMARK_SUITE.md`](BENCHMARK_SUITE.md) for suite boundaries. There is deliberately no aggregate performance/compliance score: dissimilar microbenchmarks cannot establish production readiness.

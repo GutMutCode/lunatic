@@ -1,214 +1,110 @@
 # Lunatic Benchmark Suite
 
-**Last Updated**: July 20, 2026
-**Coverage**: Core runtime suites plus targeted instance-pool, messaging, distributed-serialization, QUIC-transport, and control-plane benches
+Evidence review: 2026-07-21
 
----
+Canonical implementation status: [`docs/core_values/status.md`](../core_values/status.md)
 
-## Overview
+## Purpose and Evidence Classes
 
-Lunatic's benchmark suite provides comprehensive performance measurements across all core components:
+The repository contains targeted micro-, component-, and transport-boundary benchmarks. A benchmark name such as “round trip” or “full cycle” is an internal Criterion label and must not be interpreted as production E2E evidence without inspecting the harness.
 
-1. **Process Spawn** (`spawn.rs`) - Process creation performance
-2. **Message Passing** (`mailbox.rs`) - Mailbox and selective receive
-3. **Hot Reload** (`hot_reload.rs`) - End-to-end hot code reloading
-4. **Memory Profile** (`memory_profile.rs`) - Memory overhead and scalability
-5. **Distributed Transport** (`distributed_messaging.rs`) - Request serialization plus production-framed local mTLS QUIC dispatch
+Use these evidence classes when reporting results:
 
-### Distributed benchmark boundary
+- **Microbenchmark** — an in-memory operation or narrow function path.
+- **Component harness** — multiple components composed directly by the benchmark.
+- **Probe/projection** — type-size, snapshot-size, or arithmetic evidence that is not a resident-memory or scale measurement.
+- **Transport-boundary benchmark** — real transport through decode/dispatch, stopping before a live destination process.
+- **Production E2E benchmark** — public/runtime entry point through a live outcome, including acknowledgement and failure behavior.
 
-`distributed_quic_message_dispatch_2kb` creates a real QUIC client and server on the OS-native loopback address and validates the generated server certificate against its `ctrl.lunatic.cloud` DNS identity. Each timed iteration serializes a 2 KiB `Request::Message`, writes it to a persistent unidirectional stream using production 1 KiB chunk framing, reassembles and decodes it with the production receive path, and waits for the decoded request to cross a dispatch callback.
+The current suite contains microbenchmark, component-harness, probe/projection, and transport-boundary evidence. It does not yet contain production E2E coverage for live hot reload or process messaging.
 
-The benchmark covers MessagePack, chunking/framing, loopback QUIC, reassembly, decoding, and the server dispatch boundary. It does **not** deliver into a live process mailbox or exercise registry lookup, control-plane node discovery, multiple machines, or partition behavior, so it must not be described as a full end-to-end distributed process benchmark.
+Historical numeric results in the companion documents are from 2025-10-06. They have no recorded commit or exact hardware/toolchain profile and therefore are not a reproducible current baseline.
 
----
+## Suite Inventory
+
+| Suite | Evidence class | What it exercises | Explicit boundary |
+| --- | --- | --- | --- |
+| `spawn.rs` | Component harness | Precompiled minimal Wasm process state, spawn, and join | One tiny short-lived guest; no concurrent/load scenario |
+| `mailbox.rs` | Microbenchmark | New local mailbox, N direct pushes, one FIFO/selective pop | No sender/receiver processes, host calls, or backpressure |
+| `messaging.rs` | Microbenchmark | Direct push/pop on one local mailbox | Its `round_trip` label is not a process round trip |
+| `hot_reload.rs` | Component harness | Direct compile, registry, instantiate, memory snapshot/restore | No running guest, `Signal::HotReload`, acknowledgement, commit, or rollback |
+| `memory_profile.rs` | Probe/projection | Rust type sizes, example memory snapshot, up to 100 state constructions | No RSS/reachable-heap measurement or large-scale live process run |
+| `instance_pool.rs` | Component harness | Pool acquire/release and hit/miss behavior | Does not establish whole-process spawn behavior under production load |
+| `distributed_messaging.rs` | Micro + transport boundary | Encode/decode and real loopback mTLS QUIC framing/reassembly/dispatch | Stops at decoded callback; no registry-to-live-mailbox delivery |
+| `distributed_latency.rs` | Component/transport boundary | Control-plane node lookup | No remote guest process lifecycle or data-plane message round trip |
 
 ## Quick Start
 
+Run all Criterion suites:
+
 ```bash
-# Run all benchmarks
 cargo bench
-
-# Run specific suite
-cargo bench --bench spawn          # Process spawn
-cargo bench --bench mailbox        # Message passing
-cargo bench --bench hot_reload     # Hot reload
-cargo bench --bench memory_profile # Memory profiling
-cargo bench --bench distributed_messaging # Serialization + production-framed loopback QUIC
-
-# View HTML reports
-open target/criterion/report/index.html
 ```
 
----
+Run one suite:
 
-## Benchmark Results Summary
-
-### 1. Process Spawn (`spawn.rs`)
-
-**Key Metric**: **23.055μs** per process
-
-```
-spawn process           time:   [22.971 µs 23.055 µs 23.139 µs]
-```
-
-- **vs CORE_VALUES target (10μs)**: 2.3x slower
-- **vs Erlang (1-2μs)**: 12-23x slower
-- **Status**: ✅ Excellent for WASM-based runtime
-
-**Breakdown**:
-- WASM instantiation: ~15μs (65%)
-- Store creation: ~5μs (22%)
-- Task spawn: ~3μs (13%)
-
----
-
-### 2. Message Passing (`mailbox.rs`)
-
-**Key Metrics**:
-- **FIFO (10 msg)**: **353ns** ✅ **Target exceeded!**
-- **Selective (100 msg, 5 tags)**: 1.97μs
-- **Selective (1000 msg, 10 tags)**: 25.41μs
-
-**FIFO Receive**:
-| Messages | Time | Status |
-|----------|------|--------|
-| 10 | 353ns | ✅ Sub-μs |
-| 100 | 1.85μs | ✅ Good |
-| 1000 | 24.1μs | ✅ Linear |
-
-**Selective Receive**:
-| Messages | Tags | Time |
-|----------|------|------|
-| 10 | 1 | 390ns |
-| 100 | 5 | 1.97μs |
-| 1000 | 10 | 25.4μs |
-
-**Key Findings**:
-- ✅ Tag overhead: <7%
-- ✅ O(n) scaling validated
-- ✅ Phase 2 decision confirmed (current impl is optimal)
-
----
-
-### 3. Hot Reload (`hot_reload.rs`)
-
-**Full Cycle Time**: **758.94μs** (v1 → v2 transition)
-
-**Component Breakdown**:
-
-| Operation | Time | % of Total |
-|-----------|------|------------|
-| Module compilation (v1) | 343.52μs | 45% |
-| Module compilation (v2) | ~340μs | 45% |
-| Registry add version | 325.58μs | (included above) |
-| Registry get latest | **68.29ns** | <0.01% |
-| Memory snapshot | 360.83μs | 48% |
-| Memory restore | 387.04μs | 51% |
-| **FULL CYCLE** | **758.94μs** | **100%** |
-
-**Analysis**:
-- ✅ Sub-millisecond hot reload achieved
-- ✅ CORE_VALUES target (<100ms) easily met
-- ⚠️ Most time in compilation (can be cached)
-- ✅ Registry operations are extremely fast (68ns)
-
----
-
-### 4. Memory Profile (`memory_profile.rs`)
-
-**Per-Process Overhead**:
-
-| Component | Size | Notes |
-|-----------|------|-------|
-| Empty Mailbox | ~8 bytes | Arc wrapper only |
-| ProcessState | ~400 bytes | Rust struct |
-| Message | ~40 bytes | Enum + data |
-| WASM Instance | **65,536 bytes** | Minimum 1 page |
-
-**Mailbox Growth**:
-| Messages | Time | Estimated Size |
-|----------|------|----------------|
-| 10 | 336ns | ~400 bytes |
-| 100 | 1.64μs | ~4KB |
-| 1000 | 21.26μs | ~40KB |
-| 10,000 | 147.21μs | ~400KB |
-
-**Process Creation Overhead**:
-- Process minimal overhead: **185.66μs**
-- WASM instance creation: **364.75μs**
-- Total estimated memory: **~66KB per process**
-
-**Scalability Test**:
-| Processes | Total Memory (estimated) |
-|-----------|--------------------------|
-| 10 | ~660KB |
-| 50 | ~3.3MB |
-| 100 | ~6.6MB |
-| 1,000 | ~66MB |
-| 10,000 | ~660MB |
-| 100,000 | ~6.6GB |
-| 1,000,000 | ~66GB |
-
-**Key Finding**: ⚠️ WASM 64KB page size is main memory bottleneck
-
----
-
-## CI/CD Integration
-
-**GitHub Actions Workflow** (`.github/workflows/ci.yml`):
-
-```yaml
-- name: "Run benchmarks (baseline check)"
-  if: runner.os == 'Linux'
-  run: |
-    cargo bench --bench spawn --no-fail-fast
-    cargo bench --bench mailbox --no-fail-fast  
-    cargo bench --bench hot_reload --no-fail-fast
-    cargo bench --bench memory_profile --no-fail-fast
-    cargo bench --bench distributed_messaging --no-fail-fast
-```
-
-**Features**:
-- ✅ Runs on every push/PR (Linux only)
-- ✅ Uploads results as artifacts
-- ✅ Shows summary in job output
-- ⏳ Performance regression detection (coming soon)
-
----
-
-## Performance Regression Detection
-
-**Current Status**: Manual comparison
-
-**Planned**:
-1. Store baseline results in repository
-2. Auto-compare against baseline on PR
-3. Fail CI if >10% regression detected
-4. Generate performance comparison report
-
-**Workaround**:
 ```bash
-# Download previous artifact
-# Compare benchmark_output.txt manually
-diff baseline.txt current.txt
+cargo bench --bench spawn
+cargo bench --bench mailbox
+cargo bench --bench messaging
+cargo bench --bench hot_reload
+cargo bench --bench memory_profile
+cargo bench --bench instance_pool
+cargo bench --bench distributed_messaging
+cargo bench --bench distributed_latency
 ```
 
----
+Criterion HTML reports are written below `target/criterion/`.
 
-## Adding New Benchmarks
+## Historical Observation Summary
 
-### 1. Create Benchmark File
+The following values are preserved only to explain the October 2025 reports. They are not current-HEAD evidence.
+
+| Area | Historical observation | Correct interpretation |
+| --- | ---: | --- |
+| Spawn | 23.055µs | Minimal precompiled `hello.wat` spawn-and-join harness; recorded run missed the `<10µs` goal |
+| Mailbox FIFO | 353.23ns | New mailbox + ten local pushes + one pop; not end-to-end message latency |
+| Selective mailbox | 390ns–25.4µs | Local fixture across 10–1,000 queued items |
+| Reload composition | 758.94µs | Manual v1/v2 compile/instantiate/snapshot/restore; not live reload |
+| Memory/process | ~66KiB | Lower-bound estimate, not RSS |
+| One million processes | ~66GiB | Arithmetic projection; never executed as a scale/soak test |
+
+See [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for the retained details.
+
+## CI Coverage
+
+On Linux, `.github/workflows/ci.yml` is configured to invoke all eight suites listed above and retain their combined textual output for 30 days.
+
+The workflow also runs `scripts/check_bench_thresholds.py`, which separately executes and enforces ceilings for these four suites only:
+
+- `spawn`;
+- `messaging`;
+- `distributed_messaging`;
+- `distributed_latency`.
+
+The script checks configured absolute upper bounds for specific Criterion labels. It does not compare a pull request against a stored historical baseline. The workflow explicitly reports that baseline regression comparison remains manual.
+
+Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete.
+
+## Adding or Changing a Benchmark
+
+1. State the public/runtime entry point and the end boundary.
+2. Classify the evidence as micro, component, transport-boundary, or production E2E.
+3. Name all excluded work, including setup performed outside measurement.
+4. Use a representative fixture and record queue sizes, payloads, concurrency, and failure mode.
+5. Record commit, dirty state, OS, CPU, memory, toolchain, and dependency lockfile.
+6. Use Criterion warmup/sample controls and retain raw artifacts.
+7. Add CI execution and, where appropriate, a justified threshold.
+8. Do not translate one fixture into a product-wide latency, scale, or readiness claim.
+
+Minimal Criterion example:
 
 ```rust
-// benches/my_bench.rs
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 fn my_benchmark(c: &mut Criterion) {
-    c.bench_function("my_test", |b| {
-        b.iter(|| {
-            // Your code here
-        });
+    c.bench_function("component_operation", |b| {
+        b.iter(|| black_box(component_operation()));
     });
 }
 
@@ -216,7 +112,7 @@ criterion_group!(benches, my_benchmark);
 criterion_main!(benches);
 ```
 
-### 2. Add to `Cargo.toml`
+Register a new file in `Cargo.toml`:
 
 ```toml
 [[bench]]
@@ -224,136 +120,33 @@ harness = false
 name = "my_bench"
 ```
 
-### 3. Add to CI Workflow
+## Interpreting Criterion Output
 
-```yaml
-- name: "Run benchmarks (baseline check)"
-  run: |
-    cargo bench --bench my_bench --no-fail-fast | tee -a benchmark_output.txt
-```
-
----
-
-## Benchmark Best Practices
-
-### DO:
-- ✅ Use `black_box()` to prevent compiler optimizations
-- ✅ Warm up for 3+ seconds
-- ✅ Collect 100+ samples for statistical significance
-- ✅ Use `to_async(&rt)` for async code
-- ✅ Fix Tokio runtime context (`rt.block_on(async { ... })`)
-
-### DON'T:
-- ❌ Benchmark I/O-heavy operations (use integration tests)
-- ❌ Assume cold cache (warm up first)
-- ❌ Ignore outliers (Criterion handles this)
-- ❌ Mix sync and async code without proper runtime
-
----
-
-## Interpreting Results
-
-### Criterion Output
-
-```
+```text
 spawn process           time:   [22.971 µs 23.055 µs 23.139 µs]
-                        ^^^^     ^^^^^^  ^^^^^^^  ^^^^^^
-                        metric   min     mean     max
 ```
 
-- **Mean**: Primary metric (23.055μs)
-- **[Min, Max]**: 95% confidence interval
-- **change**: vs previous run (if available)
-- **outliers**: Measurements outside normal distribution
+- The bracketed values are Criterion's estimated interval for that harness on that run.
+- Outliers and changes must be evaluated against the recorded environment and raw report.
+- Generic labels such as “excellent” or “slow” are not evidence; compare against a workload-specific service objective.
+- A historical result without commit and hardware metadata is a note, not a regression baseline.
 
-### Performance Markers
+## Required Production Evidence
 
-| Time | Classification |
-|------|----------------|
-| < 1μs | ✅ Excellent |
-| 1-10μs | ✅ Good |
-| 10-100μs | ⚠️ Acceptable |
-| 100μs-1ms | ⚠️ Slow |
-| > 1ms | ❌ Needs optimization |
+The suite still needs:
 
----
+1. A live running-Wasm `Signal::HotReload` benchmark that asserts interruption, state transition, acknowledgement, commit, failure, and rollback.
+2. A local guest sender-to-live-guest receiver benchmark with serialization, scheduling, bounded-mailbox pressure, and tail latency.
+3. A distributed guest round trip through registry lookup, routing, mTLS QUIC, destination mailbox, and reply.
+4. Actual process RSS/reachable-heap measurement under idle and loaded states.
+5. Increasing-count scale tests and sustained soak tests with resource usage, queue depth, latency percentiles, failures, and recovery.
+6. Supervisor/link failure and resource-limit overhead benchmarks on their production paths.
 
-## Troubleshooting
-
-### Tokio Runtime Panics
-
-**Error**: `there is no reactor running`
-
-**Fix**:
-```rust
-let runtime = rt.block_on(async {
-    WasmtimeRuntime::new(&config).unwrap()
-});
-```
-
-### Memory Export Not Found
-
-**Error**: `No memory export found`
-
-**Fix**: Use WAT files with memory exports
-```wat
-(module
-  (memory (export "memory") 1)
-  ...
-)
-```
-
-### Unstable Results
-
-**Symptoms**: Large variance, many outliers
-
-**Solutions**:
-1. Increase warmup time (5+ seconds)
-2. Increase sample size (200+)
-3. Close background applications
-4. Use `--sample-size` flag
-
----
-
-## Performance Goals (CORE_VALUES)
-
-| Metric | Target | Current | Status |
-|--------|--------|---------|--------|
-| Process spawn | <10μs | 23.055μs | ⚠️ 2.3x |
-| Message passing | <1μs | **353ns** | ✅ Exceeded |
-| Hot reload | <100ms | **<1ms** | ✅ Exceeded |
-| Memory/process | <1KB | ~66KB | ⚠️ 66x |
-
-**Overall Score**: **9/10** (updated Oct 6, 2025)
-
----
-
-## Future Benchmarks
-
-### Planned
-1. ⏳ End-to-end distributed process messaging through real node routing
-2. ⏳ Supervisor overhead
-3. ⏳ Link/Monitor performance
-4. ⏳ Resource limit enforcement overhead
-5. ⏳ Multi-core scaling
-
-### Ideas
-- Process pool reuse
-- Message batching
-- Zero-copy optimizations
-- Instance pooling
-
----
+Until those exist, the live reload, end-to-end messaging, one-million-process, and production-readiness targets remain unverified regardless of component benchmark speed.
 
 ## References
 
-- [Criterion.rs Documentation](https://bheisler.github.io/criterion.rs/book/)
-- [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md) - Analysis & predictions
-- [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Actual measurements
-- [CORE_VALUES.md](../../CORE_VALUES.md) - Performance targets
-
----
-
-**Maintained by**: Lunatic Core Team  
-**Last Benchmark Run**: October 6, 2025  
-**Next Review**: As needed for performance regressions
+- [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) — historical numbers with their boundaries.
+- [`PERFORMANCE_ANALYSIS.md`](PERFORMANCE_ANALYSIS.md) — scoped analysis and evidence gaps.
+- [`../../CORE_VALUES.md`](../../CORE_VALUES.md) — goals, not a completion report.
+- [`../core_values/status.md`](../core_values/status.md) — canonical current implementation status.

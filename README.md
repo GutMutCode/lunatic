@@ -8,11 +8,12 @@
     <p>&nbsp;</p>
 </div>
 
-Lunatic is a universal runtime for **fast**, **robust** and **scalable** server-side applications.
-It's inspired by Erlang and can be used from any language that compiles to [WebAssembly][1].
+Lunatic is a universal runtime designed for **fast**, **robust** and **scalable** server-side applications.
+It's inspired by Erlang. Languages can target it when their toolchains emit compatible [WebAssembly][1]
+and provide bindings for the Lunatic host APIs they need.
 You can read more about the motivation behind Lunatic [here][2].
 
-We currently provide libraries to take full advantage of Lunatic's features for:
+Language bindings and ecosystem libraries are available for:
 
 - [Rust][3]
 - [AssemblyScript][11]
@@ -23,25 +24,27 @@ If you would like to see other languages supported or just follow the discussion
 ## Supported features
 
 - [x] Creating, cancelling & waiting on processes
-- [x] Fine-grained process permissions
-- [x] Process supervision
+- [ ] Capability and resource isolation (core checks and quotas exist; least-privilege defaults and attenuation are still being completed)
+- [ ] Process supervision (host-side GenServer/Supervisor process paths exist; automatic monitor intake and guest-WASM adapters are pending)
 - [x] Channel based message passing
 - [x] TCP networking
 - [x] Filesystem access
-- [x] Distributed nodes
-- [x] Hot reloading (preemptive, all processes)
-- [x] OTP patterns (GenServer, Supervisor, GenStatem)
+- [ ] Distributed nodes (mTLS QUIC and registry coordination exist; live cross-node guest mailbox delivery is not yet proven end to end)
+- [ ] Hot reload (snapshot, validation, and resource-transfer components exist; the live running-Wasm reload path is not yet production-verified)
+- [ ] OTP patterns (host-side GenServer and Supervisor are integrated; GenStatem/GenEvent runtime adapters and guest bindings are pending)
+
+Unchecked entries are active implementation areas, not unavailable concepts. The canonical evidence and known gaps are maintained in [the core-values status](docs/core_values/status.md); historical phase and benchmark reports do not override it.
 
 ## Documentation
 
 - [**CORE_VALUES.md**](CORE_VALUES.md) - Design principles and Erlang inspiration
 - [**docs/core_values/status.md**](docs/core_values/status.md) - Up-to-date implementation compliance review
 - [**docs/security/AUDIT_LOGGING.md**](docs/security/AUDIT_LOGGING.md) - How to capture and route audit log events
-- [**HOT_RELOAD_ARCHITECTURE.md**](HOT_RELOAD_ARCHITECTURE.md) - Hot reload system design
-- [**docs/HOT_RELOAD_PREEMPTIVE.md**](docs/HOT_RELOAD_PREEMPTIVE.md) - Preemptive hot reload implementation
-- [**docs/PERFORMANCE_ANALYSIS.md**](docs/PERFORMANCE_ANALYSIS.md) - Performance metrics and analysis
-- [**docs/BENCHMARK_RESULTS.md**](docs/BENCHMARK_RESULTS.md) - Actual benchmark measurements
-- [**docs/BENCHMARK_SUITE.md**](docs/BENCHMARK_SUITE.md) - Complete benchmark suite guide
+- [**docs/hot_reload/HOT_RELOAD_ARCHITECTURE.md**](docs/hot_reload/HOT_RELOAD_ARCHITECTURE.md) - Hot reload system design
+- [**docs/hot_reload/HOT_RELOAD_PREEMPTIVE.md**](docs/hot_reload/HOT_RELOAD_PREEMPTIVE.md) - Historical preemptive hot reload design notes
+- [**docs/benchmarks/PERFORMANCE_ANALYSIS.md**](docs/benchmarks/PERFORMANCE_ANALYSIS.md) - Historical component metrics and analysis
+- [**docs/benchmarks/BENCHMARK_RESULTS.md**](docs/benchmarks/BENCHMARK_RESULTS.md) - Historical benchmark measurements and their scope
+- [**docs/benchmarks/BENCHMARK_SUITE.md**](docs/benchmarks/BENCHMARK_SUITE.md) - Benchmark suite guide and coverage boundaries
 
 ## Installation
 
@@ -90,10 +93,10 @@ To learn how to build modules, check out language-specific bindings:
 
 ## Architecture
 
-Lunatic's design is all about spawning _super lightweight_ processes, also known as green threads or
-[go-routines][8] in other runtimes. Lunatic's processes are fast to create, have a small memory footprint
-and a low scheduling overhead. They are designed for **massive** concurrency. It's not uncommon to have
-hundreds of thousands of such processes concurrently running in your app.
+Lunatic's design centers on lightweight isolated processes, comparable in role to green threads or
+[go-routines][8] in other runtimes. Low spawn cost, small memory overhead, and massive concurrency are
+design goals; current measured boundaries and missing scale/soak evidence are recorded in the
+[implementation status](docs/core_values/status.md).
 
 Some common use cases for processes are:
 
@@ -108,26 +111,25 @@ What makes the last use case possible are the sandboxing capabilities of [WebAss
 originally developed to run in the browser and provides extremely strong sandboxing on multiple levels.
 Lunatic's processes inherit these properties.
 
-Each process has its own stack, heap, and even syscalls. If one process fails, it will not affect the rest
-of the system. This allows you to create very powerful and fault-tolerant abstraction.
+Each process has its own stack, heap, and syscall capability context. A guest trap is contained to that
+process's Wasm instance; higher-level link and supervision behavior is tracked separately in the
+[implementation status](docs/core_values/status.md).
 
-This is also true for some other runtimes, but Lunatic goes one step further and makes it possible to use C
-bindings directly in your app without any fear. If the C code contains any security vulnerabilities or crashes,
-those issues will only affect the process currently executing the code. The only requirement is that the C
-code can be compiled to WebAssembly.
+Code such as C can participate when compiled to compatible WebAssembly. Wasm memory isolation contains many
+guest memory faults, while safety still depends on the runtime, configured capabilities, host imports, and
+resource limits; it is not a blanket guarantee for arbitrary native vulnerabilities.
 
-It's possible to give per process fine-grained access to resources (filesystem, memory, network connections, ...).
-This is enforced on the syscall level.
+Per-process configuration provides configured filesystem preopens, compile/create/spawn capability flags,
+memory/table/fuel limits, and network-connection quotas. Least-privilege defaults, attenuation, and coverage
+vary by resource type, as detailed in the [implementation status](docs/core_values/status.md).
 
 ### Scheduling
 
-All processes running on Lunatic are preemptively scheduled and executed by a [work stealing async executor][9]. This
-gives you the freedom to write simple _blocking_ code, but the runtime is going to make sure it actually never blocks
-a thread if waiting on I/O.
-
-Even if you have an infinite loop somewhere in your code, the scheduling will always be fair and not permanently block
-the execution thread. The best part is that you don't need to do anything special to achieve this, the runtime will take
-care of it no matter which programming language you use.
+Wasm execution uses Wasmtime's async support with fuel yielding and configured epoch deadlines on a
+[work stealing async executor][9]. The current process-global ticker advances only stores associated with the
+first-created engine; independently constructed later engines do not receive its epoch increments. Async host APIs avoid
+blocking an executor thread while they wait, but not every host operation is currently proven non-blocking and
+bounded; see the [implementation status](docs/core_values/status.md) for the current boundary.
 
 ### Compatibility
 

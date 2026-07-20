@@ -1,21 +1,23 @@
 # Multi-Language Examples for Lunatic
 
-Lunatic is a language-agnostic runtime powered by WebAssembly. Any language that compiles to WASM can run on Lunatic!
+Lunatic exposes language-neutral WebAssembly host imports. A language can target Lunatic when its toolchain emits a compatible Wasm/WASI module and it has the bindings required for the host APIs it uses.
 
 This guide helps you choose the right language for your use case and get started quickly.
+
+> **Evidence boundary:** Source examples and build recipes are present, but the repository does not yet validate them as a complete build-and-run matrix. They do not prove equivalent Lunatic API coverage across languages. Rust OTP examples use host-side native-process adapters; the Go and AssemblyScript OTP examples are manual pattern simulations. TinyGo and AssemblyScript guest E2E execution are not enforced in CI, and some example recipes still require repair. See [`docs/core_values/status.md`](../docs/core_values/status.md) for canonical status.
 
 ## Quick Start by Language
 
 | Language | Directory | Best For | Difficulty |
 |----------|-----------|----------|------------|
-| **Rust** | [`rust/`](rust/) | Production apps, OTP patterns, full features | ⭐⭐ |
+| **Rust** | [`rust/`](rust/) | Broadest available bindings and host-side OTP examples | ⭐⭐ |
 | **Go** | [`go/`](go/) | Go developers, simple services | ⭐⭐ |
 | **AssemblyScript** | [`assemblyscript/`](assemblyscript/) | TypeScript devs, quick prototypes | ⭐ |
 | **WAT** | [`*.wat`](./) | Learning, low-level control | ⭐⭐⭐ |
 
-## 🚀 OTP Patterns - Production Ready
+## OTP Pattern Examples — Experimental and Scope-Limited
 
-Lunatic implements Erlang/OTP-inspired patterns for building fault-tolerant, concurrent applications:
+The `lunatic-otp-patterns` crate contains host-side Erlang/OTP-inspired components. GenServer and Supervisor have native Lunatic-process integration tests, but guest-Wasm adapters, automatic Supervisor monitor intake, and process-runtime GenStatem/GenEvent adapters remain pending.
 
 ### GenServer - Generic Server Pattern
 
@@ -42,7 +44,7 @@ impl GenServer for Counter {
 
     fn init() -> Self::State { Counter { count: 0 } }
 
-    fn handle_call(&mut self, request: Self::Call) -> Result<Self::CallReply> {
+    fn handle_call(&mut self, request: Self::Call) -> anyhow::Result<Self::CallReply> {
         match request {
             Request::Increment => {
                 self.count += 1;
@@ -52,7 +54,7 @@ impl GenServer for Counter {
         }
     }
 
-    fn handle_cast(&mut self, request: Self::Cast) -> Result<()> {
+    fn handle_cast(&mut self, request: Self::Cast) -> anyhow::Result<()> {
         match request {
             Request::Increment => {
                 self.count += 1;
@@ -69,7 +71,9 @@ impl GenServer for Counter {
 **Supervisor** manages real child process handles and applies restart strategies when an exit reason is forwarded to `handle_child_exit`.
 
 ```rust
-use lunatic_otp_patterns::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec};
+use lunatic_otp_patterns::{
+    ChildSpec, RestartPolicy, RestartStrategy, ShutdownPolicy, Supervisor, SupervisorSpec,
+};
 use lunatic_process::{env::Environment, spawn_native, Process};
 use std::{future, sync::Arc};
 
@@ -105,18 +109,20 @@ supervisor.start_children()?;
 - ✅ **Concurrency**: Message-passing between processes
 - ✅ **State Management**: Safe mutable state handling
 - ✅ **Error Propagation**: Structured error handling with `OtpError`
-- ✅ **Multi-Language**: Available in Rust, Go, AssemblyScript
-- ✅ **Performance**: Low-latency message passing (~1-5ns for local calls)
+- ⚠️ **Language boundary**: Rust examples call host-side adapters; Go and AssemblyScript show manual designs rather than the same runtime API
+- ⚠️ **Performance boundary**: Historical mailbox microbenchmarks measure local queue operations, not OTP or end-to-end process latency
 
-### Production Deployment
+### Running a Wasm Example
 
 ```bash
-# Build OTP-enabled WASM
+# Build a compatible Wasm module
 cargo build --target wasm32-wasip1 --release
 
-# Run with Lunatic
-lunatic run --otp-enabled target/wasm32-wasip1/release/my_app.wasm
+# Run it with the current CLI
+lunatic run target/wasm32-wasip1/release/my_app.wasm
 ```
+
+This command demonstrates module execution only; it does not turn the host-side OTP crate into a guest-Wasm API or certify a production deployment.
 
 **→ [OTP Examples](rust/src/gen_server_example.rs)** | **→ [Supervisor Examples](go/supervisor_example.go)**
 
@@ -196,34 +202,24 @@ ChildSpec {
 
 ### Monitoring
 
-Enable logging to track OTP behavior:
-
-```rust
-// Supervisor automatically logs restart events
-println!("SUPERVISOR: Child restarted");  // Built-in logging
-```
-
-**→ [Full Troubleshooting Guide](../../docs/otp_patterns_troubleshooting.md)**
+The current Supervisor does not automatically emit restart telemetry. Applications must add their own logging around forwarded exit events and `handle_child_exit`; a structured OTP monitoring contract remains future work.
 
 ## Language Comparison
 
-### 🦀 Rust - **Recommended**
+### 🦀 Rust — Broadest Current Ecosystem
 
 **Pros:**
-- ✅ First-class Lunatic support
-- ✅ Access to all runtime APIs
-- ✅ Best performance
-- ✅ Smallest WASM binaries
+- ✅ Most mature available Lunatic binding ecosystem
 - ✅ Strong type safety and memory safety
+- ✅ Host-side OTP component examples in this repository
 
 **Cons:**
 - ⚠️ Steeper learning curve
 - ⚠️ Longer compile times than scripting languages
 
 **When to Use:**
-- Production applications
-- When you need full Lunatic API access
-- Performance-critical code
+- When the required host imports are available in the selected Rust binding
+- When you can validate the complete workload against the runtime
 - Complex state management
 
 **Example:**
@@ -309,7 +305,7 @@ export function increment(): i32 {
 - ✅ Full control over WASM
 - ✅ No compilation step
 - ✅ Educational value
-- ✅ Smallest possible binaries
+- ✅ Direct control over emitted Wasm instructions
 
 **Cons:**
 - ⚠️ Very verbose
@@ -344,10 +340,10 @@ export function increment(): i32 {
 | **Strings** | ✅ | ✅ | ✅ | ⚠️ Manual |
 | **Collections** | ✅ HashMap, Vec | ✅ map, slice | ✅ Array, Map | ❌ |
 | **Error Handling** | ✅ Result, Option | ✅ error | ⚠️ Limited | ❌ |
-| **OTP Patterns** | ✅ GenServer, Supervisor | ⚠️ Manual implementation | ⚠️ Manual implementation | ❌ |
-| **Hot Reload Compatible** | ✅ | ✅ | ✅ | ✅ |
-| **Process Spawning** | ✅ Full API | ⚠️ Manual bindings | ⚠️ Manual bindings | ⚠️ Manual bindings |
-| **Networking** | ✅ Full API | ⚠️ Manual bindings | ❌ | ❌ |
+| **OTP Patterns** | ⚠️ Host-side GenServer/Supervisor examples | ⚠️ Manual simulation | ⚠️ Manual simulation | ❌ |
+| **Live Hot Reload** | ⚠️ Production path unverified | ⚠️ Production path unverified | ⚠️ Production path unverified | ⚠️ Production path unverified |
+| **Process Spawning** | ⚠️ Binding-dependent | ⚠️ Manual bindings | ⚠️ Manual bindings | ⚠️ Manual bindings |
+| **Networking** | ⚠️ Binding-dependent | ⚠️ Manual bindings | ❌ | ❌ |
 | **Binary Size** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
 | **Compile Speed** | ⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ |
 | **Developer Experience** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐⭐⭐ | ⭐⭐ |
@@ -360,9 +356,9 @@ export function increment(): i32 {
 
 Pick based on:
 - **Your experience**: Use what you know
-- **Project requirements**: Production → Rust, Prototype → AssemblyScript
+- **Project requirements**: Choose only after validating the exact host imports and failure behavior your workload needs
 - **Team skills**: Match team expertise
-- **Feature needs**: Full API → Rust, Basic → any language
+- **Feature needs**: Rust currently has the broadest ecosystem; verify every required API against its binding and an executable test
 
 ### 2. Install Prerequisites
 
@@ -371,13 +367,14 @@ Pick based on:
 # Build Lunatic runtime
 cargo build
 
-# Optional: WASM validation tool
-cargo install wabt
+# Optional: after installing WABT with your platform's supported package,
+# confirm that `wasm-validate` is available on PATH.
+wasm-validate --version
 ```
 
 **Rust:**
 ```bash
-rustup target add wasm32-wasi
+rustup target add wasm32-wasip1
 ```
 
 **Go:**
@@ -392,41 +389,13 @@ brew install tinygo  # macOS
 npm install --save-dev assemblyscript
 ```
 
-### 3. Build Your First Example
+### 3. Inspect and Validate an Example
 
-Choose your language and follow its README:
+Choose a language directory and inspect its README and build files before running it. The current recipes are not a CI-verified cross-language matrix: the Rust package mixes host-only OTP dependencies with guest targets, TinyGo is not built in CI, and the AssemblyScript test script references missing test material. Treat successful compilation, Wasm validation, and execution through the current `lunatic run` CLI as separate required checks.
 
-```bash
-# Rust
-cd examples/rust
-make
-./target/debug/lunatic run build/counter.wasm
+### 4. Experiment with Watch Mode
 
-# Go
-cd examples/go
-make
-./target/debug/lunatic run build/counter.wasm
-
-# AssemblyScript
-cd examples/assemblyscript
-npm install
-npm run build
-./target/debug/lunatic run build/counter.wasm
-```
-
-### 4. Try Hot Reload
-
-```bash
-# Terminal 1: Run with watch mode
-./target/debug/lunatic run --watch examples/rust/build/counter.wasm
-
-# Terminal 2: Make changes and rebuild
-cd examples/rust
-# Edit src/counter.rs
-make
-
-# Terminal 1 automatically reloads!
-```
+Watch mode can detect a rebuilt file and request a reload, but the provided counter exits instead of remaining alive and the running-Wasm replacement path is not connected end to end. There is no verified runnable live-reload example yet; do not use this guide as a zero-downtime deployment procedure.
 
 ---
 
@@ -506,7 +475,7 @@ let counter: i32 = 0;
 
 ## OTP Patterns in Lunatic
 
-Lunatic implements Erlang/OTP-inspired patterns for building fault-tolerant, concurrent applications. While Rust has first-class support through the `lunatic-otp-patterns` crate, other languages can implement these patterns manually.
+The repository provides host-side Rust adapters for selected Erlang/OTP-inspired patterns and manual Go/AssemblyScript sketches. These examples are learning material, not equivalent guest-Wasm runtime integrations or a general fault-tolerance guarantee.
 
 ### GenServer Pattern
 
@@ -531,15 +500,15 @@ impl GenServer for Counter {
         Counter { count: 0 }
     }
 
-    fn handle_call(&mut self, request: Self::Call) -> Self::CallReply {
-        match request {
+    fn handle_call(&mut self, request: Self::Call) -> anyhow::Result<Self::CallReply> {
+        Ok(match request {
             CounterRequest::Increment => {
                 self.count += 1;
                 CounterResponse::Ok
             }
             CounterRequest::Get => CounterResponse::Value(self.count),
             // ... other handlers
-        }
+        })
     }
 }
 ```
@@ -649,11 +618,11 @@ export class Supervisor {
 - **Use both together** for building fault-tolerant application architectures
 
 **Examples:**
-- [`rust/gen_server_example.rs`](../rust/src/gen_server_example.rs) - Rust GenServer
-- [`go/gen_server_example.go`](../go/gen_server_example.go) - Go GenServer
-- [`assemblyscript/gen_server_example.ts`](../assemblyscript/assembly/gen_server_example.ts) - AssemblyScript GenServer
-- [`go/supervisor_example.go`](../go/supervisor_example.go) - Go Supervisor
-- [`assemblyscript/supervisor_example.ts`](../assemblyscript/assembly/supervisor_example.ts) - AssemblyScript Supervisor
+- [`rust/gen_server_example.rs`](rust/src/gen_server_example.rs) - Rust host-side GenServer
+- [`go/gen_server_example.go`](go/gen_server_example.go) - Go manual pattern sketch
+- [`assemblyscript/gen_server_example.ts`](assemblyscript/assembly/gen_server_example.ts) - AssemblyScript manual pattern sketch
+- [`go/supervisor_example.go`](go/supervisor_example.go) - Go manual Supervisor sketch
+- [`assemblyscript/supervisor_example.ts`](assemblyscript/assembly/supervisor_example.ts) - AssemblyScript manual Supervisor sketch
 
 ---
 
@@ -670,7 +639,7 @@ export class Supervisor {
 
 1. Check [TinyGo supported packages](https://tinygo.org/docs/reference/lang-support/)
 2. Start with `go/` examples
-3. Test compilation: `tinygo build -target=wasi`
+3. Test compilation with the repository's documented TinyGo WASI target and validate the emitted imports
 4. Replace unsupported packages
 
 ### From Any Language → Rust
@@ -692,7 +661,7 @@ export class Supervisor {
 1. Verify WASM validity: `wasm-validate module.wasm`
 2. Check exports: `wasm-objdump -x module.wasm | grep export`
 3. Ensure `_start` function exists
-4. Check target: must be `wasm32-wasi` not `wasm32-unknown-unknown`
+4. For current Rust toolchains, check that the target is `wasm32-wasip1`, not `wasm32-unknown-unknown`
 
 ### Issue: Function Not Found
 
@@ -759,7 +728,7 @@ wasm-validate build/module.wasm
 ./target/debug/lunatic run build/module.wasm
 ```
 
-### 4. Optimize for Production
+### 4. Prepare a Release Build
 
 - Enable all optimizations
 - Run `wasm-opt`
@@ -820,11 +789,11 @@ Want to add examples in other languages (Zig, C, C++, etc.)?
 
 | If you want... | Use... | Because... |
 |----------------|--------|------------|
-| Full Lunatic features | **Rust** | First-class API support |
+| Broadest current Lunatic bindings | **Rust** | Most mature available ecosystem; verify required APIs individually |
 | Familiar Go syntax | **Go/TinyGo** | Easy for Go developers |
 | Quick TypeScript prototypes | **AssemblyScript** | Familiar syntax, fast iteration |
 | Learn WASM internals | **WAT** | Direct WASM control |
-| Production deployment | **Rust** | Best performance & tooling |
+| Production evaluation | **Rust** | Broadest tooling, while production-path gaps still require workload-specific validation |
 
 **Still unsure?** Start with the language you know best, then migrate to Rust when you need advanced features.
 

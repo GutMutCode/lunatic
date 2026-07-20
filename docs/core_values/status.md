@@ -1,139 +1,171 @@
 # Core Values Compliance Status
 
 Reviewed: 2026-07-21
-Reviewed baseline: `7bf6752424cfab859813249812776ad320cf7f79`
 
-This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
+Reviewed baseline: `6ea4521f40cadaf36c610857ba67740c4bd767f8`
 
-An item is complete only when the production path is connected and an executable test exercises that path. Data structures, callback logic, serialization tests, loopback transport tests, and manually orchestrated handler tests are reported as partial evidence rather than end-to-end completion.
+This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
+
+An item is complete only when both conditions hold:
+
+1. The production path is connected from its public/runtime entry point to the intended outcome.
+2. An executable test exercises that same path and asserts the outcome, including relevant failure behavior.
+
+Data structures, serialization tests, callback tests, loopback transport tests, manually orchestrated component harnesses, and documentation examples are useful evidence but are not end-to-end completion by themselves.
 
 ## Status at a Glance
 
-| Focus | Status | Highlights |
+| Focus | Status | Current evidence boundary |
 | --- | --- | --- |
-| Fast | Partial | Global epoch preemption and hot-reload snapshots are implemented; distributed serialization and a production-framed loopback QUIC dispatch benchmark exist, but live process-mailbox delivery is not benchmarked. |
-| Robust | Strong | Per-process isolation, link/monitor semantics, and hot-reload swap path are in place. |
-| Scalable | Partial | Environment tracking and resource caps land, yet instance pooling and distributed ergonomics remain incomplete. |
-| Language Independence | Strong | Host APIs are language-agnostic and enumerated in `wat/all_imports.wat`. Comprehensive examples for Rust, Go (TinyGo), and AssemblyScript with full documentation. |
-| Security Through Isolation | Strong | Capability checks are enforced; in-process hot reload transfers live TLS sessions without serializing keys, while serialized TLS restoration fails explicitly. |
-| Fault Tolerance & HA | Partial | Hot reload, links/monitors, actual-process OTP supervision, and networked registry quorum/recovery work; cross-node process failure and hot-reload recovery remain open. |
-| Async by Default | Strong | `tokio::select!` driven scheduler and mailbox future-based API keep guest code async-transparent. |
-| Erlang-Inspired | Partial | GenServer and Supervisor run on native Lunatic processes, while global registration uses mTLS QUIC quorum; remaining OTP adapters and automatic monitor intake are open. |
+| Fast | Partial | Wasmtime preemption primitives exist; spawn, pooling, mailbox, and transport components are benchmarked. Live hot reload and end-to-end local/remote process delivery are not. |
+| Robust | Partial | Wasm isolation and host-side supervision components exist. Wasm link death reasons and acknowledged reload/rollback semantics remain incomplete. |
+| Scalable | Emerging | Concurrent registries and quotas exist, but mailboxes/signals are unbounded and cluster-scale process/resource behavior is unverified. |
+| Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
+| Security Through Isolation | Partial | Several syscall checks and resource limits are enforced. Least-privilege defaults, capability attenuation, complete accounting, and structured audit events remain open. |
+| Fault Tolerance & HA | Partial | Links, monitors, host-side OTP components, snapshots, and registry quorum components exist. Critical production paths below are not complete. |
+| Async by Default | Partial | Wasmtime preemption and several async host paths exist. Unbounded queues and unverified blocking host calls prevent a stronger claim. |
+| Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
 
-Status values: **Strong** (implemented with validation), **Partial** (major elements shipped but measurable gaps), **Emerging** (initial scaffolding only).
+Status values: **Strong** means production-path implementation plus executable validation; **Partial** means major connected elements with material gaps; **Emerging** means useful scaffolding without a demonstrated system-level guarantee. No focus currently meets the Strong threshold.
+
+## P0 Production-Path Gaps
+
+These gaps invalidate broad “production ready,” “all processes,” or “fully implemented” claims:
+
+1. **Live Wasm hot reload is not connected.** The running guest future takes ownership of the instance from `ProcessContext`; the reload handler later attempts to take an instance from that same empty option and can return `No instance available for hot reload` (`crates/lunatic-process/src/wasm.rs`, `crates/lunatic-process/src/lib.rs`). Existing integration tests and `benches/hot_reload.rs` manually compose Wasmtime compilation, instantiation, snapshot, and restore instead of exercising the live `Signal::HotReload` path.
+2. **Wasm link failure semantics lose the exit reason.** The Wasm runner calculates error, panic, kill, or normal outcomes, but its link-notification path currently sends `DeathReason::Normal`. Normal exits are ignored by the receiver, so linked failures are not demonstrated to propagate as intended (`crates/lunatic-process/src/lib.rs`).
+3. **The default capability posture is not least privilege.** `DefaultProcessConfig` currently enables config creation, module compilation, and process spawning by default, while the process API documentation describes a newly created config as denying permissions. Arbitrary WASI preopen paths also require an explicit capability policy (`src/config.rs`, `crates/lunatic-process-api/src/lib.rs`, `crates/lunatic-wasi-api/src/lib.rs`).
+4. **Queue and environment growth are not bounded end to end.** Process message and signal channels are unbounded, and the environment does not enforce a process-count limit. Existing file, network, memory, and table checks do not close mailbox/signal/process exhaustion paths (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/env.rs`, `src/config.rs`).
+5. **Reload coordination has no process acknowledgement protocol.** Successful signal delivery is treated as successful reload; atomic commit, version lifecycle, and rollback are not proven against actual process results. Rollback send failures are logged rather than recovered (`crates/lunatic-process/src/hot_reload.rs`).
 
 ## 1. Fast, Robust, and Scalable
 
-### Fast
-- Evidence: global epoch ticker plus async fuel ensure preemption even for tight guest loops (`crates/lunatic-process/src/runtimes/wasmtime.rs:27`).
-- Evidence: hot reload preserves memory and queues via `perform_pending_reload` (`crates/lunatic-process/src/lib.rs:475`).
-- Evidence: `MessageMailbox` async future prevents busy waiting and supports selective receive (`crates/lunatic-process/src/mailbox.rs:32`).
-- Evidence: `InstancePool` reports hit/miss counters (`stats()` and `lunatic.instance_pool.*` metrics) and the `instance_pool_hit_rate` Criterion bench runs in CI to guard pooled spawn latency (`crates/lunatic-process/src/instance_pool.rs:71`, `.github/workflows/ci.yml:63`).
-- Evidence: Messaging round-trip benches execute in CI to monitor mailbox latency (`benches/messaging.rs:1`, `.github/workflows/ci.yml:64`).
-- Evidence: Distributed encode/decode costs are tracked via the new Criterion suite (`benches/distributed_messaging.rs:1`, `scripts/check_bench_thresholds.py:45`).
-- Evidence: Control-plane node lookup latency is captured to baseline cross-node registration calls (`benches/distributed_latency.rs:1`, `scripts/check_bench_thresholds.py:52`).
-- Evidence: `distributed_quic_message_dispatch_2kb` opens a real mTLS connection over the OS-native loopback address, validates the generated server certificate against `ctrl.lunatic.cloud`, serializes a 2 KiB `Request::Message`, and sends it over the same persistent unidirectional stream, 1 KiB chunk framing, reassembly, MessagePack decode, and dispatch-callback path used by production node messaging (`benches/distributed_messaging.rs`, `crates/lunatic-distributed/src/quic/quin.rs`, `crates/lunatic-distributed/src/congestion/mod.rs`). CI runs the benchmark and applies a latency ceiling (`.github/workflows/ci.yml:66`, `scripts/check_bench_thresholds.py:45-60`).
-- Gap: the benchmark stops at the decoded-request dispatch boundary. It does not deliver into a live process mailbox or exercise registry lookup, control-plane discovery, multiple nodes, or network partitions. A full Lunatic distributed-process message round trip remains unverified.
+### Verified components
 
-### Robust
-- Evidence: resource limiter gating per store enforced in `WasmtimeRuntime::instantiate` (`crates/lunatic-process/src/runtimes/wasmtime.rs:76`).
-- Evidence: per-process file and network caps tracked at runtime (`src/state.rs:84`).
-- Evidence: monitors and links propagate failure reason without crashing unrelated processes (`crates/lunatic-process/src/lib.rs:491`).
-- ✅ ~~Gap: TODO note about missing `catch_unwind` means host panics can bypass supervisor notifications (`crates/lunatic-process/src/lib.rs:498`)~~ **RESOLVED**: process runner wraps native futures in `AssertUnwindSafe(...).catch_unwind()` and reports panics before unwinding (`crates/lunatic-process/src/lib.rs:517-754`).
+- Wasmtime stores configure async fuel yielding and epoch deadlines (`crates/lunatic-process/src/runtimes/wasmtime.rs`).
+- `MessageMailbox` implements asynchronous waiting and selective receive (`crates/lunatic-process/src/mailbox.rs`).
+- Instance-pool and component microbenchmarks provide useful local regression signals.
+- The distributed QUIC benchmark uses real loopback mTLS, production framing, reassembly, MessagePack decoding, and the request-dispatch boundary.
 
-### Scalable
-- Evidence: environment registry uses `DashMap` and exposes broadcast APIs (`crates/lunatic-process/src/env.rs:66`).
-- Evidence: `DefaultProcessConfig` enforces table, file, and network quotas to avoid per-process blowups (`src/config.rs:8`).
-- Evidence: Pool telemetry now surfaces hit/miss counters and gauges so operators can alert on unhealthy reuse (`crates/lunatic-process/src/instance_pool.rs:107`).
-- Evidence: Control client HTTP wrappers propagate structured errors without leaking debug output (`crates/lunatic-distributed/src/control/client.rs:209`).
-- Gap: distributed scheduler stress, sustained throughput, and cluster-wide process/memory/network quota enforcement are not covered. The current multi-node tests validate registry correctness, not scheduler capacity (`docs/testing/DISTRIBUTED_STRESS_TESTING.md`).
+### Boundary
+
+- The mailbox benchmark measures local mailbox operations, not a sender-to-live-receiver process round trip.
+- The distributed benchmark stops at decoded request dispatch; it does not deliver into a live guest mailbox or cover discovery, multiple hosts, or partitions.
+- Historical spawn, mailbox, and component-reload measurements do not establish current production latency guarantees.
+- One ticker advances stores associated with the first-created Wasmtime engine. Later independently constructed engines are not advanced because the ticker-start guard is process-global while each runtime constructs a new engine.
+- Sustained scheduler throughput, mailbox pressure, and cluster-wide memory/network limits are not covered by a scale or soak gate.
 
 ## 2. Language Independence via WebAssembly
-- Evidence: host registration for all subsystems lives behind traits and is language-neutral (`src/state.rs:195`).
-- Evidence: exhaustive host import list kept in sync at `wat/all_imports.wat`.
-- Evidence: **Comprehensive multi-language examples now available** - Rust, Go (TinyGo), and AssemblyScript (TypeScript) examples with full build systems, READMEs, and feature comparison guide (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
-- ✅ ~~Gap: repo samples are only WAT; need non-Rust WASM guest examples to demonstrate ergonomics~~ **RESOLVED**: Complete examples for Rust, Go, and AssemblyScript with comprehensive documentation, feature matrix, migration guides, and troubleshooting.
-- ✅ ~~Gap: no automated validation that `wat/all_imports.wat` matches linker exposure~~ **RESOLVED**: `tests/imports_match.rs` validates host registrations against the curated `wat/all_imports.wat` list each run.
+
+### Verified components
+
+- Host subsystems expose language-neutral Wasm imports, and `tests/imports_match.rs` checks registrations against `wat/all_imports.wat`.
+- The repository contains Rust, TinyGo, AssemblyScript, and WAT source examples and build recipes.
+
+### Boundary
+
+- The example sources and recipes have not yet been validated as a complete multi-language build-and-run matrix; they do not demonstrate equivalent access to the complete Lunatic runtime API.
+- Rust OTP examples use host-side `lunatic-otp-patterns`; they are not proof of a guest-Wasm OTP API.
+- Go and AssemblyScript OTP samples are manual pattern simulations, not runtime adapters.
+- CI does not yet build and execute a representative guest API scenario for every advertised language.
 
 ## 3. Security Through Isolation
-- Evidence: capability checks guard spawn, compile, and config creation (`crates/lunatic-process-api/src/lib.rs:563`).
-- Evidence: networking host calls enforce per-process quotas before creating sockets (`crates/lunatic-networking-api/src/tcp.rs:192`).
-- Evidence: `ResourceLimiter` prevents memory and table growth above config limits (`src/state.rs:268`).
-- Evidence: TCP/UDP listeners are rebound automatically during hot reload when limits allow, preserving sandbox boundaries across upgrades (`src/state.rs:347`).
-- Evidence: in-process hot reload moves the live network resource maps into the replacement state, preserving active client/server TLS sessions, guest resource IDs, ID seeds, timeouts, listeners, and resource accounting (`src/state.rs`, `crates/lunatic-process/src/lib.rs`).
-- Evidence: the live-path test completes a real TLS handshake, transfers the exact `TlsConnection`, and successfully exchanges data after state replacement (`src/state.rs::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`).
-- Evidence: serialized snapshots use the explicitly limited `TlsClientConnectionMetadata` and `TlsServerConnectionMetadata` variants and do not serialize TLS traffic keys (`crates/lunatic-process/src/resource_migration.rs`).
-- Evidence: serialized TLS stream restoration returns an error before any partial listener/socket restoration, rather than logging and reporting success (`src/state.rs::restore_resource_snapshot`).
-- Evidence: the support boundary and security rationale are documented in `docs/tls/TLS_STREAM_MIGRATION.md`.
-- Evidence: privileged operations (spawn, bind/connect) emit `target="audit"` log entries for downstream ingestion (`crates/lunatic-common-api/src/lib.rs:113`). Implementation documented in `docs/security/AUDIT_LOGGING.md`.
-- Evidence: **Comprehensive audit logging persistence guide** - Production-ready documentation covering OpenTelemetry, syslog, and container logging architectures with storage recommendations, compliance checklists, and alerting strategies (`docs/security/AUDIT_LOGGING_PERSISTENCE.md`).
-- Limitation: TLS stream preservation applies only to hot reload inside the same runtime process. Persisted snapshots, host restarts, and cross-process migration cannot restore an active TLS/application byte stream; this path returns an explicit unsupported error.
 
-## 4. Fault Tolerance & High Availability
-- Evidence: hot reload path validates signatures and swaps instances atomically (`crates/lunatic-process/src/lib.rs:607`).
-- Evidence: module registry tracks versions and dependency reload order (`crates/lunatic-process/src/module_registry.rs:61`).
-- Evidence: **Rollback mechanism fully implemented** - atomic reload failures trigger automatic rollback to previous version (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`).
-- Evidence: rollback signals sent to successfully reloaded processes on atomic reload failure, maintaining system consistency.
-- Evidence: global registration crosses real localhost mTLS QUIC endpoints and verifies one-winner contention in 2/3/5-node clusters, majority blocking, partition recovery, and resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
-- Evidence: production QUIC framing reassembles and dispatches a 4,097-byte multi-chunk distributed request (`crates/lunatic-distributed/tests/quic_transport.rs`).
-- ✅ ~~Gap: inline comment still states "TODO: Implement full hot reload logic"~~ **RESOLVED**: Hot reload implementation is complete and TODO has been removed.
-- Gap: registry endpoint interruption and recovery are covered, but live distributed process crashes, cross-node hot reload, rollback, and message recovery are not production-path E2E tested.
+### Verified components
+
+- Spawn, compile, and config-creation operations have capability checks (`crates/lunatic-process-api/src/lib.rs`).
+- Networking paths enforce several per-process limits, and Wasmtime uses memory/table resource limiting (`crates/lunatic-networking-api`, `src/state.rs`).
+- A directly tested same-runtime helper can transfer supported live network resource maps between process states without serializing TLS traffic keys. Serialized active TLS restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
+
+### Boundary
+
+- The default privilege mismatch, path preopen policy, and complete capability attenuation model remain unresolved.
+- Resource accounting is not yet closed across processes, messages, signals, and all handles.
+- Selected successful process-spawn and network bind/accept/connect paths emit `target="audit"` formatted log records. Denial/failure coverage, a stable typed event schema, required fields, sink contract, redaction, and executable log assertions are not implemented. A persistence guide is operational guidance, not implementation evidence.
+- The live-resource transfer helper is same-runtime only and is not currently proven reachable through running-Wasm reload. Serialized snapshots, host restarts, and cross-node migration cannot restore active TCP/TLS streams; listener restoration has separate support.
+
+## 4. Fault Tolerance and High Availability
+
+### Verified components
+
+- Process links and monitors, snapshot/signature components, and reload coordination structures exist.
+- Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, and resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- Production QUIC framing has a multi-chunk transport test (`crates/lunatic-distributed/tests/quic_transport.rs`).
+
+### Boundary
+
+- The P0 link-death and live-reload gaps prevent production failure-propagation and zero-downtime claims.
+- Registry coordination is real, and cleanup helpers exist, but guest name lookup, automatic process/node-lifecycle-triggered ownership cleanup, and live cross-node process-mailbox delivery are not connected and tested together.
+- Cross-node process failure, reload, rollback, and message recovery have no production-path E2E test.
 
 ## 5. Asynchronous by Default
-- Evidence: main loop biases handling signals before resuming guest future, preventing starvation (`crates/lunatic-process/src/lib.rs:507`).
-- Evidence: Wasmtime async fuel and epoch yields configured to preempt long-running guest code (`crates/lunatic-process/src/runtimes/wasmtime.rs:83`).
-- Gap: blocking host calls (for example filesystem) still rely on implementers yielding; there is no lint ensuring wrappers remain non-blocking.
-- Gap: `MessageMailbox::pop_skip_search` safety relies on guest discipline, which should be documented in API reference (`crates/lunatic-process/src/mailbox.rs:95`).
+
+### Verified components
+
+- The process loop prioritizes signals, and Wasmtime fuel yielding provides guest preemption points. Epoch deadlines are also configured, but the process-global ticker advances only stores belonging to the first-created engine.
+- Mailbox waits and several networking operations use async futures rather than busy waiting.
+
+### Boundary
+
+- Unbounded message and signal channels provide no backpressure guarantee.
+- No audit or test proves that every potentially blocking host call yields instead of occupying an executor worker.
+- Fairness under sustained CPU, I/O, and mailbox load has not been established by a deterministic test.
 
 ## 6. Erlang-Inspired, WebAssembly-Native
-- Evidence: messaging, monitors, and process registry mirror OTP patterns (`crates/lunatic-process/src/lib.rs:559`).
-- Evidence: hot reload uses module versioning and memory snapshots similar to BEAM upgrades (`crates/lunatic-process/src/hot_reload.rs:397`).
-- Evidence: per-environment registry supports name-based lookup (`src/state.rs:190`).
-- Evidence: `GlobalProcessId` represents node/environment/process coordinates and supports compact encoding (`crates/lunatic-distributed/src/distributed/global_process_id.rs`).
-- Evidence: `DistributedRegistry` provides concurrent in-memory local/global maps and reverse lookup (`crates/lunatic-distributed/src/distributed/registry.rs`).
-- Evidence: `RegistryCoordinator` defines coordination messages and handler-side response aggregation (`crates/lunatic-distributed/src/distributed/registry_coordination.rs`).
-- Evidence: `Client::register_global` delegates to `register_global_coordinated`, and `Request::Registry` carries prepare/response/decision/notify/sync messages through the production QUIC transport (`crates/lunatic-distributed/src/distributed/client.rs`, `crates/lunatic-distributed/src/distributed/message.rs`, `crates/lunatic-distributed/src/quic/quin.rs`).
-- Evidence: networked integration tests run real 2/3/5-node endpoints and prove one-winner registration, request-ID uniqueness, quorum waiting, and post-partition resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
-- Gap: registry lookup is not yet integrated into an end-to-end live distributed process-mailbox benchmark, and tooling (tracing, dashboards) referenced in `CORE_VALUES.md` is not implemented.
 
-## Validation and Test Coverage
+### Verified components
 
-| Area | Verified implementation | Not verified or not implemented | Executable evidence |
-| --- | --- | --- | --- |
-| OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process lifecycle and restart strategies; GenEvent exact-target and isolated concurrent fan-out | Supervisor automatic monitor-event intake; GenStatem/GenEvent process-runtime adapters; guest-WASM adapters | `cargo test -p lunatic-otp-patterns` (41 tests pass, including 9 real-process integration tests and 5 GenEvent contract tests) |
-| TLS streams | Live in-process transfer with preserved session, guest ID and timeouts; metadata serialization contract | Serialized/cross-process active-stream restoration | `cargo test --lib state::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`; `cargo test --test tls_stream_migration_contract` |
-| Global registry | Production mTLS QUIC transport, 2/3/5-node contention, request-ID uniqueness, quorum wait and partition resync | Live process ownership cleanup and process-mailbox lookup path | `cargo test -p lunatic-distributed --test registry_coordination` (4 networked E2E tests pass) |
-| QUIC transport and benchmark | Real loopback mTLS, production uni-stream chunk framing, reassembly, MessagePack decode, and request dispatch boundary | Live process-mailbox delivery and cross-host behavior | `cargo test -p lunatic-distributed --test quic_transport`; `cargo bench --bench distributed_messaging`; `python scripts/check_bench_thresholds.py distributed_messaging` |
+- `GenServer::spawn` uses native Lunatic processes and mailbox call/cast/reply flows. Process-level integration tests cover its host-side lifecycle (`crates/lunatic-otp-patterns`).
+- Supervisor strategies operate on native Lunatic process handles and have process-level integration tests.
+- GenEvent has a tested in-memory concurrency contract.
+- Coordinated registry messages travel over the production QUIC control transport.
 
-These commands were executed on Windows against the reviewed baseline on 2026-07-21. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem/GenEvent process-runtime adapters, serialized TLS recovery, live distributed process delivery, or scheduler stress gaps.
+### Boundary
 
-## Known Documentation Deltas
-- Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
+- Supervisor exit events must be forwarded manually to `handle_child_exit`; automatic monitor intake is pending.
+- GenStatem and GenEvent are not Lunatic process-runtime adapters.
+- GenServer, Supervisor, GenStatem, and GenEvent do not yet expose equivalent guest-Wasm adapters; GenServer named registration is not connected.
+- The Wasm link-death issue prevents claiming BEAM-like linked failure behavior.
 
-## OTP Patterns Implementation
-- Evidence: `GenServer::spawn` uses `lunatic_process::spawn_native`, registers the process in a `LunaticEnvironment`, and consumes serialized call/cast/stop messages from its `MessageMailbox` (`crates/lunatic-otp-patterns/src/gen_server.rs`, `crates/lunatic-process/src/lib.rs`).
-- Evidence: call replies use unique request IDs with pending-reply correlation, configurable timeout cleanup, and process-exit wakeups. Graceful stop runs `terminate`; kill and fatal cast errors remove the process and reject later messages.
-- Evidence: `crates/lunatic-otp-patterns/tests/gen_server_runtime.rs` verifies call response, cast state changes, timeout recovery, error propagation, graceful stop, and kill using actual native Lunatic processes.
-- Evidence: Supervisor child starters receive its `Environment` and return actual `Process` handles. Strategy restarts preflight intensity, stop affected processes in reverse specification order, restart in forward order, preserve per-child restart counts, and roll back partial batch starts (`crates/lunatic-otp-patterns/src/supervisor.rs`).
-- Evidence: `crates/lunatic-otp-patterns/tests/supervisor_runtime.rs` verifies actual-process replacement and removal for OneForOne, OneForAll and RestForOne, all restart policies, restart intensity rejection, persistent counts, ordered restart, duplicate-start rejection, and shutdown.
-- Evidence: GenEvent snapshots `Arc` handlers under its `RwLock`, releases the guard, and executes the snapshot concurrently on Tokio's blocking pool. `notify_handler` invokes exactly one snapshotted handler; `NotifyReport` isolates returned errors, panics, and runtime failures (`crates/lunatic-otp-patterns/src/gen_event.rs`).
-- Evidence: GenEvent tests prove a slow handler does not delay other deliveries or concurrent add/remove operations, additions are excluded from an existing snapshot, removals do not cancel in-flight delivery, and panic/error outcomes do not stop healthy handlers or later notifications.
-- Limitation: Supervisor child exit notifications must currently be forwarded to `handle_child_exit`; automatic monitor-event intake is not yet implemented.
-- Limitation: the current GenServer adapter is host-side and requires a multi-thread Tokio runtime. It does not yet expose the same abstraction through guest-WASM SDK host imports, and `GenServerConfig::name` is metadata rather than registry registration.
-- Limitation: GenEvent now has a defined and tested in-memory concurrency contract, but it is not yet a Lunatic process-runtime or guest-WASM adapter.
-- Gap: connect Supervisor monitor intake and GenStatem/GenEvent adapters to the process runtime before claiming complete OTP runtime coverage.
+## Validation Scope
 
-## Recommended Follow-Ups
-1. Add a live cross-node process-mailbox round-trip correctness test and benchmark beyond the current QUIC dispatch boundary.
-2. If cross-process TLS recovery becomes a requirement, design an explicit application-level quiesce/replay protocol; do not substitute a fresh stream behind an existing guest handle.
-3. ✅ ~~Expand language coverage with at least one non-Rust guest example plus documentation for guest SDK expectations~~ **COMPLETED**: Comprehensive multi-language examples for Rust, Go (TinyGo), and AssemblyScript with full build systems, documentation, feature matrix, migration guides, and troubleshooting (`examples/rust/`, `examples/go/`, `examples/assemblyscript/`, `examples/MULTI_LANGUAGE_GUIDE.md`).
-4. ✅ ~~Document and implement rollback semantics~~ **COMPLETED**: Full rollback implementation with automatic recovery on atomic reload failure (`crates/lunatic-process/src/hot_reload.rs:223-255`, `crates/lunatic-process/src/lib.rs:703-744`). Rollback signals sent to affected processes to restore previous version.
-5. Connect Supervisor monitor-event intake, GenStatem, and GenEvent to real Lunatic processes; add guest-WASM adapters and GenServer named registration.
-6. Add deterministic distributed process-failure, cross-node hot-reload, and cluster-wide quota stress suites.
-7. Add structured audit logging for privileged host operations to close the remaining security gap.
+| Evidence | What it establishes | What it does not establish |
+| --- | --- | --- |
+| `cargo test --all` | Current unit and integration contracts exercised by the repository | Untested production paths, performance, scale, or multi-host behavior |
+| `cargo test -p lunatic-otp-patterns` | Host-side OTP component and process integration behavior | Guest-Wasm adapters, automatic Supervisor monitor intake, GenStatem/GenEvent runtime integration |
+| Registry/QUIC integration tests | Real localhost mTLS transport, framing, and registry quorum behavior | Guest lookup-to-mailbox delivery, cross-host operations, distributed process recovery |
+| Criterion mailbox benchmark | Local queue-operation cost for its configured workload | End-to-end process message latency or backpressure |
+| Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
+| Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
+
+Verification on 2026-07-21: `cargo test --all` completed with 137 passing tests, zero failures, and four ignored documentation tests. This confirms only the contracts exercised by those tests; it does not close the production-path gaps above.
+
+The benchmark documents under `docs/benchmarks/` preserve an October 2025 measurement snapshot, but the original record omitted the tested commit and exact hardware/toolchain profile. It is therefore not a reproducible baseline. Future values must be quoted with commit, dirty state, hardware, toolchain, workload, and evidence boundary; they are not release certification by default.
+
+## Documentation Policy
+
+- `CORE_VALUES.md` defines goals and decision principles.
+- This file is the canonical current status and evidence boundary.
+- Historical phase/completion reports are archival context. Any unqualified completion language in them is superseded by this file.
+- README feature claims must link here and use the same completion rule.
+- A future completion change must name the production entry point, executable test, reviewed commit, and unsupported cases.
+
+## Prioritized Follow-Ups
+
+1. Enforce least-privilege defaults and explicit capability attenuation.
+2. Correct Wasm link death-reason propagation and add production-path tests.
+3. Connect and test live running-Wasm hot reload.
+4. Add reload acknowledgement, atomic commit, rollback, and version lifecycle semantics.
+5. Bound mailboxes/signals/process creation and validate resource accounting under pressure.
+6. Define structured security audit events and test schema/redaction guarantees.
+7. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
+8. Connect Supervisor monitor intake and OTP guest/runtime adapters.
+9. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
+10. Add scale, soak, and final production-readiness gates.
 
 ## Related Resources
-- `CORE_VALUES.md` – source principles and metrics.
-- `docs/core_values/CORE_VALUES_COMPLIANCE_REPORT.md` – archived scorecard (now points here).
-- `docs/benchmarks/BENCHMARK_RESULTS.md` – historical benchmark notes; not authoritative.
-- `PRIORITY_IMPROVEMENTS.md` – roadmap items derived from prior compliance reviews.
+
+- `CORE_VALUES.md` — design principles and target metrics.
+- `docs/benchmarks/BENCHMARK_RESULTS.md` — historical component measurements with scope limitations.
+- `examples/MULTI_LANGUAGE_GUIDE.md` — language example guide with support boundaries.
+- `docs/core_values/CORE_VALUES_COMPLIANCE_REPORT.md` — archived scorecard; this file supersedes its status claims.

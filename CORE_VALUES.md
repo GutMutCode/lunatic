@@ -1,8 +1,12 @@
 # Lunatic Core Values & Design Principles
 
-**Last Updated**: October 6, 2025  
-**Performance Analysis**: See [docs/benchmarks/PERFORMANCE_ANALYSIS.md](docs/benchmarks/PERFORMANCE_ANALYSIS.md)  
+**Last Updated**: July 21, 2026
+
+**Historical Performance Analysis (October 2025)**: See [docs/benchmarks/PERFORMANCE_ANALYSIS.md](docs/benchmarks/PERFORMANCE_ANALYSIS.md)
+
 **Current Compliance Status**: See [docs/core_values/status.md](docs/core_values/status.md)
+
+This document defines design goals. It is not an implementation-completion report; the linked compliance status is authoritative for overall feature completion. In the reference sections below, ✅ means only that the named component has direct executable evidence, not that the broader production feature is complete. Historical benchmark values are component evidence, not production guarantees.
 
 ## Executive Summary
 
@@ -41,10 +45,10 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 ### 2. **Language Independence via WebAssembly**
 
 **Principles**
-- Any language that compiles to WASM is supported
+- The execution ABI should remain usable from languages that can target compatible WASM
 - No single language lock-in
-- Polyglot systems are first-class citizens
-- Interoperability across language boundaries
+- Polyglot systems are a first-class design goal
+- Interoperability across language boundaries must be demonstrated by guest SDKs and tests
 
 **Guidelines**
 - Host APIs must be language-agnostic
@@ -87,7 +91,7 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 
 **Operational Excellence**
 - Zero-downtime deployments
-- Hot code reloading for all processes
+- Hot code reloading for eligible processes, with explicit unsupported-resource behavior
 - Graceful degradation
 - Self-healing systems
 
@@ -109,7 +113,7 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Write synchronous-looking code
 - Runtime handles async complexity
 - No callback hell or explicit async/await (in guest code)
-- Automatic backpressure management
+- Bounded queues and explicit backpressure behavior
 
 **Guiding Questions:**
 - Does this operation yield when blocking?
@@ -157,10 +161,11 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Selective receive
 
 **Lunatic Implementation Status:**
-- ✅ Lightweight processes (WASM instances)
+- ⚠️ Lightweight Wasm process abstraction exists; Erlang-comparable spawn, memory, and scale goals remain unmet or unverified
 - ✅ Isolated memory
 - ✅ Message passing via mailboxes
 - ⚠️  Fast spawn (slower due to WASM instantiation)
+- ⚠️ Link/monitor plumbing exists, but the current Wasm process exit path does not yet propagate every non-normal death reason correctly
 
 ### Hot Code Loading
 
@@ -176,11 +181,11 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Tail-recursive loops enable version switching
 
 **Lunatic Implementation Status:**
-- ✅ Module versioning (ModuleRegistry)
-- ✅ State preservation (memory snapshots)
-- ✅ Preemptive hot reload (epoch interruption)
-- ✅ Signature validation
-- ❌ Resource migration (Phase 7)
+- ⚠️ `ModuleRegistry` stores and prunes module entries, but unique version identity and live process-version lifecycle are not production-path verified
+- ⚠️ State snapshot/restore components are implemented; live running-Wasm state preservation is not yet production-path verified
+- ⚠️ Preemptive reload signaling exists, but acknowledgement, atomic commit, and tested live instance replacement remain pending
+- ⚠️ A signature-validation component exists; rejection through the live reload path is not E2E-verified
+- ⚠️ A directly tested same-runtime in-memory helper transfers supported live resource maps, including active TLS sessions, between replacement states; it is not proven reachable through live Wasm reload. Serialized snapshot, host-restart, and cross-node restoration of active TCP/TLS streams remain unsupported
 
 ### Fault Tolerance
 
@@ -197,9 +202,7 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Trapping exits for custom handling
 
 **Lunatic Implementation Status:**
-- ✅ Process links
-- ✅ Process monitors
-- ✅ Death notifications
+- ⚠️ Process link, monitor, and death-notification components exist, but the Wasm exit path currently loses non-normal death reasons
 - ⚠️ Supervisor restart strategies manage real host-side Lunatic processes; automatic monitor-event intake and guest-WASM adapters remain pending
 
 ### Distribution
@@ -217,8 +220,8 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 
 **Lunatic Implementation Status:**
 - ⚠️  Distributed messaging (lunatic-distributed crate)
-- ⚠️  `GlobalProcessId` and in-memory distributed registry data structures exist, but name lookup is not wired into the runtime messaging path
-- ❌ Cross-node registry coordination over the control/QUIC transport
+- ✅ Registry coordination uses the runtime mTLS QUIC control path and is covered by localhost multi-endpoint quorum/partition tests
+- ⚠️ `GlobalProcessId` and coordinated registry operations exist, but guest name lookup, automatic process/node-lifecycle-triggered ownership cleanup, and delivery into a cross-node mailbox are not yet wired and tested end to end
 - ❌ Distributed hot reload (Phase 10)
 
 ### OTP Patterns
@@ -322,28 +325,30 @@ When designing or reviewing features, ask:
 
 ## Success Metrics
 
+Checkboxes in this section represent current production-path verification, not whether a supporting component or historical microbenchmark exists. Measurement scope and reviewed commit are recorded in [the canonical status](docs/core_values/status.md).
+
 ### Performance
-- [ ] Process spawn < 10μs (current: 100-500μs, WASM overhead)
-- [x] Hot reload < 100ms (achieved: 20-100ms)
-- [x] Message passing < 1μs (achieved: 500ns-10μs, optimal for workloads)
-- [ ] Memory overhead < 1KB per process (current: 10-50KB, WASM page size limit)
+- [ ] Process spawn < 10μs (historical component benchmark: 23.055μs; remeasurement and workload definition required)
+- [ ] Live hot reload < 100ms (historical synthetic Criterion compile/instantiate/registry/snapshot/restore harness: 0.76ms; live signal path unverified)
+- [ ] End-to-end process message passing < 1μs (historical local 10-message FIFO mailbox creation/push/pop harness: 353ns; process delivery unmeasured)
+- [ ] Memory overhead < 1KB per process (historical lower-bound estimate: ~66KiB including one 64KiB Wasm page)
 
 ### Reliability
-- [x] Process isolation (100% guaranteed)
-- [x] Hot reload state preservation
+- [ ] Production isolation contract (Wasm memory isolation exists; least-privilege defaults, bounded resources, and failure propagation still have open gaps)
+- [ ] Live hot reload state preservation with acknowledgement and rollback proof
 - [ ] 99.999% uptime (application-dependent)
 - [ ] Automatic failure recovery via OTP supervisors (real process restart is implemented; automatic monitor-event intake is pending)
 
 ### Developer Experience
-- [x] Multi-language support
+- [ ] Multi-language guest API support (basic Rust, Go, and AssemblyScript build examples exist; equivalent runtime APIs and CI E2E coverage do not)
 - [ ] Rich ecosystem (libraries in Rust, JS, Go, etc.)
 - [ ] Comprehensive documentation
 - [ ] Production-ready tooling
 
 ### Erlang Parity
-- [x] Lightweight processes
-- [x] Message passing
-- [x] Hot code loading (preemptive)
+- [ ] Erlang-comparable lightweight processes (the Wasm process abstraction exists; spawn, memory, and scale targets remain unmet or unverified)
+- [ ] Bounded message passing with production backpressure guarantees
+- [ ] Live hot code loading with acknowledged version transition and rollback
 - [ ] Full OTP patterns
 - [ ] Transparent distribution
 

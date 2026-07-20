@@ -1,10 +1,12 @@
 # Audit Logging
 
-Lunatic emits structured audit logs for all privileged operations to support security monitoring, compliance auditing, and incident investigation.
+Lunatic emits `target="audit"` formatted text records on selected successful process-spawn and network bind/accept/connect paths.
+
+> **Current boundary (reviewed 2026-07-21):** These records do not form a complete or typed security-event contract. Denial/failure coverage, stable schema and required fields, redaction tests, sink guarantees, and executable log assertions remain unimplemented. This document is an event inventory and routing guide; it is not production-readiness or compliance evidence. See [`docs/core_values/status.md`](../core_values/status.md).
 
 ## Overview
 
-All security-sensitive operations are logged using the `audit` log target, making it easy to route these logs to dedicated storage, SIEM systems, or compliance platforms.
+The operations listed below call the `audit` log target after selected successful actions. Coverage is not exhaustive, and routing/persistence depends on application logging configuration.
 
 ## Logged Operations
 
@@ -103,9 +105,9 @@ RUST_LOG=audit=info lunatic run app.wasm
 RUST_LOG=info,audit=info lunatic run app.wasm 2>&1 | tee >(grep "audit" >> audit.log)
 ```
 
-### Production: See Persistence Guide
+### Operational Routing: See Persistence Guide
 
-For production deployments, see the comprehensive [Audit Logging Persistence and Aggregation Guide](./AUDIT_LOGGING_PERSISTENCE.md), which covers:
+For deployment-oriented routing examples, see the [Audit Logging Persistence and Aggregation Guide](./AUDIT_LOGGING_PERSISTENCE.md), which covers:
 
 - **Architecture Options**:
   - OpenTelemetry + OTLP (recommended for cloud-native)
@@ -211,7 +213,7 @@ For PII redaction strategies, see [Audit Logging Persistence Guide](./AUDIT_LOGG
 
 ## Related Documentation
 
-- **[Audit Logging Persistence and Aggregation Guide](./AUDIT_LOGGING_PERSISTENCE.md)** - Comprehensive production deployment guide
+- **[Audit Logging Persistence and Aggregation Guide](./AUDIT_LOGGING_PERSISTENCE.md)** - Operational routing ideas; not a runtime completeness guarantee
 - [Security Through Isolation](../core_values/status.md#3-security-through-isolation) - Security core values
 - [Core Values Status](../core_values/status.md) - Overall compliance status
 
@@ -222,5 +224,6 @@ For PII redaction strategies, see [Audit Logging Persistence Guide](./AUDIT_LOGG
 
 ---
 
-**Last Updated**: 2025-10-06
-**Status**: Production Ready
+**Last Updated**: 2026-07-21
+
+**Status**: Scope-limited implementation note; production security-event coverage is incomplete
