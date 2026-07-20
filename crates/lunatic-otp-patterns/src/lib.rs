@@ -1,12 +1,15 @@
 //! OTP-Inspired Patterns for Lunatic
 //!
-//! This crate provides Erlang/OTP behavior patterns for Lunatic WASM processes:
+//! This crate provides Erlang/OTP-inspired host-side runtime adapters and
+//! in-memory behavior patterns:
 //! - **GenServer**: Generic server with synchronous and asynchronous calls
 //! - **Supervisor**: Process supervision with restart strategies
+//! - **GenEvent**: Isolated concurrent event fan-out with targeted delivery
 //! - **GenStatem**: Generic state machine with event-driven transitions
 //!
-//! These patterns are designed to be used from WASM guest code and provide
-//! the same fault-tolerance and concurrency primitives that make Erlang/OTP successful.
+//! GenServer and Supervisor connect to host-side native Lunatic processes.
+//! GenEvent and GenStatem remain in-memory patterns. Guest-WASM adapters are
+//! separate future work.
 
 pub mod error;
 pub mod gen_event;
@@ -16,7 +19,8 @@ pub mod supervisor;
 
 pub use error::{OtpError, OtpResult};
 pub use gen_event::{
-    Event, GenEvent, LogEvent, MetricEvent, TerminateReason as EventTerminateReason,
+    Event, GenEvent, HandlerOutcome, LogEvent, MetricEvent, NotifyReport,
+    TerminateReason as EventTerminateReason,
 };
 pub use gen_server::{
     GenServer, GenServerConfig, GenServerHandle, ServerMessage, ServerReply, TerminateReason,

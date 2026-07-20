@@ -13,6 +13,10 @@ GenServer and Supervisor are connected to Lunatic's host-side native process run
 - Supervisor child starters receive the managed `Environment` and return an actual `Process` handle.
 - OneForOne, OneForAll, and RestForOne terminate old processes, restart in specification order, preserve restart counts, enforce restart intensity, and reject duplicate starts.
 - `crates/lunatic-otp-patterns/tests/supervisor_runtime.rs` exercises strategies and restart policies against real native Lunatic processes.
+- GenEvent snapshots `Arc` handlers before invoking user code, dispatches the snapshot concurrently
+  outside its registry lock, and reports per-handler success, error, panic, or runtime failure.
+- Targeted GenEvent delivery calls exactly one handler. Add/remove operations affect future
+  snapshots and never cancel an already snapshotted delivery.
 - GenStatem tests drive transitions directly in memory.
 - The Rust examples use the process-backed GenServer and Supervisor APIs.
 
@@ -20,7 +24,7 @@ The current GenServer and Supervisor adapters require a multi-thread Tokio runti
 
 ## Overview
 
-Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate builds higher-level patterns on those primitives; GenServer has mailbox and lifecycle integration, while Supervisor has real process shutdown and ordered restart integration.
+Lunatic implements actor-model primitives inspired by Erlang/BEAM. This crate builds higher-level patterns on those primitives; GenServer has mailbox and lifecycle integration, Supervisor has real process shutdown and ordered restart integration, and GenEvent provides isolated in-memory event fan-out.
 
 ## Patterns
 
@@ -132,6 +136,42 @@ supervisor.start_children()?;
 
 Call `handle_child_exit` after receiving a child exit notification. `shutdown` terminates active children in reverse specification order. The public example is `examples/rust/src/supervisor_example.rs`.
 
+### GenEvent
+
+In-memory event fan-out with lock-free user-code invocation and per-handler outcomes.
+
+```rust
+use lunatic_otp_patterns::{GenEvent, HandlerOutcome, LogEvent};
+
+let events = GenEvent::<LogEvent>::new();
+events
+    .add_handler("console".to_string(), |event| {
+        println!("{event:?}");
+    })
+    .await;
+events
+    .add_fallible_handler("checked".to_string(), |_event| -> Result<(), &'static str> {
+        Ok(())
+    })
+    .await;
+
+let report = events
+    .notify(LogEvent::Info("ready".to_string()))
+    .await;
+assert_eq!(report.outcome("console"), Some(&HandlerOutcome::Succeeded));
+
+let targeted = events
+    .notify_handler("checked", LogEvent::Info("only once".to_string()))
+    .await;
+assert_eq!(targeted, Some(HandlerOutcome::Succeeded));
+```
+
+`notify` snapshots the current handler IDs and `Arc` callbacks, releases the `RwLock`, then runs all
+snapshotted callbacks concurrently on Tokio's blocking pool. A handler added after the snapshot
+does not receive that event. Removing or replacing a handler does not cancel a delivery that was
+already snapshotted. Panic and returned errors are isolated in `NotifyReport`; `notify` waits for
+all snapshotted outcomes before returning.
+
 ### GenStatem
 
 Generic state machine pattern for implementing finite state machines with event-driven transitions.
@@ -191,7 +231,7 @@ The API is intended to align with Lunatic's core values. Claims below distinguis
 - **Language Independence**: Pure Rust with serde serialization
 - **Security Through Isolation**: The native process is registered in a Lunatic environment; this is not a Wasm sandbox boundary
 - **Fault Tolerance**: GenServer exit/error handling and Supervisor process replacement are implemented; automatic monitor-event intake is pending
-- **Asynchronous by Default**: Casts use mailbox delivery; synchronous calls add correlated replies and timeouts
+- **Asynchronous by Default**: Casts use mailbox delivery; synchronous calls add correlated replies and timeouts; GenEvent runs synchronous callbacks concurrently outside its registry lock
 - **Erlang-Inspired**: Callback and strategy APIs are modeled after OTP
 
 ## License

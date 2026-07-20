@@ -1,7 +1,7 @@
 # Core Values Compliance Status
 
 Reviewed: 2026-07-21
-Reviewed baseline: `a643f211d03129394e59df7b79fc5838678c13f7`
+Reviewed baseline: `57885c783a587718a893af7492340f486bbd56df`
 
 This document supersedes ad-hoc phase reports and consolidates how the current codebase aligns with the principles in `CORE_VALUES.md`. It cites concrete implementation points, test coverage, and gaps that require follow-up work.
 
@@ -99,12 +99,12 @@ Status values: **Strong** (implemented with validation), **Partial** (major elem
 
 | Area | Verified implementation | Not verified or not implemented | Executable evidence |
 | --- | --- | --- | --- |
-| OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process shutdown, OneForOne/OneForAll/RestForOne, restart policies, intensity limits and persistent restart counts | Supervisor automatic monitor-event intake; GenStatem/GenEvent remain in-memory; guest-WASM adapters not implemented | `cargo test -p lunatic-otp-patterns` (38 tests pass, including 9 real-process integration tests) |
+| OTP | GenServer mailbox/lifecycle integration; Supervisor actual-process lifecycle and restart strategies; GenEvent exact-target and isolated concurrent fan-out | Supervisor automatic monitor-event intake; GenStatem/GenEvent process-runtime adapters; guest-WASM adapters | `cargo test -p lunatic-otp-patterns` (41 tests pass, including 9 real-process integration tests and 5 GenEvent contract tests) |
 | TLS streams | Live in-process transfer with preserved session, guest ID and timeouts; metadata serialization contract | Serialized/cross-process active-stream restoration | `cargo test --lib state::tests::hot_reload_transfers_live_tls_stream_with_id_and_timeouts`; `cargo test --test tls_stream_migration_contract` |
 | Global registry | In-memory registry operations and coordination handler transitions | Control/QUIC transport wiring, quorum wait, live concurrent registration, partition recovery | `cargo test -p lunatic-distributed --test registry_coordination` (8 manually orchestrated tests pass) |
 | QUIC benchmark | Real loopback mTLS QUIC connection and stream echo | Lunatic distributed client/server routing and multi-node behavior | `cargo bench --bench distributed_messaging --no-run` builds the executable benchmark |
 
-These commands were executed on Windows against the reviewed baseline on 2026-07-20. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem, GenEvent, TLS, registry, or distributed messaging gaps.
+These commands were executed on Windows against the reviewed baseline on 2026-07-21. Passing tests apply only to the runtime paths named in the table; they must not be generalized to the remaining Supervisor monitor intake, GenStatem/GenEvent process-runtime adapters, serialized TLS recovery, registry, or distributed messaging gaps.
 
 ## Known Documentation Deltas
 - Legacy phase reports (`docs/phases/PHASE*.md`) contain historical context but may diverge from current implementation. Notable: Phase 7 (TLS migration) has been completed beyond original scope. Use this status file as the canonical source for current state.
@@ -115,9 +115,12 @@ These commands were executed on Windows against the reviewed baseline on 2026-07
 - Evidence: `crates/lunatic-otp-patterns/tests/gen_server_runtime.rs` verifies call response, cast state changes, timeout recovery, error propagation, graceful stop, and kill using actual native Lunatic processes.
 - Evidence: Supervisor child starters receive its `Environment` and return actual `Process` handles. Strategy restarts preflight intensity, stop affected processes in reverse specification order, restart in forward order, preserve per-child restart counts, and roll back partial batch starts (`crates/lunatic-otp-patterns/src/supervisor.rs`).
 - Evidence: `crates/lunatic-otp-patterns/tests/supervisor_runtime.rs` verifies actual-process replacement and removal for OneForOne, OneForAll and RestForOne, all restart policies, restart intensity rejection, persistent counts, ordered restart, duplicate-start rejection, and shutdown.
+- Evidence: GenEvent snapshots `Arc` handlers under its `RwLock`, releases the guard, and executes the snapshot concurrently on Tokio's blocking pool. `notify_handler` invokes exactly one snapshotted handler; `NotifyReport` isolates returned errors, panics, and runtime failures (`crates/lunatic-otp-patterns/src/gen_event.rs`).
+- Evidence: GenEvent tests prove a slow handler does not delay other deliveries or concurrent add/remove operations, additions are excluded from an existing snapshot, removals do not cancel in-flight delivery, and panic/error outcomes do not stop healthy handlers or later notifications.
 - Limitation: Supervisor child exit notifications must currently be forwarded to `handle_child_exit`; automatic monitor-event intake is not yet implemented.
 - Limitation: the current GenServer adapter is host-side and requires a multi-thread Tokio runtime. It does not yet expose the same abstraction through guest-WASM SDK host imports, and `GenServerConfig::name` is metadata rather than registry registration.
-- Gap: connect Supervisor monitor intake, GenStatem, and GenEvent to the process runtime before claiming complete OTP runtime coverage.
+- Limitation: GenEvent now has a defined and tested in-memory concurrency contract, but it is not yet a Lunatic process-runtime or guest-WASM adapter.
+- Gap: connect Supervisor monitor intake and GenStatem/GenEvent adapters to the process runtime before claiming complete OTP runtime coverage.
 
 ## Recommended Follow-Ups
 1. Wire the spawn/messaging Criterion benches into CI to enforce the sub-10 µs target and catch regressions early.
