@@ -243,7 +243,31 @@ pub struct ServerReply<Reply> {
     pub reply: Reply,
 }
 
-type PendingReply = std::result::Result<Vec<u8>, String>;
+struct PendingReply {
+    result: std::result::Result<Vec<u8>, String>,
+    completed_at: Instant,
+}
+
+impl PendingReply {
+    fn new(result: std::result::Result<Vec<u8>, String>) -> Self {
+        Self {
+            result,
+            completed_at: Instant::now(),
+        }
+    }
+
+    fn before_deadline(
+        self,
+        started_at: Instant,
+        timeout: Duration,
+    ) -> std::result::Result<Self, mpsc::RecvTimeoutError> {
+        if self.completed_at.saturating_duration_since(started_at) >= timeout {
+            Err(mpsc::RecvTimeoutError::Timeout)
+        } else {
+            Ok(self)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum ExitStatus {
@@ -272,7 +296,8 @@ impl GenServerShared {
         self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn reply(&self, request_id: u64, reply: PendingReply) {
+    fn reply(&self, request_id: u64, reply: std::result::Result<Vec<u8>, String>) {
+        let reply = PendingReply::new(reply);
         if let Some(sender) = self
             .pending
             .lock()
@@ -302,7 +327,7 @@ impl GenServerShared {
             .lock()
             .expect("GenServer pending replies mutex poisoned");
         for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(pending_error.clone()));
+            let _ = sender.send(PendingReply::new(Err(pending_error.clone())));
         }
         condvar.notify_all();
     }
@@ -473,23 +498,30 @@ where
         }
 
         let response = match self.config.timeout_ms {
-            Some(timeout_ms) => Duration::from_millis(timeout_ms)
-                .checked_sub(started_at.elapsed())
-                .ok_or(mpsc::RecvTimeoutError::Timeout)
-                .and_then(|remaining| receiver.recv_timeout(remaining))
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => anyhow!(
-                        "GenServer call {} to process {} timed out after {} ms",
-                        request_id,
-                        self.process_id,
-                        timeout_ms
-                    ),
-                    mpsc::RecvTimeoutError::Disconnected => anyhow!(
-                        "GenServer process {} terminated before replying to call {}",
-                        self.process_id,
-                        request_id
-                    ),
-                }),
+            Some(timeout_ms) => {
+                let timeout = Duration::from_millis(timeout_ms);
+                timeout
+                    .checked_sub(started_at.elapsed())
+                    .ok_or(mpsc::RecvTimeoutError::Timeout)
+                    .and_then(|remaining| receiver.recv_timeout(remaining))
+                    // `recv_timeout` checks for a queued reply before checking
+                    // its deadline. Use the reply completion time so a caller
+                    // descheduled past the deadline cannot accept a late reply.
+                    .and_then(|response| response.before_deadline(started_at, timeout))
+                    .map_err(|error| match error {
+                        mpsc::RecvTimeoutError::Timeout => anyhow!(
+                            "GenServer call {} to process {} timed out after {} ms",
+                            request_id,
+                            self.process_id,
+                            timeout_ms
+                        ),
+                        mpsc::RecvTimeoutError::Disconnected => anyhow!(
+                            "GenServer process {} terminated before replying to call {}",
+                            self.process_id,
+                            request_id
+                        ),
+                    })
+            }
             None => receiver.recv().map_err(|_| {
                 anyhow!(
                     "GenServer process {} terminated before replying to call {}",
@@ -509,8 +541,8 @@ where
                     .remove(&request_id);
                 return Err(error);
             }
-        }
-        .map_err(anyhow::Error::msg)?;
+        };
+        let response = response.result.map_err(anyhow::Error::msg)?;
         let reply: ServerReply<Reply> =
             bincode::deserialize(&response).context("invalid GenServer reply")?;
         Ok(reply.reply)
@@ -728,6 +760,26 @@ mod tests {
     }
 
     #[test]
+    fn pending_reply_deadline_uses_completion_time() {
+        let started_at = Instant::now();
+        let timeout = Duration::from_millis(20);
+        let on_time = PendingReply {
+            result: Ok(Vec::new()),
+            completed_at: started_at + Duration::from_millis(19),
+        };
+        let at_deadline = PendingReply {
+            result: Ok(Vec::new()),
+            completed_at: started_at + timeout,
+        };
+
+        assert!(on_time.before_deadline(started_at, timeout).is_ok());
+        assert!(matches!(
+            at_deadline.before_deadline(started_at, timeout),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
     fn test_terminate_reason() {
         let mut server = TestServer::init();
         server.terminate(TerminateReason::Normal);
@@ -810,6 +862,12 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
+        assert!(handle
+            .shared
+            .pending
+            .lock()
+            .expect("GenServer pending replies mutex poisoned")
+            .is_empty());
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(matches!(
