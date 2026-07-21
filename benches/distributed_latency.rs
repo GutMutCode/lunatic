@@ -29,8 +29,11 @@ fn control_lookup_benchmark(c: &mut Criterion) {
             let mut total = Duration::ZERO;
             for _ in 0..iters {
                 let start = Instant::now();
-                nodes[0].lookup_nodes("").await.expect("lookup to succeed");
+                let (query_id, _) = nodes[0].lookup_nodes("").await.expect("lookup to succeed");
                 total += start.elapsed();
+                nodes[0]
+                    .query_result(&query_id)
+                    .expect("lookup result to remain available");
             }
 
             for node in &nodes {

@@ -464,4 +464,38 @@ mod tests {
         assert_eq!(current.address.port(), 2001);
         assert!(client.node_info(2).is_none());
     }
+
+    #[test]
+    fn pending_query_capacity_is_released_on_cancellation_and_result_consumption() {
+        let client = Client::from_static_nodes(registration(), 1, vec![node(1, 1001, "one")]);
+
+        let cancelled = client.reserve_node_query().expect("query reservation");
+        assert_eq!(
+            client
+                .inner
+                .pending_node_queries
+                .load(atomic::Ordering::Acquire),
+            1
+        );
+        drop(cancelled);
+        assert_eq!(
+            client
+                .inner
+                .pending_node_queries
+                .load(atomic::Ordering::Acquire),
+            0
+        );
+
+        let completed = client.reserve_node_query().expect("query reservation");
+        client.inner.node_queries.insert(7, vec![1]);
+        completed.commit();
+        assert_eq!(client.query_result(&7), Some((7, vec![1])));
+        assert_eq!(
+            client
+                .inner
+                .pending_node_queries
+                .load(atomic::Ordering::Acquire),
+            0
+        );
+    }
 }
