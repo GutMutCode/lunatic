@@ -3,10 +3,16 @@ name: cargo deny
 on:
   push:
     paths:
+      - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - '**/deny.toml'
+      - '.github/workflows/cargo-deny-pr.yml'
   pull_request:
     paths:
+      - '**/Cargo.lock'
       - '**/Cargo.toml'
+      - '**/deny.toml'
+      - '.github/workflows/cargo-deny-pr.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,14 +22,20 @@ jobs:
   cargo-deny:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        checks:
-          - advisories
-          - bans licenses sources
+        include:
+          # Keep accepted advisory debt visible in the log. Only the exact IDs documented in
+          # deny.toml are notes; every new advisory remains a blocking error.
+          - checks: advisories
+            log_level: info
+          - checks: bans licenses sources
+            log_level: warn
 
     steps:
-    - uses: actions/checkout@v3
-    - uses: EmbarkStudios/cargo-deny-action@v1
+    - uses: actions/checkout@v5
+    - uses: EmbarkStudios/cargo-deny-action@v2
       with:
-        command: check ${{ matrix.checks }}
-
+        command: check
+        command-arguments: ${{ matrix.checks }} --show-stats
+        log-level: ${{ matrix.log_level }}
