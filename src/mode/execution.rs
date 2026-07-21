@@ -36,7 +36,8 @@ enum Commands {
 }
 
 pub(crate) async fn execute(augmented_args: Option<Vec<String>>) -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,audit=info"))
+        .init();
 
     let args = match augmented_args {
         Some(a) => Args::parse_from(a),

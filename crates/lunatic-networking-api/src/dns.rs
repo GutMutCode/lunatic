@@ -7,10 +7,16 @@ use anyhow::Result;
 use tokio::time::timeout;
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
-use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
+use lunatic_common_api::{
+    get_memory, AuditAction, AuditEvent, AuditReason, AuditResult, AuditTargetKind, IntoTrap,
+    LinkerAsyncExt,
+};
 use lunatic_error_api::ErrorCtx;
 
-use crate::{validate_memory_range, DnsIteratorLease, NetworkingCtx};
+use crate::{
+    redacted_network_target, validate_memory_range, DnsIteratorLease, NetworkingCtx,
+    PendingNetworkAudit,
+};
 
 pub struct DnsIterator {
     iter: IntoIter<SocketAddr>,
@@ -106,6 +112,12 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
     id_u64_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkConnect,
+            AuditAction::Resolve,
+            redacted_network_target(AuditTargetKind::DnsIterator, None, None),
+        );
         let memory = get_memory(&mut caller)?;
         validate_memory_range(
             &caller,
@@ -123,34 +135,48 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
             .or_trap("lunatic::network::resolve::not_valid_utf8_string")?;
 
         let lease = state.reserve_dns_iterator_lease();
-        let (iter_or_error_id, result) = match lease {
+        let (iter_or_error_id, result, audit_result, audit_reason) = match lease {
             Ok(lease) => {
+                audit.set_fallback_reason(AuditReason::RuntimeFailure);
                 // Check for timeout during lookup.
                 let lookup_host = tokio::net::lookup_host(name);
-                if let Ok(result) = match timeout_duration {
+                audit.mark_async();
+                match match timeout_duration {
                     // Without timeout
                     u64::MAX => Ok(lookup_host.await),
                     // With timeout
                     t => timeout(Duration::from_millis(t), lookup_host).await,
                 } {
-                    match result {
-                        Ok(sockets) => {
-                            // This is a bug in clippy, this collect is not needless.
-                            #[allow(clippy::needless_collect)]
-                            let iterator = DnsIterator::with_lease(
-                                sockets.collect::<Vec<SocketAddr>>().into_iter(),
-                                lease,
-                            );
-                            (state.dns_resources_mut().add(iterator), 0)
-                        }
-                        Err(error) => (state.add_error_resource(error.into()), 1),
+                    Ok(Ok(sockets)) => {
+                        // This is a bug in clippy, this collect is not needless.
+                        #[allow(clippy::needless_collect)]
+                        let iterator = DnsIterator::with_lease(
+                            sockets.collect::<Vec<SocketAddr>>().into_iter(),
+                            lease,
+                        );
+                        let id = state.dns_resources_mut().add(iterator);
+                        audit.set_target(redacted_network_target(
+                            AuditTargetKind::DnsIterator,
+                            Some(id),
+                            None,
+                        ));
+                        (id, 0, AuditResult::Succeeded, AuditReason::Completed)
                     }
-                } else {
-                    // Timeout drops the unused lease.
-                    (0, 9027)
+                    Ok(Err(error)) => (
+                        state.add_error_resource(error.into()),
+                        1,
+                        AuditResult::Failed,
+                        AuditReason::RuntimeFailure,
+                    ),
+                    Err(_) => (0, 9027, AuditResult::Failed, AuditReason::TimedOut),
                 }
             }
-            Err(error) => (state.add_error_resource(error), 1),
+            Err(error) => (
+                state.add_error_resource(error),
+                1,
+                AuditResult::Denied,
+                AuditReason::ResourceLimit,
+            ),
         };
         let memory = get_memory(&mut caller)?;
         memory
@@ -160,6 +186,7 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
                 &iter_or_error_id.to_le_bytes(),
             )
             .or_trap("lunatic::networking::resolve")?;
+        audit.finish(audit_result, audit_reason);
         Ok(result)
     })
 }

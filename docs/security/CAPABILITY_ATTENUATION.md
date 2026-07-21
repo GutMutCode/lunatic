@@ -30,6 +30,10 @@ at the parent's ceilings.
 | Table elements | Child maximum must be less than or equal to the parent maximum. |
 | File descriptors | Child maximum must be less than or equal to the parent maximum. |
 | Network connections | Child maximum must be less than or equal to the parent maximum. |
+| Mailbox messages | Child maximum must be less than or equal to the parent maximum. |
+| Signal queue | Child maximum must be less than or equal to the parent maximum. |
+| Message bytes | Child maximum must be less than or equal to the parent maximum. |
+| Message resources | Child maximum must be less than or equal to the parent maximum. |
 
 Guest mutations are transactional: clone the stored config, apply the requested
 change, validate it against the caller, and replace the stored config only after
@@ -41,9 +45,10 @@ imports.
 Existing custom `ProcessConfig` and `ProcessConfigCtx` implementations remain
 source-compatible. New attenuation methods have fail-closed defaults: guest
 config creation, custom-config spawn, and distributed transfer remain denied
-until the implementation defines its own policy. New table/FD/network context
-methods default to zero/no-op. Custom runtimes should override these defaults
-before exposing the corresponding guest APIs.
+until the implementation defines its own policy. New table, FD, network,
+mailbox, signal, message-byte, and message-resource context methods default to
+zero/no-op. Custom runtimes should override these defaults before exposing the
+corresponding guest APIs.
 
 ## Enforcement Boundaries
 
@@ -72,20 +77,19 @@ CLI preopen are intentionally rejected. A future node allowlist may safely
 replace this conservative rule, but sender-side path equality alone is never
 remote authorization.
 
-The current distributed trust model still treats an authenticated cluster node
-as authoritative for serialized non-filesystem capability flags and resource
-ceilings. The receiver does not independently cap compile/create/spawn, memory,
-fuel, table, FD, or network values. A compromised authenticated node is outside
-the restricted-guest attenuation guarantee and can supply elevated portable
-fields; receiver-owned ceilings are a separate hardening requirement.
+The distributed receiver applies a fixed `DefaultProcessConfig::default()`
+ceiling. Portable compile/create/spawn capabilities therefore remain denied,
+and memory, table, FD, network, mailbox, signal, message-byte, and
+message-resource limits cannot exceed that baseline. This is not yet an
+operator-selectable receiver policy, and fuel is validated for internal
+consistency but has no receiver-owned finite ceiling.
 
-The FD and network values in this contract are configuration ceilings. FD
-accounting is not yet connected to every host file operation, and network
-accounting currently covers selected TCP paths rather than every listener,
-TLS, UDP, and DNS resource. Network destination allowlists are also not part of
-`DefaultProcessConfig`. Complete resource accounting is a separate follow-up;
-this change guarantees that the represented ceilings do not increase during
-delegation.
+Every guest-visible TCP/TLS listener, TCP/TLS stream, UDP socket, and clone now
+owns one paired FD/network lease; accept/connect/bind failure, cancellation,
+drop, message transfer, and hot reload preserve or release that lease. DNS and
+address iterators have a separate finite quota derived from the network
+ceiling. The FD ceiling is still not connected to general WASI file handles,
+and network destination allowlists are not part of `DefaultProcessConfig`.
 
 ## Errors and Audit Records
 
@@ -98,15 +102,17 @@ New guests should use `lunatic::process::config_set_checked(config_id,
 setting_id, value)`. It returns `-1` on success or a guest-readable
 `lunatic::error` resource ID on failure. Setting IDs are `0` memory, `1` fuel,
 `2` table elements, `3` file descriptors, `4` network connections, `5` compile,
-`6` create-config, and `7` spawn. The legacy void setters remain available; a
+`6` create-config, `7` spawn, `8` mailbox messages, `9` signal queue, `10`
+message bytes, and `11` message resources. The legacy void setters remain available; a
 denied legacy mutation is an audited no-op so existing modules cannot elevate
 authority or abort the Windows runtime.
 
 `lunatic::wasi::config_preopen_dir_checked` follows the same `-1`/error-resource
 contract, including malformed memory ranges, invalid UTF-8, missing config IDs,
 and policy denials. The legacy void preopen import turns any of those failures
-into a safe no-op; policy allow/deny decisions that reach config validation are
-audited, while malformed input and missing IDs do not emit an audit record. The
+into a safe no-op. Its operation guard records one typed terminal result for
+policy decisions and early malformed/trap exits without including the raw path
+or error. The
 checked import is registered separately through
 `lunatic_wasi_api::register_checked` so the legacy `register` API does not gain
 an `ErrorCtx` bound. Local `spawn` returns status `1` and writes an error-resource
@@ -126,12 +132,13 @@ handle. Live guest-owned handles are never evicted by the bounded insertion
 path. This bound applies to runtime host APIs that insert errors through
 `ErrorCtx::add_error_resource`; direct mutation of the backing map bypasses it.
 
-Config creation, setter/preopen decisions, and final custom-config spawn checks
-emit `target="audit"` records named `capability_delegation`, with the parent
-process, config ID when available, operation, and allowed/denied outcome.
-Successful local child creation continues to emit `process_spawn`. These are
-the runtime's current formatted-text audit records, not the stable typed and
-redaction-tested event schema planned separately.
+Config creation, setter/preopen decisions, compile, and spawn boundaries emit
+versioned `AuditEventV1` JSON records on `target="audit"`. The stable schema
+includes subject identity, typed numeric targets, result and machine reason
+codes. Paths, guest strings, environment/argument values, payloads, and raw
+errors cannot enter its string-free target type. See
+[`AUDIT_LOGGING.md`](./AUDIT_LOGGING.md) for the event inventory and best-effort
+delivery boundary.
 
 ## Executable Evidence
 
@@ -144,7 +151,11 @@ redaction-tested event schema planned separately.
   behavior, both checked and legacy downward delegation followed by an actual
   child spawn, guest readability of returned error-resource IDs, the final
   local state-construction check, sender-side remote-preopen rejection, and
-  both allowed and denied audit records. It also injects an invalid selected
+  both allowed and denied audit records. It also exercises actual local
+  process-quota rejection through `spawn` and `get_or_spawn`; TCP/UDP bind and
+  DNS success/quota denial; TLS and out-of-range-port validation failure; and
+  local registry register/unregister/not-found outcomes. It asserts one typed,
+  redacted audit event for each operation. It injects an invalid selected
   config through the actual `spawn` and `get_or_spawn` imports and verifies the
   1,024-resource bound under repeated checked denials. The complete matrix runs
   on Windows without an ignored host-trap test.

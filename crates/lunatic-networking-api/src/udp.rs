@@ -9,8 +9,14 @@ use tokio::time::timeout;
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 use crate::dns::DnsIterator;
-use crate::{socket_address, validate_memory_range, NetworkingCtx};
-use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
+use crate::{
+    audit_port, redacted_network_target, socket_address, validate_memory_range, NetworkingCtx,
+    PendingNetworkAudit,
+};
+use lunatic_common_api::{
+    get_memory, AuditAction, AuditEvent, AuditReason, AuditResult, AuditTargetKind, IntoTrap,
+    LinkerAsyncExt,
+};
 use lunatic_error_api::ErrorCtx;
 
 // Register UDP networking APIs to the linker
@@ -105,7 +111,20 @@ fn udp_bind<T: NetworkingCtx + ErrorCtx + Send>(
     id_u64_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkBind,
+            AuditAction::Bind,
+            redacted_network_target(AuditTargetKind::UdpSocket, None, audit_port(port)),
+        );
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::udp_bind",
+        )?;
         let socket_addr = socket_address(
             &caller,
             &memory,
@@ -116,20 +135,43 @@ fn udp_bind<T: NetworkingCtx + ErrorCtx + Send>(
             scope_id,
         )?;
         let lease = caller.data().reserve_network_handle_lease();
-        let (udp_listener_or_error_id, result) = match lease {
-            Ok(lease) => match UdpSocket::bind(socket_addr).await {
-                Ok(listener) => {
-                    audit_log("udp_bind", format!("address={}", socket_addr));
-                    let id = caller
-                        .data_mut()
-                        .udp_resources_mut()
-                        .add(Arc::new(listener));
-                    lease.into_table_reservation();
-                    (id, 0)
+        let (udp_listener_or_error_id, result, audit_result, audit_reason) = match lease {
+            Ok(lease) => {
+                audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                audit.mark_async();
+                match UdpSocket::bind(socket_addr).await {
+                    Ok(listener) => {
+                        let bound_port = listener
+                            .local_addr()
+                            .ok()
+                            .map(|address| address.port())
+                            .or_else(|| audit_port(port));
+                        let id = caller
+                            .data_mut()
+                            .udp_resources_mut()
+                            .add(Arc::new(listener));
+                        lease.into_table_reservation();
+                        audit.set_target(redacted_network_target(
+                            AuditTargetKind::UdpSocket,
+                            Some(id),
+                            bound_port,
+                        ));
+                        (id, 0, AuditResult::Succeeded, AuditReason::Completed)
+                    }
+                    Err(error) => (
+                        caller.data_mut().add_error_resource(error.into()),
+                        1,
+                        AuditResult::Failed,
+                        AuditReason::RuntimeFailure,
+                    ),
                 }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
-            },
-            Err(error) => (caller.data_mut().add_error_resource(error), 1),
+            }
+            Err(error) => (
+                caller.data_mut().add_error_resource(error),
+                1,
+                AuditResult::Denied,
+                AuditReason::ResourceLimit,
+            ),
         };
         memory
             .write(
@@ -138,6 +180,8 @@ fn udp_bind<T: NetworkingCtx + ErrorCtx + Send>(
                 &udp_listener_or_error_id.to_le_bytes(),
             )
             .or_trap("lunatic::networking::udp_bind")?;
+
+        audit.finish(audit_result, audit_reason);
 
         Ok(result)
     })
@@ -315,8 +359,25 @@ fn udp_connect<T: NetworkingCtx + ErrorCtx + Send>(
     id_u64_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkConnect,
+            AuditAction::Connect,
+            redacted_network_target(
+                AuditTargetKind::UdpSocket,
+                Some(udp_socket_id),
+                audit_port(port),
+            ),
+        );
         // Get the memory and the socket being connected to
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::udp_connect",
+        )?;
         let socket_addr = socket_address(
             &caller,
             &memory,
@@ -332,27 +393,33 @@ fn udp_connect<T: NetworkingCtx + ErrorCtx + Send>(
             .get(udp_socket_id)
             .or_trap("lunatic::networking::udp_connect")?;
 
+        audit.set_fallback_reason(AuditReason::RuntimeFailure);
         let connect = socket.connect(socket_addr);
+        audit.mark_async();
         if let Ok(result) = match timeout_duration {
             // Without timeout
             u64::MAX => Ok(connect.await),
             // With timeout
             t => timeout(Duration::from_millis(t), connect).await,
         } {
-            let (opaque, return_) = match result {
-                Ok(()) => {
-                    audit_log("udp_connect", format!("peer={}", socket_addr));
-                    (0, 0)
-                }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+            let (opaque, return_, audit_result, audit_reason) = match result {
+                Ok(()) => (0, 0, AuditResult::Succeeded, AuditReason::Completed),
+                Err(error) => (
+                    caller.data_mut().add_error_resource(error.into()),
+                    1,
+                    AuditResult::Failed,
+                    AuditReason::RuntimeFailure,
+                ),
             };
 
             memory
                 .write(&mut caller, id_u64_ptr as usize, &opaque.to_le_bytes())
                 .or_trap("lunatic::networking::udp_connect")?;
+            audit.finish(audit_result, audit_reason);
             Ok(return_)
         } else {
             // Call timed out
+            audit.finish(AuditResult::Failed, AuditReason::TimedOut);
             Ok(9027)
         }
     })
@@ -478,7 +545,24 @@ fn udp_send_to<T: NetworkingCtx + ErrorCtx + Send>(
     opaque_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkSend,
+            AuditAction::SendTo,
+            redacted_network_target(
+                AuditTargetKind::UdpSocket,
+                Some(socket_id),
+                audit_port(port),
+            ),
+        );
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            opaque_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::udp_send_to",
+        )?;
         let socket_addr = socket_address(
             &caller,
             &memory,
@@ -500,15 +584,29 @@ fn udp_send_to<T: NetworkingCtx + ErrorCtx + Send>(
             .or_trap("lunatic::network::udp_send_to")?
             .clone();
 
-        let (opaque, return_) = match stream.send_to(buffer, socket_addr).await {
-            Ok(bytes) => (bytes as u64, 0),
-            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
-        };
+        audit.set_fallback_reason(AuditReason::RuntimeFailure);
+        audit.mark_async();
+        let (opaque, return_, audit_result, audit_reason) =
+            match stream.send_to(buffer, socket_addr).await {
+                Ok(bytes) => (
+                    bytes as u64,
+                    0,
+                    AuditResult::Succeeded,
+                    AuditReason::Completed,
+                ),
+                Err(error) => (
+                    caller.data_mut().add_error_resource(error.into()),
+                    1,
+                    AuditResult::Failed,
+                    AuditReason::RuntimeFailure,
+                ),
+            };
 
         let memory = get_memory(&mut caller)?;
         memory
             .write(&mut caller, opaque_ptr as usize, &opaque.to_le_bytes())
             .or_trap("lunatic::networking::udp_send_to")?;
+        audit.finish(audit_result, audit_reason);
         Ok(return_)
     })
 }

@@ -6,6 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use hash_map_id::HashMapId;
+use lunatic_common_api::{
+    emit_audit_event, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
+    AuditSubject, AuditTarget, AuditTargetKind,
+};
 use lunatic_distributed::{DistributedCtx, DistributedProcessState};
 use lunatic_error_api::{ErrorCtx, ErrorResource};
 use lunatic_networking_api::{
@@ -25,7 +29,7 @@ use lunatic_process_api::{ProcessConfigCtx, ProcessCtx};
 use lunatic_sqlite_api::{SQLiteConnections, SQLiteCtx, SQLiteGuestAllocators, SQLiteStatements};
 use lunatic_stdout_capture::StdoutCapture;
 use lunatic_timer_api::{TimerCtx, TimerResources};
-use lunatic_wasi_api::{build_wasi, LunaticWasiCtx};
+use lunatic_wasi_api::{build_wasi_with_audit, LunaticWasiCtx};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -351,8 +355,15 @@ impl DefaultProcessState {
             config.get_max_message_size(),
             config.get_max_message_resources(),
         );
+        let id = environment.get_next_process_id();
+        let mut audit_subject = AuditSubject::new()
+            .with_environment_id(environment.id())
+            .with_process_id(id);
+        if let Some(distributed) = distributed.as_ref() {
+            audit_subject = audit_subject.with_node_id(distributed.node_id());
+        }
         let state = Self {
-            id: environment.get_next_process_id(),
+            id,
             environment,
             distributed,
             runtime: Some(runtime),
@@ -362,10 +373,11 @@ impl DefaultProcessState {
             signal_mailbox,
             message_mailbox,
             resources: Resources::default(),
-            wasi: build_wasi(
+            wasi: build_wasi_with_audit(
                 Some(config.command_line_arguments()),
                 Some(config.environment_variables()),
                 config.preopened_dirs(),
+                audit_subject,
             )?,
             wasi_stdout: None,
             wasi_stderr: None,
@@ -398,8 +410,15 @@ impl ProcessState for DefaultProcessState {
             config.get_max_message_size(),
             config.get_max_message_resources(),
         );
+        let id = self.environment.get_next_process_id();
+        let mut audit_subject = AuditSubject::new()
+            .with_environment_id(self.environment.id())
+            .with_process_id(id);
+        if let Some(distributed) = self.distributed.as_ref() {
+            audit_subject = audit_subject.with_node_id(distributed.node_id());
+        }
         let state = Self {
-            id: self.environment.get_next_process_id(),
+            id,
             environment: self.environment.clone(),
             distributed: self.distributed.clone(),
             runtime: self.runtime.clone(),
@@ -409,10 +428,11 @@ impl ProcessState for DefaultProcessState {
             signal_mailbox,
             message_mailbox,
             resources: Resources::default(),
-            wasi: build_wasi(
+            wasi: build_wasi_with_audit(
                 Some(config.command_line_arguments()),
                 Some(config.environment_variables()),
                 config.preopened_dirs(),
+                audit_subject,
             )?,
             wasi_stdout: None,
             wasi_stderr: None,
@@ -436,6 +456,13 @@ impl ProcessState for DefaultProcessState {
             .validate_child_config(config.as_ref())
             .map_err(anyhow::Error::msg)?;
 
+        let mut audit_subject = AuditSubject::new()
+            .with_environment_id(self.environment.id())
+            .with_process_id(self.id);
+        if let Some(distributed) = self.distributed.as_ref() {
+            audit_subject = audit_subject.with_node_id(distributed.node_id());
+        }
+
         Ok(Self {
             id: self.id,
             environment: self.environment.clone(),
@@ -447,10 +474,11 @@ impl ProcessState for DefaultProcessState {
             signal_mailbox: self.signal_mailbox.clone(),
             message_mailbox: self.message_mailbox.clone(),
             resources: Resources::default(),
-            wasi: build_wasi(
+            wasi: build_wasi_with_audit(
                 Some(config.command_line_arguments()),
                 Some(config.environment_variables()),
                 config.preopened_dirs(),
+                audit_subject,
             )?,
             wasi_stdout: None,
             wasi_stderr: None,
@@ -504,6 +532,16 @@ impl ProcessState for DefaultProcessState {
 
     fn id(&self) -> u64 {
         self.id
+    }
+
+    fn audit_node_id(&self) -> Option<u64> {
+        self.distributed
+            .as_ref()
+            .map(DistributedProcessState::node_id)
+    }
+
+    fn audit_environment_id(&self) -> Option<u64> {
+        Some(self.environment.id())
     }
 
     fn signal_mailbox(&self) -> &(SignalSender, SignalReceiver) {
@@ -721,16 +759,14 @@ impl ProcessState for DefaultProcessState {
 
         if let Some((id, entry)) = snapshot.tls_streams.iter().next() {
             match entry {
-                ResourceSnapshot::TlsClientConnectionMetadata {
-                    server_name, port, ..
-                } => anyhow::bail!(
+                ResourceSnapshot::TlsClientConnectionMetadata { .. } => anyhow::bail!(
                     "serialized TLS client stream restoration is unsupported \
-                     (resource {id}, endpoint {server_name}:{port}); metadata \
+                     (resource {id}, endpoint redacted); metadata \
                      cannot recreate the original TLS/application byte stream"
                 ),
-                ResourceSnapshot::TlsServerConnectionMetadata { reason, .. } => anyhow::bail!(
+                ResourceSnapshot::TlsServerConnectionMetadata { .. } => anyhow::bail!(
                     "serialized TLS server stream restoration is unsupported \
-                     (resource {id}): {reason}"
+                     (resource {id}): reason redacted"
                 ),
                 other => anyhow::bail!(
                     "serialized TLS stream restoration is unsupported \
@@ -914,7 +950,24 @@ impl ResourceLimiter for DefaultProcessState {
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(desired <= self.config().get_max_memory())
+        let allowed = desired <= self.config().get_max_memory();
+        if !allowed {
+            let mut subject = AuditSubject::new()
+                .with_environment_id(self.environment.id())
+                .with_process_id(self.id);
+            if let Some(distributed) = self.distributed.as_ref() {
+                subject = subject.with_node_id(distributed.node_id());
+            }
+            emit_audit_event(AuditEventV1::new(
+                AuditEvent::ResourceLimitDenied,
+                AuditAction::Grow,
+                AuditResult::Denied,
+                AuditReason::ResourceLimit,
+                subject,
+                AuditTarget::new(AuditTargetKind::Memory),
+            ));
+        }
+        Ok(allowed)
     }
 
     fn table_growing(
@@ -923,7 +976,24 @@ impl ResourceLimiter for DefaultProcessState {
         desired: usize,
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        Ok(desired <= self.config().get_max_table_elements() as usize)
+        let allowed = desired <= self.config().get_max_table_elements() as usize;
+        if !allowed {
+            let mut subject = AuditSubject::new()
+                .with_environment_id(self.environment.id())
+                .with_process_id(self.id);
+            if let Some(distributed) = self.distributed.as_ref() {
+                subject = subject.with_node_id(distributed.node_id());
+            }
+            emit_audit_event(AuditEventV1::new(
+                AuditEvent::ResourceLimitDenied,
+                AuditAction::Grow,
+                AuditResult::Denied,
+                AuditReason::ResourceLimit,
+                subject,
+                AuditTarget::new(AuditTargetKind::Table),
+            ));
+        }
+        Ok(allowed)
     }
 
     // Allow one instance per store
@@ -1023,6 +1093,20 @@ impl NetworkingCtx for DefaultProcessState {
 
     fn dns_resources_mut(&mut self) -> &mut lunatic_networking_api::DnsResources {
         &mut self.resources.dns_iterators
+    }
+
+    fn audit_node_id(&self) -> Option<u64> {
+        self.distributed
+            .as_ref()
+            .map(DistributedProcessState::node_id)
+    }
+
+    fn audit_environment_id(&self) -> Option<u64> {
+        Some(self.environment.id())
+    }
+
+    fn audit_process_id(&self) -> Option<u64> {
+        Some(self.id)
     }
 
     fn network_handle_quota(&self) -> Option<Arc<dyn NetworkHandleQuota>> {
@@ -1175,8 +1259,13 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             config.get_max_message_size(),
             config.get_max_message_resources(),
         );
+        let id = environment.get_next_process_id();
+        let audit_subject = AuditSubject::new()
+            .with_node_id(distributed.node_id())
+            .with_environment_id(environment.id())
+            .with_process_id(id);
         let state = Self {
-            id: environment.get_next_process_id(),
+            id,
             environment,
             distributed: Some(distributed),
             runtime: Some(runtime),
@@ -1186,10 +1275,11 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             signal_mailbox,
             message_mailbox,
             resources: Resources::default(),
-            wasi: build_wasi(
+            wasi: build_wasi_with_audit(
                 Some(config.command_line_arguments()),
                 Some(config.environment_variables()),
                 config.preopened_dirs(),
+                audit_subject,
             )?,
             wasi_stdout: None,
             wasi_stderr: None,

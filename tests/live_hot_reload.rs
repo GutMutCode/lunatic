@@ -1,6 +1,15 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{bail, Context, Result};
+use lunatic_common_api::{
+    install_global_audit_dispatcher, AuditAction, AuditConfig, AuditDispatcher, AuditEvent,
+    AuditEventV1, AuditFlushOutcome, AuditReason, AuditResult, AuditSink, SensitiveData,
+};
 use lunatic_process::{
     env::{Environment, Environments, LunaticEnvironment, LunaticEnvironments},
     hot_reload::{ReloadCoordinator, ReloadStatus},
@@ -27,6 +36,15 @@ const ALL_ACK_DELAY_MS: u64 = 1_000;
 const APPLY_TIMEOUT: Duration = Duration::from_millis(1_000);
 const LATE_APPLY_DELAY_MS: u64 = 2_500;
 const ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct RecordingAuditSink(Arc<Mutex<Vec<AuditEventV1>>>);
+
+impl AuditSink for RecordingAuditSink {
+    fn write(&mut self, event: &AuditEventV1) -> io::Result<()> {
+        self.0.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
 
 const GUEST_V1: &str = r#"
 (module
@@ -331,6 +349,13 @@ fn acknowledgement_ids(status: &ReloadStatus) -> Vec<u64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_atomic_reload_waits_for_acks_and_restores_every_process() -> Result<()> {
+    let audit_events = Arc::new(Mutex::new(Vec::new()));
+    install_global_audit_dispatcher(AuditDispatcher::new(
+        AuditConfig::default(),
+        RecordingAuditSink(Arc::clone(&audit_events)),
+    ))
+    .map_err(|_| anyhow::anyhow!("audit dispatcher was initialized before the test"))?;
+
     let runtime = WasmtimeRuntime::new(&default_config())?;
     let module_registry = Arc::new(ModuleRegistry::<DefaultProcessState>::with_max_versions(8));
     let initial_module = runtime.compile_module(wat::parse_str(GUEST_V1)?.into())?;
@@ -643,5 +668,60 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
     assert_eq!(module_registry.process_count(MODULE_ID, 1), Some(0));
 
     environment.remove_process(observer.id());
+
+    assert_eq!(
+        lunatic_common_api::flush_audit(Duration::from_secs(2)),
+        AuditFlushOutcome::Flushed
+    );
+    let audit_events = audit_events.lock().unwrap();
+    let reload_events = audit_events
+        .iter()
+        .filter(|event| {
+            event.event() == AuditEvent::HotReloadUpdate
+                && event.subject().environment_id() == Some(environment.id())
+                && event.target().resource_id() == Some(MODULE_ID)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reload_events.len(),
+        5,
+        "each public reload attempt must emit exactly one terminal event"
+    );
+    assert_eq!(
+        reload_events
+            .iter()
+            .map(|event| (event.action(), event.result(), event.reason()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                AuditAction::Commit,
+                AuditResult::Succeeded,
+                AuditReason::Completed,
+            ),
+            (
+                AuditAction::Rollback,
+                AuditResult::Failed,
+                AuditReason::ReloadNack,
+            ),
+            (
+                AuditAction::Rollback,
+                AuditResult::Failed,
+                AuditReason::ReloadNack,
+            ),
+            (
+                AuditAction::InDoubt,
+                AuditResult::Failed,
+                AuditReason::RollbackFailed,
+            ),
+            (
+                AuditAction::Commit,
+                AuditResult::Denied,
+                AuditReason::Conflict,
+            ),
+        ]
+    );
+    assert!(reload_events
+        .iter()
+        .all(|event| event.target().sensitive_data() == SensitiveData::Redacted));
     Ok(())
 }

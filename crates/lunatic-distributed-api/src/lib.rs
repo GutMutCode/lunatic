@@ -2,7 +2,11 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use asn1_rs::ToDer;
-use lunatic_common_api::{audit_log, get_memory, write_to_guest_vec, IntoTrap, LinkerAsyncExt};
+use lunatic_common_api::{
+    emit_audit_event, get_memory, write_to_guest_vec, AuditAction, AuditEvent, AuditEventV1,
+    AuditReason, AuditResult, AuditSubject, AuditTarget, AuditTargetKind, IntoTrap, LinkerAsyncExt,
+    SensitiveData,
+};
 use lunatic_distributed::{
     control::cert::CertificateAuthority,
     distributed::{
@@ -18,6 +22,68 @@ use lunatic_process_api::ProcessCtx;
 use rcgen::{CertificateSigningRequestParams, CustomExtension};
 use tokio::time::timeout;
 use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _};
+
+struct PendingDistributedAudit {
+    event: Option<AuditEvent>,
+    action: AuditAction,
+    subject: AuditSubject,
+    target: AuditTarget,
+    fallback_result: AuditResult,
+    fallback_reason: AuditReason,
+}
+
+impl PendingDistributedAudit {
+    fn new(
+        event: AuditEvent,
+        action: AuditAction,
+        subject: AuditSubject,
+        target: AuditTarget,
+        fallback_reason: AuditReason,
+    ) -> Self {
+        Self {
+            event: Some(event),
+            action,
+            subject,
+            target,
+            fallback_result: AuditResult::Failed,
+            fallback_reason,
+        }
+    }
+
+    fn mark_async(&mut self) {
+        self.fallback_result = AuditResult::Cancelled;
+        self.fallback_reason = AuditReason::Cancelled;
+    }
+
+    fn finish(mut self, result: AuditResult, reason: AuditReason) {
+        self.emit(result, reason, None);
+    }
+
+    fn finish_with_target(mut self, result: AuditResult, reason: AuditReason, target: AuditTarget) {
+        self.emit(result, reason, Some(target));
+    }
+
+    fn emit(&mut self, result: AuditResult, reason: AuditReason, target: Option<AuditTarget>) {
+        if let Some(event) = self.event.take() {
+            emit_audit_event(AuditEventV1::new(
+                event,
+                self.action,
+                result,
+                reason,
+                self.subject,
+                target.unwrap_or(self.target),
+            ));
+        }
+    }
+}
+
+impl Drop for PendingDistributedAudit {
+    fn drop(&mut self) {
+        if self.event.is_some() {
+            self.emit(self.fallback_result, self.fallback_reason, None);
+        }
+    }
+}
 
 // Register the lunatic distributed APIs to the linker
 pub fn register<T, E>(linker: &mut Linker<T>) -> Result<()>
@@ -404,7 +470,25 @@ where
     for<'a> &'a T: Send,
 {
     Box::new(async move {
+        let state = caller.data();
+        let mut subject = AuditSubject::new()
+            .with_environment_id(state.environment_id())
+            .with_process_id(state.id());
+        if let Ok(distributed) = state.distributed() {
+            subject = subject.with_node_id(distributed.node_id());
+        }
+        let mut audit = PendingDistributedAudit::new(
+            AuditEvent::DistributedRequestAuthorization,
+            AuditAction::Spawn,
+            subject,
+            AuditTarget::new(AuditTargetKind::DistributedRequest)
+                .with_node_id(node_id)
+                .with_resource_id(module_id)
+                .with_sensitive_data(SensitiveData::Redacted),
+            AuditReason::InvalidInput,
+        );
         if !caller.data().can_spawn() {
+            audit.finish(AuditResult::Denied, AuditReason::CapabilityDenied);
             return return_spawn_error(
                 &mut caller,
                 id_ptr,
@@ -450,13 +534,7 @@ where
                     .or_trap("lunatic::distributed::spawn: Config ID doesn't exist")?
                     .clone();
                 if let Err(reason) = state.config().validate_child_config(&config) {
-                    audit_log(
-                        "capability_delegation",
-                        format!(
-                            "parent_process={} config_id={} operation=distributed_spawn outcome=denied",
-                            state.id(), config_id
-                        ),
-                    );
+                    audit.finish(AuditResult::Denied, AuditReason::DelegationExceedsParent);
                     return return_spawn_error(
                         &mut caller,
                         id_ptr,
@@ -468,14 +546,7 @@ where
             }
         };
         if let Err(reason) = config.validate_distributed_config() {
-            audit_log(
-                "capability_delegation",
-                format!(
-                    "parent_process={} config_id={} operation=distributed_spawn outcome=denied",
-                    state.id(),
-                    config_id
-                ),
-            );
+            audit.finish(AuditResult::Denied, AuditReason::DelegationDenied);
             return return_spawn_error(
                 &mut caller,
                 id_ptr,
@@ -483,18 +554,13 @@ where
                 anyhow!("lunatic::distributed::spawn: remote config denied: {reason}"),
             );
         }
-        audit_log(
-            "capability_delegation",
-            format!(
-                "parent_process={} config_id={} operation=distributed_spawn outcome=allowed",
-                state.id(),
-                config_id
-            ),
-        );
         let config: Vec<u8> =
             rmp_serde::to_vec(config.as_ref()).map_err(|_| anyhow!("Error serializing config"))?;
 
-        log::debug!("Spawn on node {node_id}, mod {module_id}, fn {function}, params {params:?}");
+        log::debug!(
+            "Requesting spawn on node {node_id}, module {module_id}, with {} parameter(s)",
+            params.len()
+        );
 
         let self_node_id = state.distributed()?.node_id();
         let spawn_params = SpawnParams {
@@ -511,21 +577,53 @@ where
             },
         };
         let node_client = state.distributed()?.node_client.clone();
-        let spawn_response = node_client
-            .spawn(spawn_params)
-            .await
-            .map(|message_id| node_client.await_response(message_id))?
-            .await?;
+        audit.mark_async();
+        let message_id = match node_client.spawn(spawn_params).await {
+            Ok(message_id) => message_id,
+            Err(error) => {
+                audit.finish(AuditResult::Failed, AuditReason::IoError);
+                return Err(error);
+            }
+        };
+        let spawn_response = match node_client.await_response(message_id).await {
+            Ok(response) => response,
+            Err(error) => {
+                audit.finish(AuditResult::Failed, AuditReason::IoError);
+                return Err(error);
+            }
+        };
         let (process_or_error_id, ret) = match spawn_response {
-            distributed::message::ResponseContent::Spawned(process_id) => Ok((process_id, 0)),
+            distributed::message::ResponseContent::Spawned(process_id) => {
+                audit.finish_with_target(
+                    AuditResult::Succeeded,
+                    AuditReason::Completed,
+                    AuditTarget::new(AuditTargetKind::Process)
+                        .with_node_id(node_id)
+                        .with_environment_id(state.environment_id())
+                        .with_process_id(process_id)
+                        .with_sensitive_data(SensitiveData::Redacted),
+                );
+                Ok((process_id, 0))
+            }
             distributed::message::ResponseContent::Error(error) => {
-                let (code, message): (u32, String) = match error {
-                    ClientError::Unexpected(cause) => (3, cause),
-                    ClientError::Connection(cause) => (9027, cause),
-                    ClientError::NodeNotFound => (1, "Node does not exist.".to_string()),
-                    ClientError::ModuleNotFound => (2, "Module does not exist.".to_string()),
-                    ClientError::ProcessNotFound => (4, "Process does not exist.".to_string()),
+                let (code, message, reason): (u32, String, AuditReason) = match error {
+                    ClientError::Unexpected(cause) => (3, cause, AuditReason::RuntimeFailure),
+                    ClientError::Connection(cause) => (9027, cause, AuditReason::IoError),
+                    ClientError::NodeNotFound => {
+                        (1, "Node does not exist.".to_string(), AuditReason::NotFound)
+                    }
+                    ClientError::ModuleNotFound => (
+                        2,
+                        "Module does not exist.".to_string(),
+                        AuditReason::NotFound,
+                    ),
+                    ClientError::ProcessNotFound => (
+                        4,
+                        "Process does not exist.".to_string(),
+                        AuditReason::NotFound,
+                    ),
                 };
+                audit.finish(AuditResult::Failed, reason);
                 Ok((caller.data_mut().add_error_resource(anyhow!(message)), code))
             }
             _ => Err(anyhow!("unreachable")),

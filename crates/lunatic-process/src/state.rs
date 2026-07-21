@@ -53,6 +53,10 @@ fn ensure_registry_insert_capacity_with_limit(
     max_entries: usize,
 ) -> Result<()> {
     anyhow::ensure!(
+        !name.chars().any(char::is_control),
+        "Registry names cannot contain control characters"
+    );
+    anyhow::ensure!(
         name.len() <= MAX_REGISTRY_NAME_BYTES,
         "Registry name is {} bytes; maximum is {} bytes",
         name.len(),
@@ -703,6 +707,14 @@ pub trait ProcessState: Sized + crate::reloadable_state::ReloadableState {
 
     // Returns process ID
     fn id(&self) -> u64;
+    /// Returns the node identity attached to audit events, when known.
+    fn audit_node_id(&self) -> Option<u64> {
+        None
+    }
+    /// Returns the environment identity attached to audit events, when known.
+    fn audit_environment_id(&self) -> Option<u64> {
+        None
+    }
     // Returns signal mailbox
     fn signal_mailbox(&self) -> &(SignalSender, SignalReceiver);
     // Returns message mailbox
@@ -778,6 +790,22 @@ mod tests {
                 .to_string()
                 .contains("Registry name")
         );
+    }
+
+    #[test]
+    fn registry_admission_rejects_control_characters_without_echoing_the_name() {
+        for name in [
+            "line\nbreak",
+            "nul\0byte",
+            "escape\u{1b}[31m",
+            "unicode\u{85}next",
+        ] {
+            let error = ensure_registry_insert_capacity_with_limit(&HashMap::new(), name, 1)
+                .expect_err("control characters must be rejected")
+                .to_string();
+            assert_eq!(error, "Registry names cannot contain control characters");
+            assert!(!error.contains(name));
+        }
     }
 
     #[tokio::test]

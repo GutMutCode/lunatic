@@ -12,11 +12,17 @@ use tokio::{
 };
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
-use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
+use lunatic_common_api::{
+    get_memory, AuditAction, AuditEvent, AuditReason, AuditResult, AuditTargetKind, IntoTrap,
+    LinkerAsyncExt,
+};
 use lunatic_error_api::ErrorCtx;
 
 use crate::dns::DnsIterator;
-use crate::{socket_address, validate_memory_range, NetworkingCtx, TcpConnection};
+use crate::{
+    audit_port, redacted_network_target, socket_address, validate_memory_range, NetworkingCtx,
+    PendingNetworkAudit, TcpConnection,
+};
 
 // Register TCP networking APIs to the linker
 pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
@@ -101,7 +107,20 @@ fn tcp_bind<T: NetworkingCtx + ErrorCtx + Send>(
     id_u64_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkBind,
+            AuditAction::Bind,
+            redacted_network_target(AuditTargetKind::TcpListener, None, audit_port(port)),
+        );
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tcp_bind",
+        )?;
         let socket_addr = socket_address(
             &caller,
             &memory,
@@ -112,17 +131,40 @@ fn tcp_bind<T: NetworkingCtx + ErrorCtx + Send>(
             scope_id,
         )?;
         let lease = caller.data().reserve_network_handle_lease();
-        let (tcp_listener_or_error_id, result) = match lease {
-            Ok(lease) => match TcpListener::bind(socket_addr).await {
-                Ok(listener) => {
-                    audit_log("tcp_bind", format!("address={}", socket_addr));
-                    let id = caller.data_mut().tcp_listener_resources_mut().add(listener);
-                    lease.into_table_reservation();
-                    (id, 0)
+        let (tcp_listener_or_error_id, result, audit_result, audit_reason) = match lease {
+            Ok(lease) => {
+                audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                audit.mark_async();
+                match TcpListener::bind(socket_addr).await {
+                    Ok(listener) => {
+                        let bound_port = listener
+                            .local_addr()
+                            .ok()
+                            .map(|address| address.port())
+                            .or_else(|| audit_port(port));
+                        let id = caller.data_mut().tcp_listener_resources_mut().add(listener);
+                        lease.into_table_reservation();
+                        audit.set_target(redacted_network_target(
+                            AuditTargetKind::TcpListener,
+                            Some(id),
+                            bound_port,
+                        ));
+                        (id, 0, AuditResult::Succeeded, AuditReason::Completed)
+                    }
+                    Err(error) => (
+                        caller.data_mut().add_error_resource(error.into()),
+                        1,
+                        AuditResult::Failed,
+                        AuditReason::RuntimeFailure,
+                    ),
                 }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
-            },
-            Err(error) => (caller.data_mut().add_error_resource(error), 1),
+            }
+            Err(error) => (
+                caller.data_mut().add_error_resource(error),
+                1,
+                AuditResult::Denied,
+                AuditReason::ResourceLimit,
+            ),
         };
         memory
             .write(
@@ -131,6 +173,8 @@ fn tcp_bind<T: NetworkingCtx + ErrorCtx + Send>(
                 &tcp_listener_or_error_id.to_le_bytes(),
             )
             .or_trap("lunatic::networking::create_environment")?;
+
+        audit.finish(audit_result, audit_reason);
 
         Ok(result)
     })
@@ -225,6 +269,12 @@ fn tcp_accept<T: NetworkingCtx + ErrorCtx + Send>(
     socket_addr_id_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkAccept,
+            AuditAction::Accept,
+            redacted_network_target(AuditTargetKind::TcpListener, Some(listener_id), None),
+        );
         caller
             .data()
             .tcp_listener_resources()
@@ -255,33 +305,58 @@ fn tcp_accept<T: NetworkingCtx + ErrorCtx + Send>(
                     .reserve_dns_iterator_lease()
                     .map(|dns| (network, dns))
             });
-        let (tcp_stream_or_error_id, peer_addr_iter, result) = match leases {
-            Ok((network_lease, dns_lease)) => {
-                let accept = caller
-                    .data()
-                    .tcp_listener_resources()
-                    .get(listener_id)
-                    .expect("validated TCP listener must remain in the resource table")
-                    .accept()
-                    .await;
-                match accept {
-                    Ok((stream, socket_addr)) => {
-                        let stream_id = caller
-                            .data_mut()
-                            .tcp_stream_resources_mut()
-                            .add(Arc::new(TcpConnection::new(stream)));
-                        network_lease.into_table_reservation();
-                        let iterator =
-                            DnsIterator::with_lease(vec![socket_addr].into_iter(), dns_lease);
-                        let dns_iter_id = caller.data_mut().dns_resources_mut().add(iterator);
-                        audit_log("tcp_accept", format!("peer={}", socket_addr));
-                        (stream_id, dns_iter_id, 0)
+        let (tcp_stream_or_error_id, peer_addr_iter, result, audit_result, audit_reason) =
+            match leases {
+                Ok((network_lease, dns_lease)) => {
+                    audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                    audit.mark_async();
+                    let accept = caller
+                        .data()
+                        .tcp_listener_resources()
+                        .get(listener_id)
+                        .expect("validated TCP listener must remain in the resource table")
+                        .accept()
+                        .await;
+                    match accept {
+                        Ok((stream, socket_addr)) => {
+                            let stream_id = caller
+                                .data_mut()
+                                .tcp_stream_resources_mut()
+                                .add(Arc::new(TcpConnection::new(stream)));
+                            network_lease.into_table_reservation();
+                            let iterator =
+                                DnsIterator::with_lease(vec![socket_addr].into_iter(), dns_lease);
+                            let dns_iter_id = caller.data_mut().dns_resources_mut().add(iterator);
+                            audit.set_target(redacted_network_target(
+                                AuditTargetKind::TcpStream,
+                                Some(stream_id),
+                                Some(socket_addr.port()),
+                            ));
+                            (
+                                stream_id,
+                                dns_iter_id,
+                                0,
+                                AuditResult::Succeeded,
+                                AuditReason::Completed,
+                            )
+                        }
+                        Err(error) => (
+                            caller.data_mut().add_error_resource(error.into()),
+                            0,
+                            1,
+                            AuditResult::Failed,
+                            AuditReason::RuntimeFailure,
+                        ),
                     }
-                    Err(error) => (caller.data_mut().add_error_resource(error.into()), 0, 1),
                 }
-            }
-            Err(error) => (caller.data_mut().add_error_resource(error), 0, 1),
-        };
+                Err(error) => (
+                    caller.data_mut().add_error_resource(error),
+                    0,
+                    1,
+                    AuditResult::Denied,
+                    AuditReason::ResourceLimit,
+                ),
+            };
 
         memory
             .write(
@@ -297,6 +372,7 @@ fn tcp_accept<T: NetworkingCtx + ErrorCtx + Send>(
                 &peer_addr_iter.to_le_bytes(),
             )
             .or_trap("lunatic::networking::tcp_accept")?;
+        audit.finish(audit_result, audit_reason);
         Ok(result)
     })
 }
@@ -324,7 +400,20 @@ fn tcp_connect<T: NetworkingCtx + ErrorCtx + Send>(
     id_u64_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkConnect,
+            AuditAction::Connect,
+            redacted_network_target(AuditTargetKind::TcpStream, None, audit_port(port)),
+        );
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tcp_connect",
+        )?;
         let socket_addr = socket_address(
             &caller,
             &memory,
@@ -342,27 +431,39 @@ fn tcp_connect<T: NetworkingCtx + ErrorCtx + Send>(
                 memory
                     .write(&mut caller, id_u64_ptr as usize, &error_id.to_le_bytes())
                     .or_trap("lunatic::networking::tcp_connect")?;
+                audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
                 return Ok(1);
             }
         };
+        audit.set_fallback_reason(AuditReason::RuntimeFailure);
         let connect = TcpStream::connect(socket_addr);
+        audit.mark_async();
         if let Ok(result) = match timeout_duration {
             // Without timeout
             u64::MAX => Ok(connect.await),
             // With timeout
             t => timeout(Duration::from_millis(t), connect).await,
         } {
-            let (stream_or_error_id, result) = match result {
+            let (stream_or_error_id, result, audit_result, audit_reason) = match result {
                 Ok(stream) => {
                     let id = caller
                         .data_mut()
                         .tcp_stream_resources_mut()
                         .add(Arc::new(TcpConnection::new(stream)));
                     lease.into_table_reservation();
-                    audit_log("tcp_connect", format!("peer={}", socket_addr));
-                    (id, 0)
+                    audit.set_target(redacted_network_target(
+                        AuditTargetKind::TcpStream,
+                        Some(id),
+                        Some(socket_addr.port()),
+                    ));
+                    (id, 0, AuditResult::Succeeded, AuditReason::Completed)
                 }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+                Err(error) => (
+                    caller.data_mut().add_error_resource(error.into()),
+                    1,
+                    AuditResult::Failed,
+                    AuditReason::RuntimeFailure,
+                ),
             };
 
             memory
@@ -372,9 +473,11 @@ fn tcp_connect<T: NetworkingCtx + ErrorCtx + Send>(
                     &stream_or_error_id.to_le_bytes(),
                 )
                 .or_trap("lunatic::networking::tcp_connect")?;
+            audit.finish(audit_result, audit_reason);
             Ok(result)
         } else {
             // Call timed out
+            audit.finish(AuditResult::Failed, AuditReason::TimedOut);
             Ok(9027)
         }
     })

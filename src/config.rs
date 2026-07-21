@@ -82,12 +82,21 @@ impl Default for DefaultProcessConfig {
 
 impl Debug for DefaultProcessConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        f.debug_struct("EnvConfig")
+        f.debug_struct("DefaultProcessConfig")
             .field("max_memory", &self.max_memory)
             .field("max_fuel", &self.max_fuel)
-            .field("preopened_dirs", &self.preopened_dirs)
-            .field("args", &self.command_line_arguments)
-            .field("envs", &self.environment_variables)
+            .field("can_compile_modules", &self.can_compile_modules)
+            .field("can_create_configs", &self.can_create_configs)
+            .field("can_spawn_processes", &self.can_spawn_processes)
+            .field("preopened_dir_count", &self.preopened_dirs.len())
+            .field("argument_count", &self.command_line_arguments.len())
+            .field(
+                "environment_variable_count",
+                &self.environment_variables.len(),
+            )
+            .field("max_table_elements", &self.max_table_elements)
+            .field("max_file_descriptors", &self.max_file_descriptors)
+            .field("max_network_connections", &self.max_network_connections)
             .field("max_mailbox_messages", &self.max_mailbox_messages)
             .field("max_signal_queue", &self.max_signal_queue)
             .field("max_message_size", &self.max_message_size)
@@ -668,6 +677,24 @@ mod tests {
         assert!(!config.can_create_configs());
         assert!(!config.can_spawn_processes());
         assert!(config.preopened_dirs().is_empty());
+    }
+
+    #[test]
+    fn config_debug_reports_counts_without_secret_values() {
+        let config = DefaultProcessConfig {
+            command_line_arguments: vec!["argument-sentinel".to_owned()],
+            environment_variables: vec![("TOKEN".to_owned(), "secret-sentinel".to_owned())],
+            preopened_dirs: vec![("guest".to_owned(), "/private/sentinel".to_owned())],
+            ..DefaultProcessConfig::default()
+        };
+
+        let debug = format!("{config:?}");
+        assert!(debug.contains("argument_count: 1"));
+        assert!(debug.contains("environment_variable_count: 1"));
+        assert!(debug.contains("preopened_dir_count: 1"));
+        assert!(!debug.contains("argument-sentinel"));
+        assert!(!debug.contains("secret-sentinel"));
+        assert!(!debug.contains("/private/sentinel"));
     }
 
     #[test]

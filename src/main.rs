@@ -4,8 +4,10 @@ mod mode;
 use mode::{cargo_test, execution};
 
 use anyhow::Result;
+use lunatic_common_api::{close_audit, AuditFlushOutcome};
 use regex::Regex;
 use std::collections::VecDeque;
+use std::time::Duration;
 use std::{env, path::PathBuf};
 
 // Lunatic versions under 0.13 implied run
@@ -75,9 +77,16 @@ async fn main() -> Result<()> {
         Err(_) => false,
     };
 
-    if cargo_test {
+    let result = if cargo_test {
         cargo_test::test(augmented_args).await
     } else {
         execution::execute(augmented_args).await
+    };
+
+    let flush = close_audit(Duration::from_millis(250));
+    if !matches!(flush, AuditFlushOutcome::Flushed) {
+        log::warn!(target: "lunatic.audit", "audit shutdown flush ended with {flush:?}");
     }
+
+    result
 }

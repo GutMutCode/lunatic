@@ -2,11 +2,15 @@ use super::client::{Client, Inner};
 use super::global_process_id::GlobalProcessId;
 use super::registry::{DistributedRegistry, ProcessName};
 use anyhow::{anyhow, Result};
+use lunatic_common_api::{
+    emit_audit_event, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
+    AuditSubject, AuditTarget, AuditTargetKind, SensitiveData,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
+use std::{collections::HashMap, fmt};
 use tokio::sync::{oneshot, Mutex, Notify};
 
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -15,6 +19,28 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const NETWORK_SEND_TIMEOUT: Duration = Duration::from_millis(500);
 
 type RegistrySnapshot = Vec<(String, GlobalProcessId, u64)>;
+
+#[derive(Debug)]
+struct RegistryConflictError(String);
+
+impl fmt::Display for RegistryConflictError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RegistryConflictError {}
+
+#[derive(Debug)]
+struct RegistryTimeoutError(String);
+
+impl fmt::Display for RegistryTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RegistryTimeoutError {}
 
 /// Messages exchanged over the authenticated node-to-node QUIC transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +126,60 @@ struct PendingVotes {
     notify: Arc<Notify>,
 }
 
+struct PendingRegistryAudit {
+    subject: AuditSubject,
+    target: AuditTarget,
+    emitted: bool,
+}
+
+impl PendingRegistryAudit {
+    fn new(node_id: u64, global_pid: GlobalProcessId) -> Self {
+        Self {
+            subject: AuditSubject::new().with_node_id(node_id),
+            target: AuditTarget::new(AuditTargetKind::DistributedRegistry)
+                .with_node_id(global_pid.node_id())
+                .with_environment_id(global_pid.environment_id())
+                .with_process_id(global_pid.process_id())
+                .with_sensitive_data(SensitiveData::Redacted),
+            emitted: false,
+        }
+    }
+
+    fn finish(mut self, result: AuditResult, reason: AuditReason) {
+        self.emit(result, reason);
+    }
+
+    fn emit(&mut self, result: AuditResult, reason: AuditReason) {
+        emit_audit_event(AuditEventV1::new(
+            AuditEvent::DistributedRegistryChange,
+            AuditAction::Register,
+            result,
+            reason,
+            self.subject,
+            self.target,
+        ));
+        self.emitted = true;
+    }
+}
+
+fn classify_registration_error(error: &anyhow::Error) -> (AuditResult, AuditReason) {
+    if error.downcast_ref::<RegistryConflictError>().is_some() {
+        (AuditResult::Denied, AuditReason::Conflict)
+    } else if error.downcast_ref::<RegistryTimeoutError>().is_some() {
+        (AuditResult::Failed, AuditReason::TimedOut)
+    } else {
+        (AuditResult::Failed, AuditReason::RuntimeFailure)
+    }
+}
+
+impl Drop for PendingRegistryAudit {
+    fn drop(&mut self) {
+        if !self.emitted {
+            self.emit(AuditResult::Cancelled, AuditReason::Cancelled);
+        }
+    }
+}
+
 /// Coordinates cluster-wide process names through a stable leader and quorum.
 ///
 /// The lowest node ID in the current control-plane membership is the coordinator.
@@ -174,9 +254,10 @@ impl RegistryCoordinator {
         .await
         {
             Ok(result) => result,
-            Err(_) => Err(anyhow!(
+            Err(_) => Err(RegistryTimeoutError(format!(
                 "Timed out sending registry coordination message to node {node_id}"
-            )),
+            ))
+            .into()),
         }
     }
 
@@ -190,7 +271,24 @@ impl RegistryCoordinator {
         global_pid: GlobalProcessId,
         node_count: usize,
     ) -> Result<()> {
-        let name = name.into();
+        let audit = PendingRegistryAudit::new(self.node_id, global_pid);
+        let result = self
+            .register_global_coordinated_inner(name.into(), global_pid, node_count)
+            .await;
+        let (audit_result, reason) = match &result {
+            Ok(()) => (AuditResult::Succeeded, AuditReason::Completed),
+            Err(error) => classify_registration_error(error),
+        };
+        audit.finish(audit_result, reason);
+        result
+    }
+
+    async fn register_global_coordinated_inner(
+        &self,
+        name: ProcessName,
+        global_pid: GlobalProcessId,
+        node_count: usize,
+    ) -> Result<()> {
         let name_string = name.as_str().to_string();
         if let Some(existing) = self.registry.lookup_global(name.as_str()) {
             return Err(already_registered_error(&name_string, existing.global_pid));
@@ -203,12 +301,12 @@ impl RegistryCoordinator {
                 .expect("registry client lock poisoned")
                 .is_none()
         {
-            return self.registry.register_global(name, global_pid);
+            return self.registry.register_global_untracked(name, global_pid);
         }
 
         let members = self.members()?;
         if members.len() <= 1 {
-            return self.registry.register_global(name, global_pid);
+            return self.registry.register_global_untracked(name, global_pid);
         }
         let leader = members[0];
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -240,9 +338,10 @@ impl RegistryCoordinator {
                 }
                 Err(_) => {
                     self.pending_callers.lock().await.remove(&request_id);
-                    return Err(anyhow!(
-                        "Global registration timed out waiting for coordinator"
-                    ));
+                    return Err(RegistryTimeoutError(
+                        "Global registration timed out waiting for coordinator".into(),
+                    )
+                    .into());
                 }
             }
         };
@@ -379,6 +478,7 @@ impl RegistryCoordinator {
                 global_pid,
             } => {
                 if source_node_id != requesting_node_id {
+                    self.audit_protocol_denial();
                     return Err(anyhow!(
                         "Registry request source did not match requesting node"
                     ));
@@ -404,6 +504,7 @@ impl RegistryCoordinator {
                 global_pid,
             } => {
                 if source_node_id != self.leader()? {
+                    self.audit_protocol_denial();
                     return Err(anyhow!(
                         "Registry prepare did not come from the coordinator"
                     ));
@@ -420,6 +521,7 @@ impl RegistryCoordinator {
                 result,
             } => {
                 if source_node_id != responding_node_id {
+                    self.audit_protocol_denial();
                     return Err(anyhow!(
                         "Registry response source did not match responding node"
                     ));
@@ -429,6 +531,7 @@ impl RegistryCoordinator {
             }
             RegistryCoordinationMessage::GlobalRegisterDecision { request_id, result } => {
                 if source_node_id != self.leader()? {
+                    self.audit_protocol_denial();
                     return Err(anyhow!(
                         "Registry decision did not come from the coordinator"
                     ));
@@ -443,6 +546,7 @@ impl RegistryCoordinator {
                 registered_at,
             } => {
                 if source_node_id != self.leader()? {
+                    self.audit_protocol_denial();
                     return Err(anyhow!("Registry commit did not come from the coordinator"));
                 }
                 self.handle_register_notify(name, global_pid, registered_at)
@@ -453,6 +557,10 @@ impl RegistryCoordinator {
                 requesting_node_id,
                 name,
             } => {
+                if source_node_id != requesting_node_id || self.leader()? != self.node_id {
+                    self.audit_protocol_denial();
+                    return Err(anyhow!("Invalid global unregistration request"));
+                }
                 let response = self
                     .handle_unregister_request(request_id, requesting_node_id, name)
                     .await;
@@ -460,6 +568,12 @@ impl RegistryCoordinator {
             }
             RegistryCoordinationMessage::GlobalUnregisterResponse { .. } => {}
             RegistryCoordinationMessage::GlobalUnregisterNotify { name } => {
+                if source_node_id != self.leader()? {
+                    self.audit_protocol_denial();
+                    return Err(anyhow!(
+                        "Registry unregistration did not come from the coordinator"
+                    ));
+                }
                 self.handle_unregister_notify(name).await?;
             }
             RegistryCoordinationMessage::RegistrySyncRequest {
@@ -467,6 +581,7 @@ impl RegistryCoordinator {
                 requesting_node_id,
             } => {
                 if source_node_id != requesting_node_id || self.leader()? != self.node_id {
+                    self.audit_protocol_denial();
                     return Err(anyhow!("Invalid registry synchronization request"));
                 }
                 let response = self
@@ -479,6 +594,7 @@ impl RegistryCoordinator {
                 global_entries,
             } => {
                 if source_node_id != self.leader()? {
+                    self.audit_protocol_denial();
                     return Err(anyhow!(
                         "Registry snapshot did not come from the coordinator"
                     ));
@@ -593,7 +709,7 @@ impl RegistryCoordinator {
     }
 
     pub async fn handle_unregister_notify(&self, name: String) -> Result<()> {
-        let _ = self.registry.unregister(name);
+        self.registry.remove_global_untracked(name);
         Ok(())
     }
 
@@ -624,6 +740,13 @@ impl RegistryCoordinator {
 
     pub async fn handle_sync_response(&self, global_entries: RegistrySnapshot) -> Result<()> {
         self.registry.replace_global_snapshot(global_entries);
+        self.audit_registry_event(
+            AuditEvent::DistributedSnapshotApply,
+            AuditAction::Resync,
+            None,
+            AuditResult::Succeeded,
+            AuditReason::Completed,
+        );
         Ok(())
     }
 
@@ -640,6 +763,45 @@ impl RegistryCoordinator {
         }
         cleaned_names
     }
+
+    fn audit_protocol_denial(&self) {
+        emit_audit_event(protocol_denial_event(self.node_id));
+    }
+
+    fn audit_registry_event(
+        &self,
+        event: AuditEvent,
+        action: AuditAction,
+        global_pid: Option<GlobalProcessId>,
+        result: AuditResult,
+        reason: AuditReason,
+    ) {
+        let subject = AuditSubject::new().with_node_id(self.node_id);
+        let mut target = AuditTarget::new(AuditTargetKind::DistributedRegistry)
+            .with_node_id(self.node_id)
+            .with_sensitive_data(SensitiveData::Redacted);
+        if let Some(global_pid) = global_pid {
+            target = target
+                .with_node_id(global_pid.node_id())
+                .with_environment_id(global_pid.environment_id())
+                .with_process_id(global_pid.process_id());
+        }
+        emit_audit_event(AuditEventV1::new(
+            event, action, result, reason, subject, target,
+        ));
+    }
+}
+
+fn protocol_denial_event(local_node_id: u64) -> AuditEventV1 {
+    AuditEventV1::new(
+        AuditEvent::DistributedRequestAuthorization,
+        AuditAction::Validate,
+        AuditResult::Denied,
+        AuditReason::ProtocolDenied,
+        AuditSubject::new().with_node_id(local_node_id),
+        AuditTarget::new(AuditTargetKind::DistributedRequest)
+            .with_sensitive_data(SensitiveData::Redacted),
+    )
 }
 
 fn result_to_anyhow(name: &str, result: GlobalRegisterResult) -> Result<()> {
@@ -650,14 +812,18 @@ fn result_to_anyhow(name: &str, result: GlobalRegisterResult) -> Result<()> {
         }
         GlobalRegisterResult::ConflictDetected {
             conflicting_node_id,
-        } => Err(anyhow!(
+        } => Err(RegistryConflictError(format!(
             "Global registration for '{name}' failed without a quorum; conflict reported by node {conflicting_node_id}"
-        )),
+        ))
+        .into()),
     }
 }
 
 fn already_registered_error(name: &str, global_pid: GlobalProcessId) -> anyhow::Error {
-    anyhow!("Name '{name}' already registered globally with pid {global_pid}")
+    RegistryConflictError(format!(
+        "Name '{name}' already registered globally with pid {global_pid}"
+    ))
+    .into()
 }
 
 fn current_timestamp_ms() -> u64 {
@@ -670,6 +836,33 @@ fn current_timestamp_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registration_errors_keep_stable_audit_meanings() {
+        let conflict = already_registered_error("secret-name", GlobalProcessId::new(1, 2, 3));
+        assert_eq!(
+            classify_registration_error(&conflict),
+            (AuditResult::Denied, AuditReason::Conflict)
+        );
+        let timeout: anyhow::Error = RegistryTimeoutError("timeout".into()).into();
+        assert_eq!(
+            classify_registration_error(&timeout),
+            (AuditResult::Failed, AuditReason::TimedOut)
+        );
+    }
+
+    #[test]
+    fn protocol_denial_event_omits_unverified_remote_identity() {
+        let event = protocol_denial_event(7);
+
+        assert_eq!(event.result(), AuditResult::Denied);
+        assert_eq!(event.reason(), AuditReason::ProtocolDenied);
+        assert_eq!(event.subject().node_id(), Some(7));
+        assert_eq!(event.target().node_id(), None);
+        assert_eq!(event.target().environment_id(), None);
+        assert_eq!(event.target().process_id(), None);
+        assert_eq!(event.target().sensitive_data(), SensitiveData::Redacted);
+    }
 
     #[tokio::test]
     async fn single_node_registration_is_immediate() {
@@ -722,5 +915,24 @@ mod tests {
             registry.lookup_global("current").unwrap().global_pid,
             current
         );
+    }
+
+    #[tokio::test]
+    async fn committed_unregistration_only_removes_the_global_replica() {
+        let registry = Arc::new(DistributedRegistry::new(2));
+        let coordinator = RegistryCoordinator::new(registry.clone(), 2);
+        let local = GlobalProcessId::new(2, 1, 100);
+        let global = GlobalProcessId::new(1, 1, 200);
+        registry.register_local("service", local).unwrap();
+        registry.register_global("service", global).unwrap();
+
+        coordinator
+            .handle_unregister_notify("service".into())
+            .await
+            .unwrap();
+
+        assert!(registry.lookup_global("service").is_none());
+        assert_eq!(registry.lookup_local("service").unwrap().global_pid, local);
+        assert_eq!(registry.get_names(global), Vec::<ProcessName>::new());
     }
 }

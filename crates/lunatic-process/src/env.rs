@@ -16,6 +16,43 @@ use crate::{state::SignalSendError, Process, Signal};
 /// The maximum number of processes admitted to a newly-created environment.
 pub const DEFAULT_MAX_PROCESSES: usize = 100_000;
 
+/// A process could not be admitted because its environment reached its
+/// configured process ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessLimitReached {
+    environment_id: u64,
+    limit: usize,
+}
+
+impl ProcessLimitReached {
+    pub const fn new(environment_id: u64, limit: usize) -> Self {
+        Self {
+            environment_id,
+            limit,
+        }
+    }
+
+    pub const fn environment_id(&self) -> u64 {
+        self.environment_id
+    }
+
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl fmt::Display for ProcessLimitReached {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "environment {} process limit {} reached",
+            self.environment_id, self.limit
+        )
+    }
+}
+
+impl std::error::Error for ProcessLimitReached {}
+
 #[async_trait]
 pub trait Environment: Send + Sync {
     fn id(&self) -> u64;
@@ -219,13 +256,7 @@ impl LunaticEnvironment {
                     (count < limit).then(|| count + 1)
                 })
                 .map(|previous| previous + 1)
-                .map_err(|_| {
-                    anyhow!(
-                        "environment {} process limit {} reached",
-                        self.environment_id,
-                        limit
-                    )
-                }),
+                .map_err(|_| ProcessLimitReached::new(self.environment_id, limit).into()),
             None => self
                 .process_count
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -355,11 +386,7 @@ impl Environment for LunaticEnvironment {
     async fn can_spawn_next_process(&self) -> Result<Option<()>> {
         if let Some(limit) = self.max_processes {
             if self.process_count.load(Ordering::Acquire) >= limit {
-                return Err(anyhow!(
-                    "environment {} process limit {} reached",
-                    self.environment_id,
-                    limit
-                ));
+                return Err(ProcessLimitReached::new(self.environment_id, limit).into());
             }
         }
 

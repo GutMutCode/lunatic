@@ -1,6 +1,10 @@
 use super::global_process_id::GlobalProcessId;
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use lunatic_common_api::{
+    emit_audit_event, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
+    AuditSubject, AuditTarget, AuditTargetKind, SensitiveData,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -71,7 +75,6 @@ pub struct RegistryEntry {
 /// }
 /// ```
 pub struct DistributedRegistry {
-    #[allow(dead_code)] // Reserved for future cross-node coordination
     node_id: u64,
     /// Local name -> GlobalProcessId mappings
     local: Arc<DashMap<ProcessName, RegistryEntry>>,
@@ -103,10 +106,13 @@ impl DistributedRegistry {
         let name = name.into();
 
         if self.local.contains_key(&name) {
-            return Err(anyhow!(
-                "Name '{}' already registered locally",
-                name.as_str()
-            ));
+            self.audit_change(
+                AuditAction::Register,
+                Some(global_pid),
+                AuditResult::Denied,
+                AuditReason::Conflict,
+            );
+            return Err(anyhow!("Process name already registered locally"));
         }
 
         let entry = RegistryEntry {
@@ -117,6 +123,12 @@ impl DistributedRegistry {
 
         self.local.insert(name.clone(), entry);
         self.add_reverse_mapping(global_pid, name);
+        self.audit_change(
+            AuditAction::Register,
+            Some(global_pid),
+            AuditResult::Succeeded,
+            AuditReason::Completed,
+        );
 
         Ok(())
     }
@@ -133,13 +145,35 @@ impl DistributedRegistry {
         name: impl Into<ProcessName>,
         global_pid: GlobalProcessId,
     ) -> Result<()> {
-        let name = name.into();
+        let result = self.register_global_untracked(name, global_pid);
+        let (audit_result, reason) = if result.is_ok() {
+            (AuditResult::Succeeded, AuditReason::Completed)
+        } else {
+            (AuditResult::Denied, AuditReason::Conflict)
+        };
+        self.audit_change(
+            AuditAction::Register,
+            Some(global_pid),
+            audit_result,
+            reason,
+        );
+        result
+    }
+
+    /// Store a caller-audited global registration without emitting a second
+    /// replica-level event. Coordinated registration uses this only at its
+    /// top-level request boundary.
+    pub(crate) fn register_global_untracked(
+        &self,
+        name: impl Into<ProcessName>,
+        global_pid: GlobalProcessId,
+    ) -> Result<()> {
         let entry = RegistryEntry {
             global_pid,
             scope: RegistrationScope::Global,
             registered_at: current_timestamp_ms(),
         };
-        self.insert_global_if_absent(name, entry)
+        self.insert_global_if_absent(name.into(), entry)
     }
 
     /// Apply a committed cluster registration.
@@ -166,6 +200,18 @@ impl DistributedRegistry {
             }
         }
         self.add_reverse_mapping_once(global_pid, name);
+    }
+
+    /// Apply a committed cluster unregistration without emitting a second
+    /// replica-level audit event.
+    pub(crate) fn remove_global_untracked(
+        &self,
+        name: impl Into<ProcessName>,
+    ) -> Option<GlobalProcessId> {
+        let name = name.into();
+        let (_, entry) = self.global.remove(&name)?;
+        self.remove_reverse_mapping(entry.global_pid, &name);
+        Some(entry.global_pid)
     }
 
     /// Replace global state with an authoritative coordinator snapshot.
@@ -200,17 +246,36 @@ impl DistributedRegistry {
         let removed_local = self.local.remove(&name);
         let removed_global = self.global.remove(&name);
 
+        let mut removed_process = None;
         if let Some((_, entry)) = removed_local {
             self.remove_reverse_mapping(entry.global_pid, &name);
-            return Ok(());
+            removed_process = Some(entry.global_pid);
         }
-
         if let Some((_, entry)) = removed_global {
             self.remove_reverse_mapping(entry.global_pid, &name);
-            return Ok(());
+            removed_process.get_or_insert(entry.global_pid);
         }
 
-        Err(anyhow!("Name '{}' not registered", name.as_str()))
+        match removed_process {
+            Some(global_pid) => {
+                self.audit_change(
+                    AuditAction::Unregister,
+                    Some(global_pid),
+                    AuditResult::Succeeded,
+                    AuditReason::Completed,
+                );
+                Ok(())
+            }
+            None => {
+                self.audit_change(
+                    AuditAction::Unregister,
+                    None,
+                    AuditResult::Failed,
+                    AuditReason::NotFound,
+                );
+                Err(anyhow!("Process name not registered"))
+            }
+        }
     }
 
     /// Unregister all names for a given process
@@ -222,6 +287,12 @@ impl DistributedRegistry {
                 self.local.remove(&name);
                 self.global.remove(&name);
             }
+            self.audit_change(
+                AuditAction::Unregister,
+                Some(global_pid),
+                AuditResult::Succeeded,
+                AuditReason::Completed,
+            );
         }
     }
 
@@ -290,14 +361,38 @@ impl DistributedRegistry {
 
     // Internal helpers
 
+    fn audit_change(
+        &self,
+        action: AuditAction,
+        global_pid: Option<GlobalProcessId>,
+        result: AuditResult,
+        reason: AuditReason,
+    ) {
+        let subject = AuditSubject::new().with_node_id(self.node_id);
+        let mut target = AuditTarget::new(AuditTargetKind::DistributedRegistry)
+            .with_node_id(self.node_id)
+            .with_sensitive_data(SensitiveData::Redacted);
+        if let Some(global_pid) = global_pid {
+            target = target
+                .with_node_id(global_pid.node_id())
+                .with_environment_id(global_pid.environment_id())
+                .with_process_id(global_pid.process_id());
+        }
+        emit_audit_event(AuditEventV1::new(
+            AuditEvent::DistributedRegistryChange,
+            action,
+            result,
+            reason,
+            subject,
+            target,
+        ));
+    }
+
     fn insert_global_if_absent(&self, name: ProcessName, entry: RegistryEntry) -> Result<()> {
         use dashmap::mapref::entry::Entry;
 
         match self.global.entry(name.clone()) {
-            Entry::Occupied(_) => Err(anyhow!(
-                "Name '{}' already registered globally",
-                name.as_str()
-            )),
+            Entry::Occupied(_) => Err(anyhow!("Process name already registered globally")),
             Entry::Vacant(slot) => {
                 let global_pid = entry.global_pid;
                 slot.insert(entry);

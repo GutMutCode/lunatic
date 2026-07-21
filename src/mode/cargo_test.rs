@@ -64,7 +64,8 @@ struct Args {
 
 pub(crate) async fn test(augmented_args: Option<Vec<String>>) -> Result<()> {
     // Set logger level to "error" to avoid printing process failures warnings during tests.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error,audit=info"))
+        .init();
     // Measure test duration
     let now = Instant::now();
 
@@ -440,8 +441,9 @@ pub(crate) async fn test(augmented_args: Option<Vec<String>>) -> Result<()> {
     if failures.is_empty() {
         Ok(())
     } else {
-        // Indicate to cargo that at least one test failed
-        std::process::exit(1);
+        // Returning an error lets the top-level runtime perform bounded audit
+        // flushing before reporting a non-zero exit status to cargo.
+        Err(anyhow::anyhow!("{} test(s) failed", failures.len()))
     }
 }
 

@@ -36,6 +36,7 @@ prometheus = ["dep:metrics-exporter-prometheus", "metrics"]
 
 [dependencies]
 hash-map-id = { workspace = true }
+lunatic-common-api = { workspace = true }
 lunatic-control = { workspace = true }
 lunatic-control-axum = { workspace = true }
 lunatic-distributed = { workspace = true }

@@ -4,7 +4,7 @@ use std::io::{self, IoSlice};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio::time::timeout;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -17,13 +17,16 @@ use tokio_rustls::rustls::{
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
-use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
+use lunatic_common_api::{
+    get_memory, AuditAction, AuditEvent, AuditReason, AuditResult, AuditTargetKind, IntoTrap,
+    LinkerAsyncExt,
+};
 use lunatic_error_api::ErrorCtx;
 
 use crate::dns::DnsIterator;
 use crate::{
-    socket_address, validate_memory_range, NetworkingCtx, TlsClientConnectionMetadata,
-    TlsConnection, TlsListener,
+    audit_port, redacted_network_target, socket_address, validate_memory_range, NetworkingCtx,
+    PendingNetworkAudit, TlsClientConnectionMetadata, TlsConnection, TlsListener,
 };
 
 // Register TLS networking APIs to the linker
@@ -178,7 +181,20 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
     keys_array_len: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkBind,
+            AuditAction::Bind,
+            redacted_network_target(AuditTargetKind::TlsListener, None, audit_port(port)),
+        );
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tls_bind",
+        )?;
         let certs = memory
             .data(&caller)
             .get(certs_array_ptr as usize..(certs_array_ptr + certs_array_len) as usize)
@@ -204,24 +220,47 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
             scope_id,
         )?;
         let lease = caller.data().reserve_network_handle_lease();
-        let (tls_listener_or_error_id, result) = match lease {
-            Ok(lease) => match TcpListener::bind(socket_addr).await {
-                Ok(listener) => {
-                    audit_log("tls_bind", format!("address={}", socket_addr));
-                    let id = caller
-                        .data_mut()
-                        .tls_listener_resources_mut()
-                        .add(TlsListener {
-                            listener,
-                            keys,
-                            certs,
-                        });
-                    lease.into_table_reservation();
-                    (id, 0)
+        let (tls_listener_or_error_id, result, audit_result, audit_reason) = match lease {
+            Ok(lease) => {
+                audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                audit.mark_async();
+                match TcpListener::bind(socket_addr).await {
+                    Ok(listener) => {
+                        let bound_port = listener
+                            .local_addr()
+                            .ok()
+                            .map(|address| address.port())
+                            .or_else(|| audit_port(port));
+                        let id = caller
+                            .data_mut()
+                            .tls_listener_resources_mut()
+                            .add(TlsListener {
+                                listener,
+                                keys,
+                                certs,
+                            });
+                        lease.into_table_reservation();
+                        audit.set_target(redacted_network_target(
+                            AuditTargetKind::TlsListener,
+                            Some(id),
+                            bound_port,
+                        ));
+                        (id, 0, AuditResult::Succeeded, AuditReason::Completed)
+                    }
+                    Err(error) => (
+                        caller.data_mut().add_error_resource(error.into()),
+                        1,
+                        AuditResult::Failed,
+                        AuditReason::RuntimeFailure,
+                    ),
                 }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
-            },
-            Err(error) => (caller.data_mut().add_error_resource(error), 1),
+            }
+            Err(error) => (
+                caller.data_mut().add_error_resource(error),
+                1,
+                AuditResult::Denied,
+                AuditReason::ResourceLimit,
+            ),
         };
         memory
             .write(
@@ -230,6 +269,8 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
                 &tls_listener_or_error_id.to_le_bytes(),
             )
             .or_trap("lunatic::networking::tls_bind::create_environment")?;
+
+        audit.finish(audit_result, audit_reason);
 
         Ok(result)
     })
@@ -265,6 +306,12 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
     socket_addr_id_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkAccept,
+            AuditAction::Accept,
+            redacted_network_target(AuditTargetKind::TlsListener, Some(listener_id), None),
+        );
         let (keys, certs) = {
             let tls_listener = caller
                 .data()
@@ -304,37 +351,63 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
                     .reserve_dns_iterator_lease()
                     .map(|dns| (network, dns))
             });
-        let (tls_stream_or_error_id, peer_addr_iter, result) = match leases {
-            Ok((network_lease, dns_lease)) => {
-                let accept = caller
-                    .data()
-                    .tls_listener_resources()
-                    .get(listener_id)
-                    .expect("validated TLS listener must remain in the resource table")
-                    .listener
-                    .accept()
-                    .await;
-                match accept {
-                    Ok((stream, socket_addr)) => {
-                        let stream = acceptor
-                            .accept(stream)
-                            .await
-                            .or_trap("unexpected tls error")?;
-                        let stream_id = caller.data_mut().tls_stream_resources_mut().add(Arc::new(
-                            TlsConnection::new(tokio_rustls::TlsStream::Server(stream)),
-                        ));
-                        network_lease.into_table_reservation();
-                        let iterator =
-                            DnsIterator::with_lease(vec![socket_addr].into_iter(), dns_lease);
-                        let dns_iter_id = caller.data_mut().dns_resources_mut().add(iterator);
-                        audit_log("tls_accept", format!("peer={}", socket_addr));
-                        (stream_id, dns_iter_id, 0)
+        let (tls_stream_or_error_id, peer_addr_iter, result, audit_result, audit_reason) =
+            match leases {
+                Ok((network_lease, dns_lease)) => {
+                    audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                    audit.mark_async();
+                    let accept = caller
+                        .data()
+                        .tls_listener_resources()
+                        .get(listener_id)
+                        .expect("validated TLS listener must remain in the resource table")
+                        .listener
+                        .accept()
+                        .await;
+                    match accept {
+                        Ok((stream, socket_addr)) => {
+                            audit.mark_async();
+                            let stream = acceptor.accept(stream).await;
+                            audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                            let stream = stream.or_trap("unexpected tls error")?;
+                            let stream_id =
+                                caller.data_mut().tls_stream_resources_mut().add(Arc::new(
+                                    TlsConnection::new(tokio_rustls::TlsStream::Server(stream)),
+                                ));
+                            network_lease.into_table_reservation();
+                            let iterator =
+                                DnsIterator::with_lease(vec![socket_addr].into_iter(), dns_lease);
+                            let dns_iter_id = caller.data_mut().dns_resources_mut().add(iterator);
+                            audit.set_target(redacted_network_target(
+                                AuditTargetKind::TlsStream,
+                                Some(stream_id),
+                                Some(socket_addr.port()),
+                            ));
+                            (
+                                stream_id,
+                                dns_iter_id,
+                                0,
+                                AuditResult::Succeeded,
+                                AuditReason::Completed,
+                            )
+                        }
+                        Err(error) => (
+                            caller.data_mut().add_error_resource(error.into()),
+                            0,
+                            1,
+                            AuditResult::Failed,
+                            AuditReason::RuntimeFailure,
+                        ),
                     }
-                    Err(error) => (caller.data_mut().add_error_resource(error.into()), 0, 1),
                 }
-            }
-            Err(error) => (caller.data_mut().add_error_resource(error), 0, 1),
-        };
+                Err(error) => (
+                    caller.data_mut().add_error_resource(error),
+                    0,
+                    1,
+                    AuditResult::Denied,
+                    AuditReason::ResourceLimit,
+                ),
+            };
 
         memory
             .write(
@@ -350,6 +423,7 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
                 &peer_addr_iter.to_le_bytes(),
             )
             .or_trap("lunatic::networking::tls_accept")?;
+        audit.finish(audit_result, audit_reason);
         Ok(result)
     })
 }
@@ -401,7 +475,21 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
     certs_array_len: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkConnect,
+            AuditAction::Connect,
+            redacted_network_target(AuditTargetKind::TlsStream, None, audit_port(port)),
+        );
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tls_connect",
+        )?;
+        let port = u16::try_from(port).map_err(|_| anyhow!("network port exceeds u16"))?;
 
         let socket_addr = String::from_utf8(
             memory
@@ -472,34 +560,40 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                 memory
                     .write(&mut caller, id_u64_ptr as usize, &error_id.to_le_bytes())
                     .or_trap("lunatic::networking::tls_connect")?;
+                audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
                 return Ok(1);
             }
         };
-        let connect = TcpStream::connect((&socket_addr[..], port as u16));
+        audit.set_fallback_reason(AuditReason::RuntimeFailure);
+        let connect = TcpStream::connect((&socket_addr[..], port));
+        audit.mark_async();
         if let Ok(result) = match timeout_duration {
             // Without timeout
             u64::MAX => Ok(connect.await),
             // With timeout
             t => timeout(Duration::from_millis(t), connect).await,
         } {
-            let (stream_or_error_id, result) = match result {
+            let (stream_or_error_id, result, audit_result, audit_reason) = match result {
                 Ok(tcp_stream) => {
                     let peer_addr = tcp_stream.peer_addr().ok();
                     let local_addr = tcp_stream.local_addr().ok();
+                    audit.set_fallback_reason(AuditReason::InvalidInput);
                     let domain = ServerName::try_from(socket_addr.clone())
                         .or_trap("lunatic::networking::tls_connect::invalid_dnsname")?;
 
-                    let tls_stream = connector
-                        .connect(domain, tcp_stream)
-                        .await
-                        .or_trap("lunatic::networking::tls_connect::connect failed")?;
+                    audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                    audit.mark_async();
+                    let tls_stream = connector.connect(domain, tcp_stream).await;
+                    audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                    let tls_stream =
+                        tls_stream.or_trap("lunatic::networking::tls_connect::connect failed")?;
 
                     // Retain descriptive client metadata for diagnostics and
                     // serialized snapshots. In-process hot reload moves the
                     // live stream instead of reconnecting it.
                     let client_metadata = TlsClientConnectionMetadata {
                         server_name: socket_addr.clone(),
-                        port: port as u16,
+                        port,
                         peer_addr,
                         local_addr,
                         custom_root_certs: custom_certs,
@@ -512,10 +606,19 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                         ),
                     ));
                     lease.into_table_reservation();
-                    audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));
-                    (id, 0)
+                    audit.set_target(redacted_network_target(
+                        AuditTargetKind::TlsStream,
+                        Some(id),
+                        Some(port),
+                    ));
+                    (id, 0, AuditResult::Succeeded, AuditReason::Completed)
                 }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+                Err(error) => (
+                    caller.data_mut().add_error_resource(error.into()),
+                    1,
+                    AuditResult::Failed,
+                    AuditReason::RuntimeFailure,
+                ),
             };
 
             memory
@@ -525,9 +628,11 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                     &stream_or_error_id.to_le_bytes(),
                 )
                 .or_trap("lunatic::networking::tls_connect")?;
+            audit.finish(audit_result, audit_reason);
             Ok(result)
         } else {
             // Call timed out
+            audit.finish(AuditResult::Failed, AuditReason::TimedOut);
             Ok(9027)
         }
     })

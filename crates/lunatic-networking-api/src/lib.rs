@@ -21,7 +21,10 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsStream;
 use wasmtime::{Caller, Linker, Memory};
 
-use lunatic_common_api::IntoTrap;
+use lunatic_common_api::{
+    emit_audit_event, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
+    AuditSubject, AuditTarget, AuditTargetKind, IntoTrap, SensitiveData,
+};
 
 pub use dns::DnsIterator;
 
@@ -288,6 +291,36 @@ pub trait NetworkingCtx {
     fn dns_resources(&self) -> &DnsResources;
     fn dns_resources_mut(&mut self) -> &mut DnsResources;
 
+    /// Stable node identity included in typed network audit events, when known.
+    fn audit_node_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Stable environment identity included in typed network audit events, when known.
+    fn audit_environment_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Stable process identity included in typed network audit events, when known.
+    fn audit_process_id(&self) -> Option<u64> {
+        None
+    }
+
+    /// Builds the bounded identity used by network audit events.
+    fn network_audit_subject(&self) -> AuditSubject {
+        let mut subject = AuditSubject::new();
+        if let Some(node_id) = self.audit_node_id() {
+            subject = subject.with_node_id(node_id);
+        }
+        if let Some(environment_id) = self.audit_environment_id() {
+            subject = subject.with_environment_id(environment_id);
+        }
+        if let Some(process_id) = self.audit_process_id() {
+            subject = subject.with_process_id(process_id);
+        }
+        subject
+    }
+
     /// Returns this process's stable, shared network quota owner.
     ///
     /// Every successful call for one process must return a clone of the same
@@ -360,6 +393,122 @@ pub trait NetworkingCtx {
     }
 }
 
+/// A fail-safe audit guard for one privileged networking operation.
+///
+/// Host functions explicitly complete the guard on every normal result. If a
+/// trap, cancellation, or unexpected early return unwinds the future first,
+/// `Drop` emits one bounded failure event instead.
+pub(crate) struct PendingNetworkAudit {
+    event: AuditEvent,
+    action: AuditAction,
+    subject: AuditSubject,
+    target: AuditTarget,
+    fallback_result: AuditResult,
+    fallback_reason: AuditReason,
+    emitted: bool,
+}
+
+impl PendingNetworkAudit {
+    pub(crate) fn new<T: NetworkingCtx>(
+        context: &T,
+        event: AuditEvent,
+        action: AuditAction,
+        target: AuditTarget,
+    ) -> Self {
+        Self {
+            event,
+            action,
+            subject: context.network_audit_subject(),
+            target,
+            fallback_result: AuditResult::Failed,
+            fallback_reason: AuditReason::InvalidInput,
+            emitted: false,
+        }
+    }
+
+    pub(crate) fn set_target(&mut self, target: AuditTarget) {
+        self.target = target;
+    }
+
+    pub(crate) fn set_fallback_reason(&mut self, reason: AuditReason) {
+        self.fallback_result = AuditResult::Failed;
+        self.fallback_reason = reason;
+    }
+
+    pub(crate) fn mark_async(&mut self) {
+        self.fallback_result = AuditResult::Cancelled;
+        self.fallback_reason = AuditReason::Cancelled;
+    }
+
+    pub(crate) fn finish(mut self, result: AuditResult, reason: AuditReason) {
+        self.emit(result, reason);
+    }
+
+    fn emit(&mut self, result: AuditResult, reason: AuditReason) {
+        let _ = emit_audit_event(AuditEventV1::new(
+            self.event,
+            self.action,
+            result,
+            reason,
+            self.subject,
+            self.target,
+        ));
+        self.emitted = true;
+    }
+}
+
+impl Drop for PendingNetworkAudit {
+    fn drop(&mut self) {
+        if !self.emitted {
+            self.emit(self.fallback_result, self.fallback_reason);
+        }
+    }
+}
+
+pub(crate) fn redacted_network_target(
+    kind: AuditTargetKind,
+    resource_id: Option<u64>,
+    port: Option<u16>,
+) -> AuditTarget {
+    let mut target = AuditTarget::new(kind).with_sensitive_data(SensitiveData::Redacted);
+    if let Some(resource_id) = resource_id {
+        target = target.with_resource_id(resource_id);
+    }
+    if let Some(port) = port {
+        target = target.with_port(port);
+    }
+    target
+}
+
+pub(crate) fn audit_port(port: u32) -> Option<u16> {
+    port.try_into().ok()
+}
+
+#[allow(clippy::items_after_test_module)]
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn redacted_target_retains_only_numeric_network_metadata() {
+        let target = redacted_network_target(AuditTargetKind::TcpStream, Some(17), Some(443));
+
+        assert_eq!(target.kind(), AuditTargetKind::TcpStream);
+        assert_eq!(target.resource_id(), Some(17));
+        assert_eq!(target.port(), Some(443));
+        assert_eq!(target.sensitive_data(), SensitiveData::Redacted);
+        assert_eq!(target.node_id(), None);
+        assert_eq!(target.environment_id(), None);
+        assert_eq!(target.process_id(), None);
+    }
+
+    #[test]
+    fn audit_port_omits_values_outside_the_schema_range() {
+        assert_eq!(audit_port(u16::MAX as u32), Some(u16::MAX));
+        assert_eq!(audit_port(u16::MAX as u32 + 1), None);
+    }
+}
+
 // Register the networking APIs to the linker
 pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
     linker: &mut Linker<T>,
@@ -403,6 +552,7 @@ fn socket_address<T: NetworkingCtx>(
     flow_info: u32,
     scope_id: u32,
 ) -> Result<SocketAddr> {
+    let port = u16::try_from(port).map_err(|_| anyhow!("network port exceeds u16"))?;
     Ok(match addr_type {
         4 => {
             let ip = memory
@@ -410,7 +560,7 @@ fn socket_address<T: NetworkingCtx>(
                 .get(addr_u8_ptr as usize..(addr_u8_ptr + 4) as usize)
                 .or_trap("lunatic::network::socket_address*")?;
             let addr = <Ipv4Addr as From<[u8; 4]>>::from(ip.try_into().expect("exactly 4 bytes"));
-            SocketAddrV4::new(addr, port as u16).into()
+            SocketAddrV4::new(addr, port).into()
         }
         6 => {
             let ip = memory
@@ -418,7 +568,7 @@ fn socket_address<T: NetworkingCtx>(
                 .get(addr_u8_ptr as usize..(addr_u8_ptr + 16) as usize)
                 .or_trap("lunatic::network::socket_address*")?;
             let addr = <Ipv6Addr as From<[u8; 16]>>::from(ip.try_into().expect("exactly 16 bytes"));
-            SocketAddrV6::new(addr, port as u16, flow_info, scope_id).into()
+            SocketAddrV6::new(addr, port, flow_info, scope_id).into()
         }
         _ => return Err(anyhow!("Unsupported address type in socket_address*")),
     })

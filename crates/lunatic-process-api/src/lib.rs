@@ -9,12 +9,15 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use hash_map_id::HashMapId;
-use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
+use lunatic_common_api::{
+    emit_audit_event, get_memory, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
+    AuditSubject, AuditTarget, AuditTargetKind, IntoTrap, LinkerAsyncExt, SensitiveData,
+};
 use lunatic_distributed::DistributedCtx;
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::{
     config::ProcessConfig,
-    env::Environment,
+    env::{Environment, ProcessLimitReached},
     mailbox::MessageMailbox,
     message::Message,
     runtimes::{wasmtime::WasmtimeCompiledModule, RawWasm},
@@ -26,6 +29,93 @@ use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _, Val};
 
 pub type ProcessResources = HashMapId<Arc<dyn Process>>;
 pub type ModuleResources<S> = HashMapId<Arc<WasmtimeCompiledModule<S>>>;
+
+fn audit_subject<T: ProcessState>(state: &T) -> AuditSubject {
+    let mut subject = AuditSubject::new().with_process_id(state.id());
+    if let Some(node_id) = state.audit_node_id() {
+        subject = subject.with_node_id(node_id);
+    }
+    if let Some(environment_id) = state.audit_environment_id() {
+        subject = subject.with_environment_id(environment_id);
+    }
+    subject
+}
+
+/// Ensures each privileged host operation produces one terminal audit event,
+/// including host-trap exits reached through `?`.
+struct PendingAudit {
+    event: Option<AuditEvent>,
+    action: Option<AuditAction>,
+    subject: Option<AuditSubject>,
+    target: Option<AuditTarget>,
+    fallback_result: AuditResult,
+    fallback_reason: Option<AuditReason>,
+}
+
+impl PendingAudit {
+    fn new(
+        event: AuditEvent,
+        action: AuditAction,
+        subject: AuditSubject,
+        target: AuditTarget,
+        fallback_reason: AuditReason,
+    ) -> Self {
+        Self {
+            event: Some(event),
+            action: Some(action),
+            subject: Some(subject),
+            target: Some(target),
+            fallback_result: AuditResult::Failed,
+            fallback_reason: Some(fallback_reason),
+        }
+    }
+
+    fn mark_async(&mut self) {
+        self.fallback_result = AuditResult::Cancelled;
+        self.fallback_reason = Some(AuditReason::Cancelled);
+    }
+
+    fn mark_failed(&mut self, reason: AuditReason) {
+        self.fallback_result = AuditResult::Failed;
+        self.fallback_reason = Some(reason);
+    }
+
+    fn finish(mut self, result: AuditResult, reason: AuditReason) {
+        self.emit(result, reason, None);
+    }
+
+    fn finish_with_target(mut self, result: AuditResult, reason: AuditReason, target: AuditTarget) {
+        self.emit(result, reason, Some(target));
+    }
+
+    fn emit(&mut self, result: AuditResult, reason: AuditReason, target: Option<AuditTarget>) {
+        let Some(event) = self.event.take() else {
+            return;
+        };
+        let action = self.action.take().expect("pending audit action");
+        let subject = self.subject.take().expect("pending audit subject");
+        let target = target
+            .or_else(|| self.target.take())
+            .expect("pending audit target");
+        self.fallback_reason = None;
+        let _ = emit_audit_event(AuditEventV1::new(
+            event, action, result, reason, subject, target,
+        ));
+    }
+}
+
+impl Drop for PendingAudit {
+    fn drop(&mut self) {
+        if self.event.is_none() {
+            return;
+        }
+        let reason = self
+            .fallback_reason
+            .take()
+            .unwrap_or(AuditReason::InternalError);
+        self.emit(self.fallback_result, reason, None);
+    }
+}
 
 pub trait ProcessConfigCtx {
     fn can_compile_modules(&self) -> bool;
@@ -369,8 +459,16 @@ where
     T: ProcessState + ProcessCtx<T> + ErrorCtx,
     T::Config: ProcessConfigCtx,
 {
+    let audit = PendingAudit::new(
+        AuditEvent::ModuleCompile,
+        AuditAction::Compile,
+        audit_subject(caller.data()),
+        AuditTarget::new(AuditTargetKind::Module).with_sensitive_data(SensitiveData::Redacted),
+        AuditReason::InvalidInput,
+    );
     // TODO: Module compilation is CPU intensive and should be done on the blocking task thread pool.
     if !caller.data().config().can_compile_modules() {
+        audit.finish(AuditResult::Denied, AuditReason::CapabilityDenied);
         return Ok(-1);
     }
 
@@ -391,14 +489,24 @@ where
 
     let module = RawWasm::new(None, module);
     let (mod_or_error_id, result) = match caller.data().runtime().compile_module(module) {
-        Ok(module) => (
-            caller
+        Ok(module) => {
+            let module_id = caller
                 .data_mut()
                 .module_resources_mut()
-                .add(Arc::new(module)),
-            0,
-        ),
-        Err(error) => (caller.data_mut().add_error_resource(error), 1),
+                .add(Arc::new(module));
+            audit.finish_with_target(
+                AuditResult::Succeeded,
+                AuditReason::Completed,
+                AuditTarget::new(AuditTargetKind::Module)
+                    .with_resource_id(module_id)
+                    .with_sensitive_data(SensitiveData::Redacted),
+            );
+            (module_id, 0)
+        }
+        Err(error) => {
+            audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
+            (caller.data_mut().add_error_resource(error), 1)
+        }
     };
 
     #[cfg(feature = "metrics")]
@@ -445,27 +553,22 @@ where
     T: ProcessState + ProcessCtx<T>,
     T::Config: ProcessConfigCtx,
 {
+    let audit = PendingAudit::new(
+        AuditEvent::ConfigCreate,
+        AuditAction::Create,
+        audit_subject(caller.data()),
+        AuditTarget::new(AuditTargetKind::Configuration)
+            .with_sensitive_data(SensitiveData::NotPresent),
+        AuditReason::InternalError,
+    );
     if !caller.data().config().can_create_configs() {
-        audit_log(
-            "capability_delegation",
-            format!(
-                "parent_process={} operation=create_config outcome=denied",
-                caller.data().id()
-            ),
-        );
+        audit.finish(AuditResult::Denied, AuditReason::CapabilityDenied);
         return -1;
     }
-    let parent_process = caller.data().id();
     let config = match caller.data().config().new_child_config() {
         Ok(config) => config,
         Err(_reason) => {
-            audit_log(
-                "capability_delegation",
-                format!(
-                    "parent_process={} operation=create_config outcome=denied",
-                    caller.data().id()
-                ),
-            );
+            audit.finish(AuditResult::Denied, AuditReason::DelegationDenied);
             return -1;
         }
     };
@@ -474,11 +577,12 @@ where
     #[cfg(feature = "metrics")]
     metrics::increment_gauge!("lunatic.process.configs.active", 1.0);
     let config_id = caller.data_mut().config_resources_mut().add(config);
-    audit_log(
-        "capability_delegation",
-        format!(
-            "parent_process={parent_process} config_id={config_id} operation=create_config outcome=allowed"
-        ),
+    audit.finish_with_target(
+        AuditResult::Allowed,
+        AuditReason::PolicyAllowed,
+        AuditTarget::new(AuditTargetKind::Configuration)
+            .with_resource_id(config_id)
+            .with_sensitive_data(SensitiveData::NotPresent),
     );
     config_id as i64
 }
@@ -515,25 +619,29 @@ where
     T: ProcessState,
     F: FnOnce(&mut T::Config),
 {
-    let parent_process = caller.data().id();
+    let audit = PendingAudit::new(
+        AuditEvent::ConfigUpdate,
+        AuditAction::Mutate,
+        audit_subject(caller.data()),
+        AuditTarget::new(AuditTargetKind::Configuration)
+            .with_resource_id(config_id)
+            .with_sensitive_data(SensitiveData::Redacted),
+        AuditReason::InternalError,
+    );
     let parent_config = caller.data().config().clone();
-    let mut candidate = caller
-        .data()
-        .config_resources()
-        .get(config_id)
-        .or_trap(format!(
-            "lunatic::process::{operation}: Config ID doesn't exist"
-        ))?
-        .clone();
+    let mut candidate = match caller.data().config_resources().get(config_id) {
+        Some(config) => config.clone(),
+        None => {
+            audit.finish(AuditResult::Failed, AuditReason::NotFound);
+            return Err(anyhow!(
+                "lunatic::process::{operation}: Config ID doesn't exist"
+            ));
+        }
+    };
 
     mutate(&mut candidate);
     if let Err(reason) = parent_config.validate_child_config(&candidate) {
-        audit_log(
-            "capability_delegation",
-            format!(
-                "parent_process={parent_process} config_id={config_id} operation={operation} outcome=denied"
-            ),
-        );
+        audit.finish(AuditResult::Denied, AuditReason::DelegationExceedsParent);
         return Err(anyhow!(
             "lunatic::process::{operation}: delegation denied: {reason}"
         ));
@@ -546,12 +654,7 @@ where
         .or_trap(format!(
             "lunatic::process::{operation}: Config ID doesn't exist"
         ))? = candidate;
-    audit_log(
-        "capability_delegation",
-        format!(
-            "parent_process={parent_process} config_id={config_id} operation={operation} outcome=allowed"
-        ),
-    );
+    audit.finish(AuditResult::Allowed, AuditReason::PolicyAllowed);
     Ok(())
 }
 
@@ -561,24 +664,22 @@ fn validate_delegated_config<T: ProcessState>(
     child: &T::Config,
     operation: &'static str,
 ) -> Result<()> {
-    let parent_process = state.id();
+    let audit = PendingAudit::new(
+        AuditEvent::ConfigUpdate,
+        AuditAction::Validate,
+        audit_subject(state),
+        AuditTarget::new(AuditTargetKind::Configuration)
+            .with_resource_id(config_id)
+            .with_sensitive_data(SensitiveData::Redacted),
+        AuditReason::InternalError,
+    );
     if let Err(reason) = state.config().validate_child_config(child) {
-        audit_log(
-            "capability_delegation",
-            format!(
-                "parent_process={parent_process} config_id={config_id} operation={operation} outcome=denied"
-            ),
-        );
+        audit.finish(AuditResult::Denied, AuditReason::DelegationExceedsParent);
         return Err(anyhow!(
             "lunatic::process::{operation}: delegated config denied: {reason}"
         ));
     }
-    audit_log(
-        "capability_delegation",
-        format!(
-            "parent_process={parent_process} config_id={config_id} operation={operation} outcome=allowed"
-        ),
-    );
+    audit.finish(AuditResult::Allowed, AuditReason::PolicyAllowed);
     Ok(())
 }
 
@@ -610,6 +711,40 @@ fn return_process_error_in_state<T: ErrorCtx>(
     Ok(1)
 }
 
+fn emit_invalid_config_update<T: ProcessState>(state: &T, config_id: u64) {
+    let _ = emit_audit_event(AuditEventV1::new(
+        AuditEvent::ConfigUpdate,
+        AuditAction::Mutate,
+        AuditResult::Failed,
+        AuditReason::InvalidInput,
+        audit_subject(state),
+        AuditTarget::new(AuditTargetKind::Configuration)
+            .with_resource_id(config_id)
+            .with_sensitive_data(SensitiveData::NotPresent),
+    ));
+}
+
+fn emit_registry_change<T: ProcessState>(
+    state: &T,
+    action: AuditAction,
+    result: AuditResult,
+    reason: AuditReason,
+    node_id: u64,
+    process_id: u64,
+) {
+    let _ = emit_audit_event(AuditEventV1::new(
+        AuditEvent::DistributedRegistryChange,
+        action,
+        result,
+        reason,
+        audit_subject(state),
+        AuditTarget::new(AuditTargetKind::DistributedRegistry)
+            .with_node_id(node_id)
+            .with_process_id(process_id)
+            .with_sensitive_data(SensitiveData::Redacted),
+    ));
+}
+
 // Applies a configuration mutation without crossing a host trap on validation
 // failure. Returns -1 on success or an error-resource ID on failure.
 //
@@ -624,7 +759,10 @@ where
 {
     let result = match setting {
         0 => usize::try_from(value)
-            .map_err(|_| anyhow!("max_memory exceeds platform max"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_memory exceeds platform max")
+            })
             .and_then(|value| {
                 mutate_child_config(&mut caller, config_id, "config_set_max_memory", |config| {
                     config.set_max_memory(value)
@@ -634,7 +772,10 @@ where
             config.set_max_fuel((value != 0).then_some(value))
         }),
         2 => u32::try_from(value)
-            .map_err(|_| anyhow!("max_table_elements exceeds u32"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_table_elements exceeds u32")
+            })
             .and_then(|value| {
                 mutate_child_config(
                     &mut caller,
@@ -644,7 +785,10 @@ where
                 )
             }),
         3 => u32::try_from(value)
-            .map_err(|_| anyhow!("max_file_descriptors exceeds u32"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_file_descriptors exceeds u32")
+            })
             .and_then(|value| {
                 mutate_child_config(
                     &mut caller,
@@ -654,7 +798,10 @@ where
                 )
             }),
         4 => u32::try_from(value)
-            .map_err(|_| anyhow!("max_network_connections exceeds u32"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_network_connections exceeds u32")
+            })
             .and_then(|value| {
                 mutate_child_config(
                     &mut caller,
@@ -682,7 +829,10 @@ where
             |config| config.set_can_spawn_processes(value != 0),
         ),
         8 => u32::try_from(value)
-            .map_err(|_| anyhow!("max_mailbox_messages exceeds u32"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_mailbox_messages exceeds u32")
+            })
             .and_then(|value| {
                 mutate_child_config(
                     &mut caller,
@@ -692,7 +842,10 @@ where
                 )
             }),
         9 => u32::try_from(value)
-            .map_err(|_| anyhow!("max_signal_queue exceeds u32"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_signal_queue exceeds u32")
+            })
             .and_then(|value| {
                 mutate_child_config(
                     &mut caller,
@@ -708,7 +861,10 @@ where
             |config| ProcessConfigCtx::set_max_message_size(config, value),
         ),
         11 => u32::try_from(value)
-            .map_err(|_| anyhow!("max_message_resources exceeds u32"))
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_message_resources exceeds u32")
+            })
             .and_then(|value| {
                 mutate_child_config(
                     &mut caller,
@@ -717,7 +873,10 @@ where
                     |config| ProcessConfigCtx::set_max_message_resources(config, value),
                 )
             }),
-        _ => Err(anyhow!("unknown config setting ID {setting}")),
+        _ => {
+            emit_invalid_config_update(caller.data(), config_id);
+            Err(anyhow!("unknown config setting ID {setting}"))
+        }
     };
 
     match result {
@@ -736,11 +895,16 @@ fn config_set_max_memory<T: ProcessState + ProcessCtx<T> + Send>(
     max_memory: u64,
 ) -> Box<dyn Future<Output = Result<()>> + Send + '_> {
     Box::new(async move {
-        if let Ok(max_memory) = usize::try_from(max_memory) {
-            let _ =
-                mutate_child_config(&mut caller, config_id, "config_set_max_memory", |config| {
-                    config.set_max_memory(max_memory)
-                });
+        match usize::try_from(max_memory) {
+            Ok(max_memory) => {
+                let _ = mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_memory",
+                    |config| config.set_max_memory(max_memory),
+                );
+            }
+            Err(_) => emit_invalid_config_update(caller.data(), config_id),
         }
         Ok(())
     })
@@ -1225,7 +1389,15 @@ where
     T::Config: ProcessConfigCtx,
 {
     Box::new(async move {
+        let mut audit = PendingAudit::new(
+            AuditEvent::ProcessSpawn,
+            AuditAction::Spawn,
+            audit_subject(caller.data()),
+            AuditTarget::new(AuditTargetKind::Process).with_sensitive_data(SensitiveData::Redacted),
+            AuditReason::InvalidInput,
+        );
         if !caller.data().config().can_spawn_processes() {
+            audit.finish(AuditResult::Denied, AuditReason::CapabilityDenied);
             return return_process_error(
                 &mut caller,
                 id_ptr,
@@ -1234,6 +1406,7 @@ where
         }
 
         if !caller.data().is_initialized() {
+            audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
             return return_process_error(
                 &mut caller,
                 id_ptr,
@@ -1253,6 +1426,7 @@ where
                 if let Err(error) =
                     validate_delegated_config(caller.data(), config_id as u64, &config, "spawn")
                 {
+                    audit.finish(AuditResult::Denied, AuditReason::DelegationExceedsParent);
                     return return_process_error(&mut caller, id_ptr, error);
                 }
                 Arc::new(config)
@@ -1271,7 +1445,10 @@ where
 
         let mut new_state = match caller.data().new_state(module.clone(), config) {
             Ok(state) => state,
-            Err(error) => return return_process_error(&mut caller, id_ptr, error),
+            Err(error) => {
+                audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
+                return return_process_error(&mut caller, id_ptr, error);
+            }
         };
 
         let memory = get_memory(&mut caller)?;
@@ -1337,23 +1514,32 @@ where
             }
         }
 
-        let parent_id = caller.data().id();
-
         // set state instead of config TODO
         let env = caller.data().environment();
+        audit.mark_async();
         let (proc_or_error_id, result) = match lunatic_process::wasm::spawn_wasm(
             env, runtime, &module, new_state, function, params, link,
         )
         .await
         {
             Ok((_, process)) => {
-                audit_log(
-                    "process_spawn",
-                    format!("parent={} child={}", parent_id, process.id()),
+                audit.finish_with_target(
+                    AuditResult::Succeeded,
+                    AuditReason::Completed,
+                    AuditTarget::new(AuditTargetKind::Process)
+                        .with_process_id(process.id())
+                        .with_sensitive_data(SensitiveData::Redacted),
                 );
                 (process.id(), 0)
             }
-            Err(error) => (caller.data_mut().add_error_resource(error), 1),
+            Err(error) => {
+                if error.downcast_ref::<ProcessLimitReached>().is_some() {
+                    audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
+                } else {
+                    audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
+                }
+                (caller.data_mut().add_error_resource(error), 1)
+            }
         };
 
         memory
@@ -1414,8 +1600,27 @@ where
     E: Environment,
 {
     Box::new(async move {
+        let mut audit = PendingAudit::new(
+            AuditEvent::ProcessSpawn,
+            AuditAction::LookupOrSpawn,
+            audit_subject(caller.data()),
+            AuditTarget::new(AuditTargetKind::Process).with_sensitive_data(SensitiveData::Redacted),
+            AuditReason::InvalidInput,
+        );
         let memory = get_memory(&mut caller)?;
         let (memory_slice, state) = memory.data_and_store_mut(&mut caller);
+        let node_id_end = node_id_ptr
+            .checked_add(std::mem::size_of::<u64>() as u32)
+            .or_trap("lunatic::process::get_or_spawn: node ID pointer overflow")?;
+        memory_slice
+            .get(node_id_ptr as usize..node_id_end as usize)
+            .or_trap("lunatic::process::get_or_spawn: node ID pointer out of bounds")?;
+        let id_end = id_ptr
+            .checked_add(std::mem::size_of::<u64>() as u32)
+            .or_trap("lunatic::process::get_or_spawn: process ID pointer overflow")?;
+        memory_slice
+            .get(id_ptr as usize..id_end as usize)
+            .or_trap("lunatic::process::get_or_spawn: process ID pointer out of bounds")?;
         let name = memory_slice
             .get(name_str_ptr as usize..(name_str_ptr + name_str_len) as usize)
             .or_trap("lunatic::process::get_or_spawn")?;
@@ -1423,7 +1628,9 @@ where
 
         // Lock the registry for every other process before lookup.
         let registry = state.registry().clone();
+        audit.mark_async();
         let mut registry = registry.write().await;
+        audit.mark_failed(AuditReason::InvalidInput);
         let node_id = state
             .distributed()
             .as_ref()
@@ -1436,7 +1643,16 @@ where
             {
                 // Local process registration is the liveness authority. Remove
                 // a stale name atomically so get-or-spawn can reuse it.
-                registry.remove(name);
+                if let Some((entry_node_id, process_id)) = registry.remove(name) {
+                    emit_registry_change(
+                        state,
+                        AuditAction::Unregister,
+                        AuditResult::Succeeded,
+                        AuditReason::Completed,
+                        entry_node_id,
+                        process_id,
+                    );
+                }
                 None
             }
             process => process,
@@ -1455,26 +1671,58 @@ where
                 .or_trap("lunatic::process::get_or_spawn")?
                 .write(&process_id.to_le_bytes())
                 .or_trap("lunatic::process::get_or_spawn")?;
+            audit.finish_with_target(
+                AuditResult::Succeeded,
+                AuditReason::Completed,
+                AuditTarget::new(AuditTargetKind::Process)
+                    .with_node_id(node_id)
+                    .with_process_id(process_id)
+                    .with_sensitive_data(SensitiveData::Redacted),
+            );
             Ok(2)
         } else {
             if name.len() <= MAX_REGISTRY_NAME_BYTES
+                && !name.chars().any(char::is_control)
                 && ensure_registry_insert_capacity(&registry, name).is_err()
             {
                 // Capacity may consist entirely of dead local registrations.
                 // Sweep only on saturation so normal lookup remains O(1), and
                 // never discard remote entries whose liveness is not locally
                 // authoritative.
-                registry.retain(|_, (entry_node_id, process_id)| {
-                    *entry_node_id != node_id || environment.get_process(*process_id).is_some()
-                });
+                let stale = registry
+                    .iter()
+                    .filter(|(_, (entry_node_id, process_id))| {
+                        *entry_node_id == node_id && environment.get_process(*process_id).is_none()
+                    })
+                    .map(|(name, entry)| (name.clone(), *entry))
+                    .collect::<Vec<_>>();
+                for (stale_name, (entry_node_id, process_id)) in stale {
+                    registry.remove(&stale_name);
+                    emit_registry_change(
+                        state,
+                        AuditAction::Unregister,
+                        AuditResult::Succeeded,
+                        AuditReason::Completed,
+                        entry_node_id,
+                        process_id,
+                    );
+                }
             }
             if let Err(error) = ensure_registry_insert_capacity(&registry, name) {
+                let reason =
+                    if name.len() > MAX_REGISTRY_NAME_BYTES || name.chars().any(char::is_control) {
+                        AuditReason::InvalidInput
+                    } else {
+                        AuditReason::ResourceLimit
+                    };
+                audit.finish(AuditResult::Failed, reason);
                 return return_process_error_in_state(state, memory_slice, id_ptr, error);
             }
             let name = name.to_owned();
             // Spawn a new process. This is copy of the code in `spawn` because host functions can't call
             // each other.
             if !state.config().can_spawn_processes() {
+                audit.finish(AuditResult::Denied, AuditReason::CapabilityDenied);
                 return return_process_error_in_state(
                     state,
                     memory_slice,
@@ -1486,6 +1734,7 @@ where
             }
 
             if !state.is_initialized() {
+                audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
                 return return_process_error_in_state(
                     state,
                     memory_slice,
@@ -1507,6 +1756,7 @@ where
                     if let Err(error) =
                         validate_delegated_config(state, config_id as u64, &config, "get_or_spawn")
                     {
+                        audit.finish(AuditResult::Denied, AuditReason::DelegationExceedsParent);
                         return return_process_error_in_state(state, memory_slice, id_ptr, error);
                     }
                     Arc::new(config)
@@ -1525,7 +1775,8 @@ where
             let mut new_state = match state.new_state(module.clone(), config) {
                 Ok(new_state) => new_state,
                 Err(error) => {
-                    return return_process_error_in_state(state, memory_slice, id_ptr, error)
+                    audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
+                    return return_process_error_in_state(state, memory_slice, id_ptr, error);
                 }
             };
 
@@ -1592,14 +1843,21 @@ where
 
             // set state instead of config TODO
             let env = state.environment();
-            let (proc_or_error_id, result) = match lunatic_process::wasm::spawn_wasm(
-                env, runtime, &module, new_state, function, params, link,
-            )
-            .await
-            {
-                Ok((_, process)) => (process.id(), 0),
-                Err(error) => (state.add_error_resource(error), 1),
-            };
+            audit.mark_async();
+            let (proc_or_error_id, result, process_limit_denied) =
+                match lunatic_process::wasm::spawn_wasm(
+                    env, runtime, &module, new_state, function, params, link,
+                )
+                .await
+                {
+                    Ok((_, process)) => (process.id(), 0, false),
+                    Err(error) => {
+                        let process_limit_denied =
+                            error.downcast_ref::<ProcessLimitReached>().is_some();
+                        (state.add_error_resource(error), 1, process_limit_denied)
+                    }
+                };
+            audit.mark_failed(AuditReason::InvalidInput);
 
             memory_slice
                 .get_mut(node_id_ptr as usize..(node_id_ptr + 8) as usize)
@@ -1618,6 +1876,28 @@ where
             // process creation both succeeded.
             if result == 0 {
                 registry.insert(name, (node_id, proc_or_error_id));
+                emit_registry_change(
+                    state,
+                    AuditAction::Register,
+                    AuditResult::Succeeded,
+                    AuditReason::Completed,
+                    node_id,
+                    proc_or_error_id,
+                );
+                audit.finish_with_target(
+                    AuditResult::Succeeded,
+                    AuditReason::Completed,
+                    AuditTarget::new(AuditTargetKind::Process)
+                        .with_node_id(node_id)
+                        .with_process_id(proc_or_error_id)
+                        .with_sensitive_data(SensitiveData::Redacted),
+                );
+            } else {
+                if process_limit_denied {
+                    audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
+                } else {
+                    audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
+                }
             }
 
             Ok(result)

@@ -119,7 +119,7 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     let runtime = runtimes::wasmtime::WasmtimeRuntime::new(&wasmtime_config)?;
     let envs = Arc::new(LunaticEnvironments::default());
 
-    let node = tokio::task::spawn(lunatic_distributed::distributed::server::node_server(
+    let mut node = tokio::task::spawn(lunatic_distributed::distributed::server::node_server(
         ServerCtx {
             envs: envs.clone(),
             modules: Modules::<DefaultProcessState>::default(),
@@ -134,11 +134,11 @@ pub(crate) async fn start(args: Args) -> Result<()> {
         node_cert.serialize_private_key_pem(),
     ));
 
-    if args.wasm.is_some() {
+    let wasm = if let Some(path) = args.wasm {
         let env = envs.create(1).await?;
-        tokio::task::spawn(async {
+        Some(tokio::task::spawn(async move {
             if let Err(e) = run_wasm(RunWasm {
-                path: args.wasm.unwrap(),
+                path,
                 wasm_args: vec![],
                 dir: vec![],
                 runtime,
@@ -153,18 +153,24 @@ pub(crate) async fn start(args: Args) -> Result<()> {
             {
                 log::error!("Error running wasm: {e:?}");
             }
-        });
+        }))
+    } else {
+        None
+    };
+
+    tokio::select! {
+        _ = &mut node => {}
+        _ = async_ctrlc::CtrlC::new().unwrap() => {
+            log::info!("Shutting down node");
+            node.abort();
+            let _ = node.await;
+        }
     }
 
-    let ctrl = control_client.clone();
-    tokio::task::spawn(async move {
-        async_ctrlc::CtrlC::new().unwrap().await;
-        log::info!("Shutting down node");
-        ctrl.notify_node_stopped().await.ok();
-        std::process::exit(0);
-    });
-
-    node.await.ok();
+    if let Some(wasm) = wasm {
+        wasm.abort();
+        let _ = wasm.await;
+    }
 
     control_client.notify_node_stopped().await.ok();
 

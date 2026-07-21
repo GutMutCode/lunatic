@@ -1,9 +1,12 @@
 use std::{
-    fs,
-    io::{Read, Seek, Write},
+    fmt, fs,
+    io::{self, Read, Seek, Write},
     path::PathBuf,
     str::FromStr,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{anyhow, Context};
 use log::debug;
@@ -67,21 +70,51 @@ impl FileBased for GlobalLunaticConfig {
         let lunatic_path = home_path.join(".lunatic");
         let config_path = lunatic_path.join("lunatic.toml");
         if let Err(e) = fs::read_dir(lunatic_path.clone()) {
-            fs::create_dir(lunatic_path).map_err(|_| {
+            fs::create_dir(&lunatic_path).map_err(|_| {
                 ConfigError::FileWriteFailed(format!(
                     "failed to create ~/.lunatic directory. Error: {e:?}"
                 ))
             })?
         };
+        #[cfg(unix)]
+        fs::set_permissions(&lunatic_path, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            ConfigError::FileWriteFailed(format!("failed to protect ~/.lunatic directory: {error}"))
+        })?;
         Ok(config_path)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+fn open_private_config(path: &PathBuf, truncate: bool) -> io::Result<fs::File> {
+    let mut options = fs::File::options();
+    options
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(truncate);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Provider {
     pub login_id: String,
     pub name: String,
     pub cookies: Vec<String>,
+}
+
+impl fmt::Debug for Provider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Provider")
+            .field("login_id", &"[REDACTED]")
+            .field("name", &"[REDACTED]")
+            .field("cookies", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl Provider {
@@ -120,13 +153,7 @@ where
     fn get_file_path() -> Result<PathBuf, ConfigError>;
 
     fn from_toml_file(path: PathBuf) -> Self {
-        match fs::File::options()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(path.clone())
-        {
+        match open_private_config(&path, false) {
             Ok(mut file) => {
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf)
@@ -139,7 +166,8 @@ where
                 loaded_toml
             }
             Err(_e) => {
-                let mut file = fs::File::create(path).expect("failed to create new lunatic.toml");
+                let mut file =
+                    open_private_config(&path, true).expect("failed to create new lunatic.toml");
                 let initial_state = Self::default();
                 let encoded = toml::to_vec(&initial_state).expect("Failed to encode toml");
                 file.write_all(&encoded)
@@ -151,13 +179,8 @@ where
 
     fn flush_file(&mut self) -> Result<(), ConfigError> {
         let file_path = Self::get_file_path()?;
-        let mut file = fs::File::options()
-            .truncate(true)
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(file_path)
-            .map_err(|_e| ConfigError::FileMissing("-"))?;
+        let mut file =
+            open_private_config(&file_path, true).map_err(|_e| ConfigError::FileMissing("-"))?;
         let encoded = toml::to_vec(self).map_err(|_| ConfigError::TomlEncodingFailed)?;
         file.rewind()
             .map_err(|e| ConfigError::FileWriteFailed(e.to_string()))?;
@@ -238,7 +261,10 @@ impl ConfigManager {
             .await
             .with_context(|| format!("Error sending HTTP {} request.", description))?;
 
-        debug!("Response from '{description}' {response:?}");
+        debug!(
+            "Response from '{description}' completed with status {}",
+            response.status()
+        );
 
         let status = response.status();
         if !status.is_success() {
@@ -348,5 +374,42 @@ impl ConfigManager {
                 .map_err(|e| anyhow!("Failed to flush project lunatic.toml config {e:?}")),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Provider;
+
+    #[test]
+    fn provider_debug_redacts_login_and_cookies() {
+        let provider = Provider {
+            login_id: "login-sentinel".to_owned(),
+            name: "https://example.invalid".to_owned(),
+            cookies: vec!["cookie-sentinel".to_owned()],
+        };
+
+        let debug = format!("{provider:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("login-sentinel"));
+        assert!(!debug.contains("cookie-sentinel"));
+        assert!(!debug.contains("https://example.invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_config_open_restricts_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("lunatic-private-config-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let file = super::open_private_config(&path, false).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }

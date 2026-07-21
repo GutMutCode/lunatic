@@ -1,236 +1,142 @@
 # Audit Logging
 
-Lunatic emits `target="audit"` formatted text records for process-config delegation decisions and selected successful process-spawn and network bind/accept/connect paths.
+Lunatic emits security-relevant runtime decisions as versioned JSON records on the Rust `log` target `audit` at `INFO` level.
 
-> **Current boundary (reviewed 2026-07-21):** These records do not form a complete or typed security-event contract. Capability delegation has selected allowed/denied coverage and executable assertions, but other denial/failure paths, stable schema and required fields, redaction tests, and sink guarantees remain unimplemented. This document is an event inventory and routing guide; it is not production-readiness or compliance evidence. See [`docs/core_values/status.md`](../core_values/status.md).
+This is an application-level event and delivery contract. It is not a durability, retention, tamper-evidence, or compliance guarantee. The built-in sink ends at the Rust `log` facade; an operator must configure and validate the downstream logger and storage path.
 
-## Overview
+## V1 event contract
 
-The operations listed below call the `audit` log target at selected delegation decisions and after selected successful actions. Coverage is not exhaustive, and routing/persistence depends on application logging configuration.
+Every record has the same envelope:
 
-## Logged Operations
-
-Lunatic logs the following privileged operations:
-
-### Process Management
-- **`capability_delegation`** - Child-config creation, mutation, preopen, and final local/distributed config validation
-  - Locations: `crates/lunatic-process-api/src/lib.rs`, `crates/lunatic-wasi-api/src/lib.rs`, `crates/lunatic-distributed-api/src/lib.rs`, `crates/lunatic-distributed/src/distributed/server.rs`
-  - Sender/local details: `parent_process={pid} config_id={id} operation={name} outcome={allowed|denied}`; `config_id` is omitted when creation is denied before an ID exists
-  - Receiver denial details: `environment={id} operation=distributed_receive outcome=denied`; the wire format does not currently carry the sender's guest process or local config ID
-  - Executable assertion: `tests/capability_attenuation.rs`
-
-- **`process_spawn`** - New process creation
-  - Location: `crates/lunatic-process-api/src/lib.rs`
-  - Details: `parent={pid} child={pid}`
-
-### Network Operations
-
-#### TCP
-- **`tcp_bind`** - TCP listener creation
-  - Location: `crates/lunatic-networking-api/src/tcp.rs:96`
-  - Details: `address={addr:port}`
-
-- **`tcp_accept`** - Incoming TCP connection accepted
-  - Location: `crates/lunatic-networking-api/src/tcp.rs:205`
-  - Details: `peer={addr:port}`
-
-- **`tcp_connect`** - Outgoing TCP connection established
-  - Location: `crates/lunatic-networking-api/src/tcp.rs:284`
-  - Details: `peer={addr:port}`
-
-#### UDP
-- **`udp_bind`** - UDP socket binding
-  - Location: `crates/lunatic-networking-api/src/udp.rs:88`
-  - Details: `address={addr:port}`
-
-- **`udp_connect`** - UDP connection establishment
-  - Location: `crates/lunatic-networking-api/src/udp.rs:282`
-  - Details: `peer={addr:port}`
-
-#### TLS
-- **`tls_bind`** - TLS listener creation
-  - Location: `crates/lunatic-networking-api/src/tls_tcp.rs:166`
-  - Details: `address={addr:port}`
-
-- **`tls_accept`** - Incoming TLS connection accepted
-  - Location: `crates/lunatic-networking-api/src/tls_tcp.rs:252`
-  - Details: `peer={addr:port}`
-
-- **`tls_connect`** - Outgoing TLS connection established
-  - Location: `crates/lunatic-networking-api/src/tls_tcp.rs:426`
-  - Details: `peer={addr} port={port}`
-
-## Implementation
-
-### API
-
-Audit logging uses the `audit_log` helper from `lunatic-common-api`:
-
-```rust
-use lunatic_common_api::audit_log;
-
-// Log an audit event
-audit_log("event_name", format!("key1=value1 key2=value2"));
-```
-
-### Internal Implementation
-
-`crates/lunatic-common-api/src/lib.rs:112`:
-```rust
-/// Emit an audit log entry with `target = "audit"` so operators can route it separately.
-pub fn audit_log(event: &str, details: impl AsRef<str>) {
-    info!(target: "audit", "{} {}", event, details.as_ref());
+```json
+{
+  "schema_version": 1,
+  "sequence": 42,
+  "event": "network_connect",
+  "action": "connect",
+  "result": "succeeded",
+  "reason": "completed",
+  "subject": {
+    "node_id": null,
+    "environment_id": 7,
+    "process_id": 11
+  },
+  "target": {
+    "kind": "network_endpoint",
+    "resource_id": null,
+    "node_id": null,
+    "environment_id": null,
+    "process_id": null,
+    "port": 443,
+    "sensitive_data": "redacted"
+  }
 }
 ```
 
-All audit logs use:
-- **Log level**: `INFO`
-- **Log target**: `audit`
-- **Format**: `{event} {details}`
+The enums in `lunatic_common_api::audit` define the stable event, action, result, reason, and target values. Optional identity keys are always present and serialize as `null` when that layer does not know the value. The dedicated writer assigns `sequence` in dequeue order, so concurrent producers cannot create out-of-order records. Queue rejections occur before sequence assignment and must be detected from delivery counters; a gap among records accepted by a custom sink can indicate a sink write failure.
 
-### Example Output
+Results have distinct meanings:
 
-With default env_logger configuration:
-```
-[2025-10-06T10:30:45Z INFO  audit] tcp_bind address=0.0.0.0:8080
-[2025-10-06T10:30:46Z INFO  audit] process_spawn parent=1 child=42
-[2025-10-06T10:30:47Z INFO  audit] tls_connect peer=api.example.com port=443
-```
+- `allowed` / `denied`: an authorization or delegation decision.
+- `succeeded` / `failed`: an attempted operation's terminal result.
+- `cancelled`: the operation did not reach a normal terminal branch.
 
-## Routing Audit Logs
+Reasons are stable machine codes. Raw `anyhow` messages, OS errors, payloads, or user-controlled detail strings are not part of the schema.
 
-### Simple: Filter by Target
+## Current event coverage
 
-Use env_logger filter to route audit logs separately:
+The implemented boundary records:
 
-```bash
-# Only show audit logs
-RUST_LOG=audit=info lunatic run app.wasm
+- module compile permission, success, and failure;
+- child configuration creation, mutation, and final delegated-config validation;
+- filesystem preopen delegation and WASI directory operations (`open`, create, remove, link, rename, metadata, and time changes);
+- local spawn, get-or-spawn, distributed spawn authorization, receiver authorization, and receiver spawn results;
+- TCP/TLS bind, accept, and connect; UDP bind, connect, and send-to; DNS resolution;
+- operation-level resource denials reached by the covered spawn and network paths;
+- hot-reload transaction commit, rollback, in-doubt, and failure results;
+- local/global distributed-registry changes, coordinator protocol denials, and snapshot application.
 
-# Show all logs but route audit separately
-RUST_LOG=info,audit=info lunatic run app.wasm 2>&1 | tee >(grep "audit" >> audit.log)
-```
+Events are emitted at one operation boundary. Replica application does not repeat the coordinator's logical registry event, and quota helpers do not emit a second event when their owning network/spawn operation already records the denial.
 
-### Operational Routing: See Persistence Guide
+Receiver authorization events record the verified local node as the subject and
+the requested environment as the target. They deliberately leave the remote
+node identity `null`: the current mTLS certificate attributes authorize
+environment access but do not bind a signed numeric node ID. Registry protocol
+denial events likewise omit the request payload's claimed node ID. Until the
+transport supplies an authenticated peer ID, that payload field is protocol
+input rather than trustworthy audit identity.
 
-For deployment-oriented routing examples, see the [Audit Logging Persistence and Aggregation Guide](./AUDIT_LOGGING_PERSISTENCE.md), which covers:
+This coverage is intentionally narrower than "every host call." Routine reads/writes, message contents, and non-security diagnostics are not audit events.
 
-- **Architecture Options**:
-  - OpenTelemetry + OTLP (recommended for cloud-native)
-  - Syslog integration (traditional Unix environments)
-  - JSON + Fluent Bit (Kubernetes/containers)
+## Redaction contract
 
-- **Storage Recommendations**:
-  - Retention policies (SOC 2, HIPAA, PCI DSS)
-  - Storage backends (Elasticsearch, ClickHouse, S3)
-  - Index lifecycle management
+`AuditTarget` accepts enum values, numeric IDs, and a port only. It has no arbitrary string field. Callers therefore cannot place raw paths, IP addresses, hostnames, registry names, guest function names, or error messages in V1 records. When such input exists, `sensitive_data` is `redacted`.
 
-- **Analysis and Alerting**:
-  - Key security queries
-  - Anomaly detection
-  - Alerting rules
+The event schema never accepts:
 
-- **Compliance**:
-  - Log integrity (tamper-proofing)
-  - Access control
-  - PII redaction
+- TLS certificates, private keys, or session material;
+- cookies, bearer tokens, credentials, or authorization headers;
+- environment values or command-line arguments;
+- filesystem paths or registry names;
+- message, SQL, HTTP, or Wasm payload bytes;
+- raw diagnostic errors.
 
-## Adding New Audit Events
+Related runtime `Debug` implementations redact credential-bearing configuration and migration data. This does not turn general diagnostic logging into an audit sink; operators must still protect all runtime logs.
 
-When adding privileged operations, emit audit logs:
+## Delivery and backpressure
 
-1. **Import the helper**:
-   ```rust
-   use lunatic_common_api::audit_log;
-   ```
+The default `AuditDispatcher` has a dedicated writer thread and a bounded queue of 1,024 records. Guest/runtime operations call `try_send` and never wait for queue capacity.
 
-2. **Log the operation**:
-   ```rust
-   audit_log("operation_name", format!("detail1={} detail2={}", val1, val2));
-   ```
+The policy is:
 
-3. **Use consistent naming**:
-   - Operation: `{resource}_{action}` (e.g., `tcp_bind`, `process_spawn`)
-   - Details: `key=value` pairs separated by spaces
+- disabled: drop the event and continue the operation (`fail-open`);
+- queue full: drop the newest event and continue (`fail-open`);
+- writer closed: drop and continue (`fail-open`);
+- logger/sink unavailable, returned error, or panic: open the health circuit, count the failure, suppress queued and later writes, and continue (`fail-open`); a bounded flush is still attempted once so records buffered before the failure can drain;
+- shutdown: atomically stop new event admission, wait at most 250 ms for already-admitted producers, prior events, and sink flush, then report the outcome without hanging shutdown; background producers after that boundary receive `DroppedClosed`.
 
-4. **Include relevant context**:
-   - Resource identifiers (IDs, addresses)
-   - Parent/child relationships
-   - Success/failure indication (if applicable)
+Concurrent flush callers may share a pending barrier only when that barrier is
+ordered after every event accepted before the caller began. A later caller
+whose required event epoch is newer waits for a subsequent barrier. A timed-out
+caller does not consume event capacity; the writer can still complete and
+release the one reserved control slot.
 
-### Example: Adding File Access Auditing
+The observable counters are returned by `audit_stats()`: attempted, enqueued, written, each drop category, sink/flush failures, flush timeouts/pending state, queue depth, and sink health. Counters are lock-free operational metrics read independently, not a transactional snapshot; consumers must not require cross-field equality from one sample. `written` means the configured `AuditSink::write` returned success. For the default `LogAuditSink`, that proves only handoff to the enabled Rust logger, not disk persistence or remote ingestion.
 
-```rust
-use lunatic_common_api::audit_log;
+The runtime enables `audit=info` in its default filter. An explicit `RUST_LOG` value replaces that default; operators who override it must include `audit=info` if events are required.
 
-pub fn open_file(path: &str, mode: &str) -> Result<File> {
-    let file = File::open(path)?;
+## Embedding API
 
-    // Audit the file access
-    audit_log("file_open", format!("path={} mode={}", path, mode));
-
-    Ok(file)
-}
-```
-
-## Testing
-
-### Verify Audit Logs
-
-```bash
-# Run with audit logging enabled
-RUST_LOG=audit=info lunatic run test.wasm 2>&1 | grep audit
-```
-
-### Integration Tests
-
-When testing privileged operations, verify audit logs are emitted:
+Embedders may install an `AuditDispatcher` with their own `AuditSink` before the first event:
 
 ```rust
-#[test]
-fn test_tcp_bind_logs_audit() {
-    let _logs = capture_logs(|| {
-        tcp_bind("0.0.0.0:8080").unwrap();
-    });
+use lunatic_common_api::{
+    install_global_audit_dispatcher, AuditConfig, AuditDispatcher, AuditSink,
+};
 
-    assert!(logs.contains("tcp_bind address=0.0.0.0:8080"));
-}
+let dispatcher = AuditDispatcher::new(AuditConfig::default(), MySink::new()?);
+install_global_audit_dispatcher(dispatcher)
+    .map_err(|_| anyhow::anyhow!("audit dispatcher was already initialized"))?;
 ```
 
-## Security Considerations
+The sink runs on the dedicated writer thread. It must emit one record per event and must not reintroduce redacted data. A custom sink defines its own persistence semantics; Lunatic does not infer durability from successful construction.
 
-### What is Logged
-- Process creation (parent/child relationships)
-- Capability-delegation decisions (selected allowed and denied paths)
-- Network bindings and connections (addresses and ports)
-- TLS connections (peer addresses)
+## Verification
 
-### What is NOT Logged
-- Payload data (message contents)
-- Authentication credentials
-- Process-internal state
-- Memory contents
+The common API has deterministic tests for the exact V1 JSON shape, redaction state, concurrent-producer/FIFO sequencing, disabled delivery, full-queue drop-newest, sink error and panic circuit opening, counters, and bounded flush. Host API tests assert typed fields for the representative production paths listed below rather than treating substring-formatted diagnostic messages as audit evidence.
 
-### Privacy
-- IP addresses are logged (may be PII under GDPR)
-- Process IDs are logged (non-sensitive)
-- No user data or payload contents are logged
+Production-import integration tests capture exact terminal records for process
+capability and process-quota decisions, configuration/preopen mutations, local
+registry changes, TCP/UDP bind, DNS resolution, and TLS/port validation. They
+cover successful, denied, failed, and redacted outcomes. The live-Wasm reload
+test captures one record for each commit, rollback, in-doubt, and blocked
+attempt. WASI directory tests cover successful access and cancellation-guard
+behavior. Distributed receiver decode/authorization and atomic-admission
+classification are tested at their production helpers, including omission of
+unverified remote identity; a full remote-spawn
+audit capture still depends on the existing QUIC integration path and is not
+claimed as a standalone audit-delivery E2E.
 
-For PII redaction strategies, see [Audit Logging Persistence Guide](./AUDIT_LOGGING_PERSISTENCE.md#3-pii-redaction).
+For deployment routing and the precise external boundary, see [Audit Logging Persistence](./AUDIT_LOGGING_PERSISTENCE.md).
 
-## Related Documentation
-
-- **[Audit Logging Persistence and Aggregation Guide](./AUDIT_LOGGING_PERSISTENCE.md)** - Operational routing ideas; not a runtime completeness guarantee
-- [Security Through Isolation](../core_values/status.md#3-security-through-isolation) - Security core values
-- [Core Values Status](../core_values/status.md) - Overall compliance status
-
-## References
-
-- Code: `crates/lunatic-common-api/src/lib.rs:112` - `audit_log` implementation
-- Usage: Search codebase for `audit_log(` to find all audit events
-
----
-
-**Last Updated**: 2026-07-21
-
-**Status**: Scope-limited implementation note; production security-event coverage is incomplete
+**Last reviewed:** 2026-07-21

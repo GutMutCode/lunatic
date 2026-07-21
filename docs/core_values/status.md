@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-21
 
-Reviewed working tree based on: `9fcc6df631196b8167cf22d3511eccf4cb3d9e70` plus the reviewed working-tree changes for Hanary #1660
+Reviewed working tree based on: `f9b97a10d7e6d2a9666b50a7dd2ec671fb9a6853` plus the reviewed working-tree changes for Hanary #1663
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -18,22 +18,25 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Focus | Status | Current evidence boundary |
 | --- | --- | --- |
 | Fast | Partial | Wasmtime preemption primitives and live process-local hot reload are production-path tested. Hot-reload latency and end-to-end local/remote process delivery are not benchmarked. |
-| Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and failed-reload fallback are production-path tested. Acknowledged coordinated reload/rollback semantics remain incomplete. |
-| Scalable | Emerging | Concurrent registries and quotas exist, but mailboxes/signals are unbounded and cluster-scale process/resource behavior is unverified. |
+| Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and acknowledged atomic reload/rollback/in-doubt behavior are production-path tested. Cross-node recovery remains incomplete. |
+| Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
-| Security Through Isolation | Partial | Process configs now default to denied capabilities and enforce non-increasing child authority. Remote preopens fail closed; complete accounting, a usable receiver path policy, and structured audit events remain open. |
+| Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. Typed/redacted V1 audit events cover major privileged boundaries, but complete resource accounting, a receiver path policy, and durable/required audit delivery remain open. |
 | Fault Tolerance & HA | Partial | Actual-Wasm links and monitors, process-local live reload, host-side OTP components, snapshots, and registry quorum components exist. Distributed recovery paths remain incomplete. |
-| Async by Default | Partial | Wasmtime preemption and several async host paths exist. Unbounded queues and unverified blocking host calls prevent a stronger claim. |
+| Async by Default | Partial | Wasmtime preemption, bounded actor ingress, and several async host paths exist. Unverified blocking host calls and scheduler fairness prevent a stronger claim. |
 | Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
 
 Status values: **Strong** means production-path implementation plus executable validation; **Partial** means major connected elements with material gaps; **Emerging** means useful scaffolding without a demonstrated system-level guarantee. No focus currently meets the Strong threshold.
 
 ## P0 Production-Path Gaps
 
-These gaps invalidate broad “production ready,” “all processes,” or “fully implemented” claims:
-
-1. **Queue and environment growth are not bounded end to end.** Process message and signal channels are unbounded, and the environment does not enforce a process-count limit. Existing file, network, memory, and table checks do not close mailbox/signal/process exhaustion paths (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/env.rs`, `src/config.rs`).
-2. **Reload coordination has no process acknowledgement protocol.** Successful signal delivery is treated as successful reload; coordinated atomic commit, version lifecycle, and rollback are not proven against actual process results. Rollback send failures are logged rather than recovered (`crates/lunatic-process/src/hot_reload.rs`).
+No unresolved P0 gap was identified in this reviewed snapshot. The former
+unbounded actor-ingress/process-admission gap is closed by finite, transactional
+quotas, and the former reload-coordination gap is closed by process
+acknowledgements, atomic commit, full-target rollback, and explicit in-doubt
+state. The partial ratings below remain because durable audit delivery,
+receiver-selected authority, cross-node recovery, and scale evidence are still
+missing.
 
 ## 1. Fast, Robust, and Scalable
 
@@ -42,6 +45,16 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 - Wasmtime stores configure async fuel yielding and epoch deadlines (`crates/lunatic-process/src/runtimes/wasmtime.rs`).
 - The watch-equivalent compile/register/broadcast boundary reaches a live Wasm process through `Signal::HotReload`. Its execution driver preserves compatible linear memory, process identity, FIFO mailbox contents, and supported in-process host resources across successful replacement, and resumes the previous instance after signature rejection or instantiation failure (`tests/live_hot_reload.rs`).
 - `MessageMailbox` implements asynchronous waiting and selective receive (`crates/lunatic-process/src/mailbox.rs`).
+- Per-process mailbox slots, signal ingress, message bytes/resources, network
+  handles, DNS iterators, and environment process admission are finite. Failed
+  admission preserves ownership, and cancellation/drop releases reservations
+  (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/state.rs`,
+  `crates/lunatic-process/src/env.rs`, `crates/lunatic-networking-api`,
+  `src/state.rs`).
+- `ReloadCoordinator` waits for process acknowledgements, commits only after
+  the full target set applies the version, rolls the full set back after any
+  apply failure, and blocks later updates when rollback is in doubt.
+  `tests/live_hot_reload.rs` exercises this through running Wasm processes.
 - Instance-pool and component microbenchmarks provide useful local regression signals.
 - The distributed QUIC benchmark uses real loopback mTLS, production framing, reassembly, MessagePack decoding, and the request-dispatch boundary.
 
@@ -75,17 +88,19 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 - Spawn, compile, and config-creation operations have capability checks (`crates/lunatic-process-api/src/lib.rs`).
 - `DefaultProcessConfig` denies compile/create/spawn and preopens by default. Child configs clear ambient arguments, environment values, preopens, and boolean capabilities while inheriting parent resource ceilings. Guest setters and local/lookup/distributed spawn boundaries enforce non-increasing capability, path, memory, fuel, table, FD, and network ceilings (`src/config.rs`, `crates/lunatic-process-api/src/lib.rs`, `crates/lunatic-wasi-api/src/lib.rs`, `crates/lunatic-distributed-api/src/lib.rs`).
 - Distributed configs with filesystem preopens fail closed at both sender and receiver boundaries because sender-local paths are not remote authority (`crates/lunatic-distributed-api/src/lib.rs`, `crates/lunatic-distributed/src/distributed/server.rs`, `src/state.rs`).
-- Production-import integration tests cover default compile/create/spawn/preopen denial, Windows-safe checked escalation errors and rollback, legacy void-setter no-op safety, checked and legacy delegation through actual child spawn, guest-readable returned error IDs, final selected-config validation through both local spawn imports, bounded error resources under repeated denial, sender-side remote-preopen rejection, and allowed/denied formatted audit emission (`tests/capability_attenuation.rs`). Receiver tests deserialize and validate configs through the production receive helper (`crates/lunatic-distributed/src/distributed/server.rs`).
+- Production-import integration tests cover default compile/create/spawn/preopen denial, Windows-safe checked escalation errors and rollback, legacy void-setter no-op safety, checked and legacy delegation through actual child spawn, guest-readable returned error IDs, final selected-config validation through both local spawn imports, bounded error resources under repeated denial, sender-side remote-preopen rejection, and typed allowed/denied audit emission (`tests/capability_attenuation.rs`). Receiver tests deserialize and validate configs through the production receive helper (`crates/lunatic-distributed/src/distributed/server.rs`).
+- `AuditEventV1` provides stable enum fields, available process/environment/node identity, typed targets, machine reason codes, and writer-ordered sequence numbers. String-free targets omit paths, endpoints, registry names, credentials, payloads, argv/env values, and raw errors before enqueue. Common tests cover exact JSON, redaction state, concurrent-producer FIFO, queue saturation, disabled/unavailable sinks, writer error/panic, counters, and bounded flush (`crates/lunatic-common-api/src/audit.rs`).
+- Privileged operation boundaries now record compile/config/preopen/WASI directory access, local and distributed spawn, TCP/TLS/UDP/DNS operations, covered resource-limit denials, hot-reload terminal outcomes, distributed-registry changes/snapshots, and distributed authorization denials. Operation-level guards emit one terminal result on success, denial, failure, timeout, or early trap.
 - Networking paths enforce several per-process limits, and Wasmtime uses memory/table resource limiting (`crates/lunatic-networking-api`, `src/state.rs`).
 - A directly tested same-runtime helper can transfer supported live network resource maps between process states without serializing TLS traffic keys. Serialized active TLS restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
 
 ### Boundary
 
 - Filesystem preopens are canonicalized and attenuated locally, but path replacement still has a check/open race. Remote preopens are unavailable until a receiver-controlled path mapping/allowlist is implemented; this is a functionality gap, not an ambient-authority fallback.
-- Authenticated cluster nodes are trusted for serialized non-filesystem capability flags and resource ceilings. A receiver-owned policy does not yet independently cap compile/create/spawn, memory, fuel, table, FD, or network authority from a compromised peer.
-- FD and network ceilings are attenuated as configuration values, but FD accounting is not connected to every host file operation and network accounting does not yet cover all listener/TLS/UDP/DNS resources or destination policy.
-- Resource accounting is not yet closed across processes, messages, signals, and all handles.
-- Capability delegation emits tested allowed/denied `target="audit"` records. Selected successful process-spawn and network bind/accept/connect paths also emit formatted records, but their denial/failure coverage, a stable typed schema, required fields, sink contract, and redaction tests remain unimplemented. A persistence guide is operational guidance, not implementation evidence.
+- Distributed receivers apply the fixed default capability and resource ceiling, but operators cannot yet select a stricter per-node policy; fuel has no receiver-owned finite ceiling. mTLS authenticates certificate and permission attributes but does not bind the peer to a signed numeric node ID. Registry control messages still trust a payload-claimed node ID for leader checks, so an authenticated peer can spoof leader-origin messages. Audit authorization records omit that unverified remote ID rather than presenting it as identity.
+- Every guest-visible TCP/TLS listener or stream and UDP socket owns a paired FD/network lease, and DNS/address iterators are finite. General WASI file handles and network destination policy are not connected to those limits.
+- Local actor ingress and resource transfer are bounded, but aggregate host/cluster memory, CPU, disk, and remote-transport budgets are not closed by one global policy.
+- Audit delivery is best-effort and fail-open: a dedicated writer uses a bounded 1,024-record queue, drops newest on saturation, opens a health circuit on sink failure, exposes counters, and waits at most 250 ms at graceful shutdown. The default sink ends at the enabled Rust `log` facade; it does not prove disk/remote persistence, action-plus-audit atomicity, retention, or tamper evidence. An explicit `RUST_LOG` can still disable `audit=info`, and remaining non-privileged host calls are outside the event inventory.
 - The running-Wasm reload transaction invokes the same-runtime live-resource transfer after its fallible preparation steps. Exact TLS session/ID preservation is tested at that transfer boundary, not yet by a guest-driven reload E2E. Serialized snapshots, host restarts, and cross-node migration cannot restore active TCP/TLS streams; listener restoration has separate support.
 
 ## 4. Fault Tolerance and High Availability
@@ -99,7 +114,7 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 
 ### Boundary
 
-- Process-local reload re-enters the guest entrypoint rather than continuing the interrupted instruction stream, and it has no completion acknowledgement; broad zero-downtime and coordinated-upgrade claims remain unsupported. Cross-node failure propagation remains outside the local link/monitor evidence.
+- Process-local reload re-enters the guest entrypoint rather than continuing the interrupted instruction stream. Acknowledged commit/rollback is implemented for the local environment, but it does not establish instruction-level continuation, cross-node coordination, or broad zero-downtime guarantees. Cross-node failure propagation remains outside the local link/monitor evidence.
 - Registry coordination is real, and cleanup helpers exist, but guest name lookup, automatic process/node-lifecycle-triggered ownership cleanup, and live cross-node process-mailbox delivery are not connected and tested together.
 - Cross-node process failure, reload, rollback, and message recovery have no production-path E2E test.
 
@@ -112,7 +127,7 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 
 ### Boundary
 
-- Unbounded message and signal channels provide no backpressure guarantee.
+- Actor message and signal ingress is bounded and returns ownership-preserving pressure errors, but producer retry/fairness behavior is application-specific.
 - No audit or test proves that every potentially blocking host call yields instead of occupying an executor worker.
 - Fairness under sustained CPU, I/O, and mailbox load has not been established by a deterministic test.
 
@@ -144,7 +159,7 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
 | Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
 
-Windows baseline verification on 2026-07-21, before the Hanary #1659 working-tree changes, completed `cargo test --all` across 57 suites with 158 passing tests, zero failures, and four ignored documentation examples. The #1659 changes add active Wasm `receive`/`sleep_ms` cancellation and host-panic coverage plus a narrowly vendored backport of the upstream Windows fiber-local-storage guard. Those new paths passed locally on macOS; they must also pass the existing Windows CI matrix before merge. Source parity with the upstream guard is not a substitute for that runtime evidence.
+The reviewed working tree must pass the complete local Rust build/test/lint/format gate and the repository's Linux and Windows GitHub Actions checks. Historical green runs do not establish the current audit, quota, reload, or Windows behavior; the exact reviewed commit and CI run are the acceptance evidence.
 
 The benchmark documents under `docs/benchmarks/` preserve an October 2025 measurement snapshot, but the original record omitted the tested commit and exact hardware/toolchain profile. It is therefore not a reproducible baseline. Future values must be quoted with commit, dirty state, hardware, toolchain, workload, and evidence boundary; they are not release certification by default.
 
@@ -158,15 +173,13 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 
 ## Prioritized Follow-Ups
 
-1. Add reload acknowledgement, coordinated atomic commit, rollback, and version lifecycle semantics.
-2. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
-3. Bound mailboxes/signals/process creation and validate resource accounting under pressure.
-4. Define structured security audit events and test schema/redaction guarantees.
-5. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
-6. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
-7. Connect Supervisor monitor intake and OTP guest/runtime adapters.
-8. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
-9. Add scale, soak, and final production-readiness gates.
+1. Add an operator-selectable required/fail-closed durable audit sink and health endpoint, then extend the typed inventory to any remaining privileged host boundaries.
+2. Bind each authenticated transport peer to its numeric node ID and reject mismatched claims; then add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
+3. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
+4. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
+5. Connect Supervisor monitor intake and OTP guest/runtime adapters.
+6. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
+7. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
 
 ## Related Resources
 

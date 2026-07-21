@@ -2164,6 +2164,8 @@ version = "0.13.2"
 dependencies = [
  "anyhow",
  "log",
+ "serde",
+ "serde_json",
  "wasmtime",
 ]
 
@@ -2209,6 +2211,7 @@ dependencies = [
  "dashmap",
  "futures",
  "log",
+ "lunatic-common-api",
  "lunatic-control",
  "lunatic-process",
  "quinn",
@@ -2371,6 +2374,7 @@ dependencies = [
  "env_logger",
  "hash-map-id",
  "log",
+ "lunatic-common-api",
  "lunatic-control",
  "lunatic-control-axum",
  "lunatic-distributed",
@@ -2469,10 +2473,13 @@ name = "lunatic-wasi-api"
 version = "0.13.2"
 dependencies = [
  "anyhow",
+ "async-trait",
  "lunatic-common-api",
  "lunatic-error-api",
  "lunatic-process",
  "lunatic-stdout-capture",
+ "serde_json",
+ "tokio",
  "wasi-common",
  "wasmtime",
 ]

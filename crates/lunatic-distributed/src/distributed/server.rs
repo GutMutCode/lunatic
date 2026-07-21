@@ -1,10 +1,14 @@
 use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 
 use anyhow::{anyhow, Result};
+use lunatic_common_api::{
+    emit_audit_event, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
+    AuditSubject, AuditTarget, AuditTargetKind, SensitiveData,
+};
 
 use lunatic_process::{
     config::ProcessConfig,
-    env::{Environment, Environments},
+    env::{Environment, Environments, ProcessLimitReached},
     message::{DataMessage, Message},
     runtimes::{wasmtime::WasmtimeRuntime, Modules, RawWasm},
     state::ProcessState,
@@ -32,6 +36,114 @@ pub struct ServerCtx<T, E: Environment> {
     pub runtime: WasmtimeRuntime,
     pub node_client: Client,
     pub allowed_envs: Option<HashSet<u64>>,
+}
+
+struct PendingServerAudit {
+    event: Option<AuditEvent>,
+    action: AuditAction,
+    subject: AuditSubject,
+    target: AuditTarget,
+    fallback_result: AuditResult,
+    fallback_reason: AuditReason,
+}
+
+impl PendingServerAudit {
+    fn new(
+        event: AuditEvent,
+        action: AuditAction,
+        subject: AuditSubject,
+        target: AuditTarget,
+        fallback_reason: AuditReason,
+    ) -> Self {
+        Self {
+            event: Some(event),
+            action,
+            subject,
+            target,
+            fallback_result: AuditResult::Failed,
+            fallback_reason,
+        }
+    }
+
+    fn mark_async(&mut self) {
+        self.fallback_result = AuditResult::Cancelled;
+        self.fallback_reason = AuditReason::Cancelled;
+    }
+
+    fn mark_failed(&mut self, reason: AuditReason) {
+        self.fallback_result = AuditResult::Failed;
+        self.fallback_reason = reason;
+    }
+
+    fn finish(mut self, result: AuditResult, reason: AuditReason) {
+        self.emit(result, reason, None);
+    }
+
+    fn finish_with_target(mut self, result: AuditResult, reason: AuditReason, target: AuditTarget) {
+        self.emit(result, reason, Some(target));
+    }
+
+    fn emit(&mut self, result: AuditResult, reason: AuditReason, target: Option<AuditTarget>) {
+        if let Some(event) = self.event.take() {
+            emit_audit_event(AuditEventV1::new(
+                event,
+                self.action,
+                result,
+                reason,
+                self.subject,
+                target.unwrap_or(self.target),
+            ));
+        }
+    }
+}
+
+impl Drop for PendingServerAudit {
+    fn drop(&mut self) {
+        if self.event.is_some() {
+            let reason = self.fallback_reason;
+            self.emit(self.fallback_result, reason, None);
+        }
+    }
+}
+
+fn audit_request_authorization(
+    local_node_id: u64,
+    environment_id: u64,
+    result: AuditResult,
+    reason: AuditReason,
+) {
+    emit_audit_event(request_authorization_event(
+        local_node_id,
+        environment_id,
+        result,
+        reason,
+    ));
+}
+
+fn request_authorization_event(
+    local_node_id: u64,
+    environment_id: u64,
+    result: AuditResult,
+    reason: AuditReason,
+) -> AuditEventV1 {
+    AuditEventV1::new(
+        AuditEvent::DistributedRequestAuthorization,
+        AuditAction::Validate,
+        result,
+        reason,
+        AuditSubject::new().with_node_id(local_node_id),
+        AuditTarget::new(AuditTargetKind::DistributedRequest)
+            .with_environment_id(environment_id)
+            .with_sensitive_data(SensitiveData::Redacted),
+    )
+}
+
+fn classify_spawn_error(error: &anyhow::Error) -> (AuditResult, AuditReason) {
+    if error.downcast_ref::<ProcessLimitReached>().is_some() {
+        (AuditResult::Denied, AuditReason::ResourceLimit)
+    } else {
+        (AuditResult::Failed, AuditReason::RuntimeFailure)
+    }
 }
 
 impl<T: 'static, E: Environment> Clone for ServerCtx<T, E> {
@@ -136,6 +248,12 @@ where
     if let Some((node_id, env_id)) = env_id {
         if let Some(ref allowed_envs) = node_permissions.0 {
             if !allowed_envs.contains(&env_id) {
+                audit_request_authorization(
+                    ctx.distributed.node_id(),
+                    env_id,
+                    AuditResult::Denied,
+                    AuditReason::PolicyDenied,
+                );
                 ctx.node_client
                     .send_response(ResponseParams {
                         node_id: NodeId(node_id),
@@ -152,6 +270,12 @@ where
         }
         if let Some(ref allowed_envs) = ctx.allowed_envs {
             if !allowed_envs.contains(&env_id) {
+                audit_request_authorization(
+                    ctx.distributed.node_id(),
+                    env_id,
+                    AuditResult::Denied,
+                    AuditReason::PolicyDenied,
+                );
                 ctx.node_client
                     .send_response(ResponseParams {
                         node_id: NodeId(node_id),
@@ -166,6 +290,12 @@ where
                 return Ok(());
             }
         }
+        audit_request_authorization(
+            ctx.distributed.node_id(),
+            env_id,
+            AuditResult::Allowed,
+            AuditReason::PolicyAllowed,
+        );
     }
     match msg {
         Request::Spawn(spawn) => {
@@ -263,16 +393,11 @@ where
     Ok(())
 }
 
-fn decode_distributed_config<C: ProcessConfig>(encoded: &[u8], environment_id: u64) -> Result<C> {
+fn decode_distributed_config<C: ProcessConfig>(encoded: &[u8], _environment_id: u64) -> Result<C> {
     let config: C = rmp_serde::from_slice(encoded)?;
     // Each config implementation applies its receiver-side policy here, including numeric
     // ceilings and rejection of receiver-local capabilities such as host filesystem paths.
     if let Err(reason) = config.validate_distributed_config() {
-        log::info!(
-            target: "audit",
-            "capability_delegation environment={} operation=distributed_receive outcome=denied",
-            environment_id
-        );
         return Err(anyhow!(
             "distributed spawn config denied by receiver: {reason}"
         ));
@@ -299,40 +424,83 @@ where
         config,
         ..
     } = spawn;
-    let config: T::Config = decode_distributed_config(&config, environment_id)?;
+    let mut audit = PendingServerAudit::new(
+        AuditEvent::ProcessSpawn,
+        AuditAction::Spawn,
+        AuditSubject::new()
+            .with_node_id(ctx.distributed.node_id())
+            .with_environment_id(environment_id),
+        AuditTarget::new(AuditTargetKind::Module)
+            .with_resource_id(module_id)
+            .with_sensitive_data(SensitiveData::Redacted),
+        AuditReason::RuntimeFailure,
+    );
+    let config: T::Config = match decode_distributed_config(&config, environment_id) {
+        Ok(config) => config,
+        Err(error) => {
+            audit.finish(AuditResult::Denied, AuditReason::DelegationDenied);
+            return Err(error);
+        }
+    };
     let config = Arc::new(config);
 
     let module = match ctx.modules.get(module_id) {
         Some(module) => module,
         None => {
-            if let Ok(bytes) = ctx
+            audit.mark_async();
+            let module_bytes = ctx
                 .distributed
                 .control
                 .get_module(module_id, environment_id)
-                .await
-            {
+                .await;
+            audit.mark_failed(AuditReason::RuntimeFailure);
+            if let Ok(bytes) = module_bytes {
                 let wasm = RawWasm::new(Some(module_id), bytes);
-                ctx.modules.compile(ctx.runtime.clone(), wasm).await??
+                audit.mark_async();
+                let compiled = ctx.modules.compile(ctx.runtime.clone(), wasm).await;
+                audit.mark_failed(AuditReason::RuntimeFailure);
+                compiled??
             } else {
+                audit.finish(AuditResult::Failed, AuditReason::NotFound);
                 return Ok(Err(ClientError::ModuleNotFound));
             }
         }
     };
 
+    audit.mark_async();
     let env = ctx.envs.get(environment_id).await;
+    audit.mark_failed(AuditReason::RuntimeFailure);
 
     let env = match env {
         Some(env) => env,
-        None => ctx.envs.create(environment_id).await?,
+        None => {
+            audit.mark_async();
+            let created = ctx.envs.create(environment_id).await;
+            audit.mark_failed(AuditReason::RuntimeFailure);
+            created?
+        }
     };
 
-    env.can_spawn_next_process().await?;
+    audit.mark_async();
+    let can_spawn = env.can_spawn_next_process().await;
+    audit.mark_failed(AuditReason::RuntimeFailure);
+    if let Err(error) = can_spawn {
+        audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
+        return Err(error);
+    }
 
     let distributed = ctx.distributed.clone();
     let runtime = ctx.runtime.clone();
-    let state = T::new_dist_state(env.clone(), distributed, runtime, module.clone(), config)?;
+    let state = match T::new_dist_state(env.clone(), distributed, runtime, module.clone(), config) {
+        Ok(state) => state,
+        Err(error) => {
+            audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
+            return Err(error);
+        }
+    };
     let params: Vec<wasmtime::Val> = params.into_iter().map(Into::into).collect();
-    let (_handle, proc) = lunatic_process::wasm::spawn_wasm(
+    audit.mark_async();
+    let (_handle, proc) = match lunatic_process::wasm::spawn_wasm(
         env,
         ctx.runtime,
         &module,
@@ -341,7 +509,24 @@ where
         params,
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let (result, reason) = classify_spawn_error(&error);
+            audit.finish(result, reason);
+            return Err(error);
+        }
+    };
+    audit.finish_with_target(
+        AuditResult::Succeeded,
+        AuditReason::Completed,
+        AuditTarget::new(AuditTargetKind::Process)
+            .with_node_id(ctx.distributed.node_id())
+            .with_environment_id(environment_id)
+            .with_process_id(proc.id())
+            .with_sensitive_data(SensitiveData::Redacted),
+    );
     Ok(Ok(proc.id()))
 }
 
@@ -379,10 +564,37 @@ where
 
 #[cfg(test)]
 mod tests {
-    use lunatic_process::config::ProcessConfig;
+    use lunatic_common_api::{AuditReason, AuditResult};
+    use lunatic_process::{config::ProcessConfig, env::ProcessLimitReached};
     use serde::{Deserialize, Serialize};
 
-    use super::decode_distributed_config;
+    use super::{classify_spawn_error, decode_distributed_config, request_authorization_event};
+
+    #[test]
+    fn atomic_process_admission_failure_is_a_resource_denial() {
+        let error = anyhow::Error::new(ProcessLimitReached::new(7, 0));
+        assert_eq!(
+            classify_spawn_error(&error),
+            (AuditResult::Denied, AuditReason::ResourceLimit)
+        );
+        assert_eq!(
+            classify_spawn_error(&anyhow::anyhow!("runtime failure")),
+            (AuditResult::Failed, AuditReason::RuntimeFailure)
+        );
+    }
+
+    #[test]
+    fn receiver_authorization_event_omits_unverified_remote_identity() {
+        let event =
+            request_authorization_event(7, 13, AuditResult::Allowed, AuditReason::PolicyAllowed);
+        assert_eq!(event.result(), AuditResult::Allowed);
+        assert_eq!(event.reason(), AuditReason::PolicyAllowed);
+        assert_eq!(event.subject().node_id(), Some(7));
+        assert_eq!(event.subject().environment_id(), None);
+        assert_eq!(event.subject().process_id(), None);
+        assert_eq!(event.target().node_id(), None);
+        assert_eq!(event.target().environment_id(), Some(13));
+    }
 
     #[derive(Clone, Debug, Default, Serialize, Deserialize)]
     struct ReceiverTestConfig {

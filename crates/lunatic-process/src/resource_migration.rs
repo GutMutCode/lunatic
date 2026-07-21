@@ -1,9 +1,9 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, fmt};
 
 /// Represents a serializable resource snapshot for migration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub enum ResourceSnapshot {
     /// TCP connection: store peer address for reconnection
     TcpConnection {
@@ -46,6 +46,54 @@ pub enum ResourceSnapshot {
         resource_type: String,
         reason: String,
     },
+}
+
+impl fmt::Debug for ResourceSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TcpConnection { .. } => formatter
+                .debug_struct("TcpConnection")
+                .field("addresses", &"[REDACTED]")
+                .finish(),
+            Self::TcpListener { .. } => formatter
+                .debug_struct("TcpListener")
+                .field("local_addr", &"[REDACTED]")
+                .finish(),
+            Self::TlsClientConnectionMetadata {
+                port,
+                custom_root_certs,
+                read_timeout_ms,
+                write_timeout_ms,
+                ..
+            } => formatter
+                .debug_struct("TlsClientConnectionMetadata")
+                .field("endpoint", &"[REDACTED]")
+                .field("port", port)
+                .field("custom_root_cert_count", &custom_root_certs.len())
+                .field("read_timeout_ms", read_timeout_ms)
+                .field("write_timeout_ms", write_timeout_ms)
+                .finish(),
+            Self::TlsServerConnectionMetadata { .. } => formatter
+                .debug_struct("TlsServerConnectionMetadata")
+                .field("reason", &"[REDACTED]")
+                .finish(),
+            Self::TlsListener { .. } => formatter
+                .debug_struct("TlsListener")
+                .field("local_addr", &"[REDACTED]")
+                .field("certificate", &"[REDACTED]")
+                .field("private_key", &"[REDACTED]")
+                .finish(),
+            Self::UdpSocket { .. } => formatter
+                .debug_struct("UdpSocket")
+                .field("local_addr", &"[REDACTED]")
+                .finish(),
+            Self::NonMigratable { resource_type, .. } => formatter
+                .debug_struct("NonMigratable")
+                .field("resource_type", resource_type)
+                .field("reason", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 /// Counts of live host resources transferred between Wasm instances.
@@ -195,5 +243,22 @@ mod tests {
         let snapshot = ResourceMigrationSnapshot::new();
         assert!(snapshot.is_empty());
         assert_eq!(snapshot.count(), 0);
+    }
+
+    #[test]
+    fn snapshot_debug_redacts_addresses_certificates_and_private_keys() {
+        let certificate = b"certificate-sentinel".to_vec();
+        let private_key = b"private-key-sentinel".to_vec();
+        let snapshot = ResourceSnapshot::TlsListener {
+            local_addr: "address-sentinel".to_owned(),
+            cert_pem: certificate.clone(),
+            key_pem: private_key.clone(),
+        };
+
+        let debug = format!("{snapshot:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("address-sentinel"));
+        assert!(!debug.contains(&format!("{certificate:?}")));
+        assert!(!debug.contains(&format!("{private_key:?}")));
     }
 }
