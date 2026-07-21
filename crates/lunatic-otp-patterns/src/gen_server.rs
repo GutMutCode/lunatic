@@ -78,7 +78,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         mpsc, Arc, Condvar, Mutex, OnceLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// GenServer behavior trait
@@ -448,6 +448,10 @@ where
     pub fn call(&self, request: Call) -> Result<Reply> {
         self.ensure_running()?;
 
+        // Measure the timeout from the beginning of the call. Starting a fresh
+        // `recv_timeout` only after sending lets a heavily descheduled caller
+        // accept a reply that arrived after the configured deadline.
+        let started_at = Instant::now();
         let request_id = self.shared.next_request_id();
         let (sender, receiver) = mpsc::channel();
         self.shared
@@ -469,8 +473,10 @@ where
         }
 
         let response = match self.config.timeout_ms {
-            Some(timeout_ms) => receiver
-                .recv_timeout(Duration::from_millis(timeout_ms))
+            Some(timeout_ms) => Duration::from_millis(timeout_ms)
+                .checked_sub(started_at.elapsed())
+                .ok_or(mpsc::RecvTimeoutError::Timeout)
+                .and_then(|remaining| receiver.recv_timeout(remaining))
                 .map_err(|error| match error {
                     mpsc::RecvTimeoutError::Timeout => anyhow!(
                         "GenServer call {} to process {} timed out after {} ms",
