@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::{Mutex, RwLock};
-use tokio_rustls::rustls::{Certificate, PrivateKey};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use wasi_common::WasiCtx;
 use wasmtime::{Linker, ResourceLimiter};
 
@@ -345,8 +346,8 @@ impl ProcessState for DefaultProcessState {
                     *id,
                     ResourceSnapshot::TlsListener {
                         local_addr: addr.to_string(),
-                        cert_pem: listener.certs.0.clone(),
-                        key_pem: listener.keys.0.clone(),
+                        cert_pem: listener.certs.as_ref().to_vec(),
+                        key_pem: listener.keys.secret_der().to_vec(),
                     },
                 ),
                 Err(err) => snapshot.add_tls_listener(
@@ -524,28 +525,39 @@ impl ProcessState for DefaultProcessState {
                     local_addr,
                     cert_pem,
                     key_pem,
-                } => match local_addr.parse::<SocketAddr>() {
-                    Ok(addr) => match handle.block_on(TcpListener::bind(addr)) {
-                        Ok(listener) => {
-                            let cert = Certificate(cert_pem);
-                            let key = PrivateKey(key_pem);
-                            self.resources.tls_listeners.add(TlsListener {
-                                listener,
-                                certs: cert,
-                                keys: key,
-                            });
-                            restored += 1;
+                } => {
+                    let key = match PrivateKeyDer::try_from(key_pem) {
+                        Ok(key) => key,
+                        Err(err) => {
+                            warn!(
+                                "Invalid TLS private key for listener '{}' in snapshot: {}",
+                                local_addr, err
+                            );
+                            continue;
                         }
+                    };
+
+                    match local_addr.parse::<SocketAddr>() {
+                        Ok(addr) => match handle.block_on(TcpListener::bind(addr)) {
+                            Ok(listener) => {
+                                self.resources.tls_listeners.add(TlsListener {
+                                    listener,
+                                    certs: CertificateDer::from(cert_pem),
+                                    keys: key,
+                                });
+                                restored += 1;
+                            }
+                            Err(err) => warn!(
+                                "Failed to rebind TLS listener at {} during hot reload: {}",
+                                local_addr, err
+                            ),
+                        },
                         Err(err) => warn!(
-                            "Failed to rebind TLS listener at {} during hot reload: {}",
+                            "Invalid TLS listener address '{}' in snapshot: {}",
                             local_addr, err
                         ),
-                    },
-                    Err(err) => warn!(
-                        "Invalid TLS listener address '{}' in snapshot: {}",
-                        local_addr, err
-                    ),
-                },
+                    }
+                }
                 other => warn!(
                     "Unexpected snapshot entry for TLS listener ignored: {:?}",
                     other
@@ -944,23 +956,22 @@ mod tests {
         };
         use tokio_rustls::{
             rustls::{
-                Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName,
+                pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName},
+                ClientConfig, RootCertStore, ServerConfig,
             },
             TlsAcceptor, TlsConnector, TlsStream,
         };
 
         let root = cert::test_root_cert()?;
         let server_cert = gen_node_cert("localhost")?;
-        let server_cert_der = server_cert.serialize_der_with_signer(&root)?;
-        let server_key_der = server_cert.serialize_private_key_der();
+        let server_cert_pem = server_cert.serialize_pem_with_signer(&root)?;
+        let server_key_pem = server_cert.serialize_private_key_pem();
+        let server_cert_der = CertificateDer::from_pem_slice(server_cert_pem.as_bytes())?;
+        let server_key_der = PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes())?;
 
         let server_config = ServerConfig::builder()
-            .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![Certificate(server_cert_der)],
-                PrivateKey(server_key_der),
-            )?;
+            .with_single_cert(vec![server_cert_der], server_key_der)?;
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let server_addr = listener.local_addr()?;
@@ -976,16 +987,17 @@ mod tests {
         });
 
         let mut root_store = RootCertStore::empty();
-        root_store.add(&Certificate(root.serialize_der()?))?;
+        root_store.add(CertificateDer::from_pem_slice(
+            root.certificate_pem().as_bytes(),
+        )?)?;
         let client_config = ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(root_store)
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(client_config));
         let tcp_stream = TcpStream::connect(server_addr).await?;
         let peer_addr = tcp_stream.peer_addr().ok();
         let local_addr = tcp_stream.local_addr().ok();
-        let domain = ServerName::try_from("localhost")?;
+        let domain = ServerName::try_from("localhost".to_string())?;
         let tls_stream = connector.connect(domain, tcp_stream).await?;
         let connection = Arc::new(TlsConnection::with_client_metadata(
             TlsStream::Client(tls_stream),

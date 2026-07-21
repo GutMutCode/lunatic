@@ -4,15 +4,19 @@ use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
 use lunatic_process::{env::Environment, state::ProcessState};
-use quinn::{ClientConfig, Connecting, Connection, ConnectionError, Endpoint, ServerConfig};
-
-use crate::distributed;
-use rustls::server::AllowAnyAuthenticatedClient;
-use rustls_pemfile::Item;
+use quinn::{
+    crypto::rustls::{QuicClientConfig, QuicServerConfig},
+    ClientConfig, Connection, ConnectionError, Endpoint, Incoming, ServerConfig,
+};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::WebPkiClientVerifier,
+    RootCertStore,
+};
 use wasmtime::ResourceLimiter;
 use x509_parser::{der_parser::oid, oid_registry::asn1_rs::Utf8String, prelude::FromDer};
 
-use crate::{CertAttrs, DistributedCtx};
+use crate::{distributed, CertAttrs, DistributedCtx};
 
 pub const MESSAGE_CHUNK_SIZE: usize = 1024;
 
@@ -55,7 +59,12 @@ impl Client {
         let conn = self._connect(addr, name).await?;
         let mut stream = conn.open_uni().await?;
         write_message(&mut stream, message_id, data).await?;
-        stream.finish().await?;
+        stream.finish()?;
+        if let Some(error_code) = stream.stopped().await? {
+            return Err(anyhow!(
+                "Peer stopped distributed message stream with error code {error_code}"
+            ));
+        }
         Ok(())
     }
 }
@@ -107,7 +116,7 @@ fn get_cert_attrs(conn: &Connection) -> Result<CertAttrs> {
     let peer_identity = match conn
         .peer_identity()
         .ok_or(anyhow!("Peer must provide an identity."))?
-        .downcast::<Vec<rustls::Certificate>>()
+        .downcast::<Vec<CertificateDer<'static>>>()
     {
         Ok(certs) => Ok(certs),
         Err(_) => Err(anyhow!("Failed to downcast peer identity.")),
@@ -115,8 +124,10 @@ fn get_cert_attrs(conn: &Connection) -> Result<CertAttrs> {
     if peer_identity.len() != 1 {
         return Err(anyhow!("More than one identity certificate detected."));
     }
-    let cert = peer_identity.first().unwrap();
-    let (_rem, x509) = x509_parser::certificate::X509Certificate::from_der(&cert.0)?;
+    let cert = peer_identity
+        .first()
+        .ok_or_else(|| anyhow!("Peer identity certificate is missing."))?;
+    let (_rem, x509) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())?;
     let oid = oid!(2.5.29 .9);
     let ext = x509
         .get_extension_unique(&oid)?
@@ -125,36 +136,45 @@ fn get_cert_attrs(conn: &Connection) -> Result<CertAttrs> {
     Ok(serde_json::from_str(&value.string())?)
 }
 
-pub fn new_quic_client(ca_cert: &str, cert: &str, key: &str) -> Result<Client> {
-    let mut ca_cert = ca_cert.as_bytes();
-    let ca_cert = rustls_pemfile::read_one(&mut ca_cert)?.unwrap();
-    let ca_cert = match ca_cert {
-        Item::X509Certificate(ca_cert) => Ok(rustls::Certificate(ca_cert)),
-        _ => Err(anyhow!("Not a valid certificate.")),
-    }?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(&ca_cert)?;
+fn read_certificate(pem: &str) -> Result<CertificateDer<'static>> {
+    let mut reader = pem.as_bytes();
+    let mut certificates = rustls_pemfile::certs(&mut reader);
+    let certificate = certificates
+        .next()
+        .transpose()?
+        .ok_or_else(|| anyhow!("Certificate PEM is empty or malformed."))?;
+    if certificates.next().transpose()?.is_some() {
+        return Err(anyhow!("Expected exactly one certificate."));
+    }
+    Ok(certificate)
+}
 
-    let mut cert = cert.as_bytes();
-    let mut key = key.as_bytes();
-    let pk = rustls_pemfile::read_one(&mut key)?.unwrap();
-    let pk = match pk {
-        Item::PKCS8Key(key) => Ok(rustls::PrivateKey(key)),
-        _ => Err(anyhow!("Not a valid private key.")),
-    }?;
-    let cert = rustls_pemfile::read_one(&mut cert)?.unwrap();
-    let cert = match cert {
-        Item::X509Certificate(cert) => Ok(rustls::Certificate(cert)),
-        _ => Err(anyhow!("Not a valid certificate")),
-    }?;
+fn read_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
+    let mut reader = pem.as_bytes();
+    let private_key = rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| anyhow!("Private key PEM is empty or malformed."))?;
+    if rustls_pemfile::private_key(&mut reader)?.is_some() {
+        return Err(anyhow!("Expected exactly one private key."));
+    }
+    Ok(private_key)
+}
+
+pub fn new_quic_client(ca_cert: &str, cert: &str, key: &str) -> Result<Client> {
+    let ca_cert = read_certificate(ca_cert)?;
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_cert)?;
+
+    let pk = read_private_key(key)?;
+    let cert = read_certificate(cert)?;
     let cert = vec![cert];
 
-    let client_crypto = rustls::ClientConfig::builder()
-        .with_safe_defaults()
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_root_certificates(roots)
         .with_client_auth_cert(cert, pk)?;
 
-    let client_config = ClientConfig::new(Arc::new(client_crypto));
+    let client_config = ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto)?));
     let mut endpoint = Endpoint::client("[::]:0".parse().unwrap())?;
     endpoint.set_default_client_config(client_config);
     Ok(Client { inner: endpoint })
@@ -166,41 +186,30 @@ pub fn new_quic_server(
     key: &str,
     ca_cert: &str,
 ) -> Result<Endpoint> {
-    let mut ca_cert = ca_cert.as_bytes();
-    let ca_cert = rustls_pemfile::read_one(&mut ca_cert)?.unwrap();
-    let ca_cert = match ca_cert {
-        Item::X509Certificate(ca_cert) => Ok(rustls::Certificate(ca_cert)),
-        _ => Err(anyhow!("Not a valid certificate.")),
-    }?;
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(&ca_cert)?;
+    let ca_cert = read_certificate(ca_cert)?;
+    let mut roots = RootCertStore::empty();
+    roots.add(ca_cert)?;
 
-    let mut key = key.as_bytes();
-    let pk = rustls_pemfile::read_one(&mut key)?.unwrap();
-    let pk = match pk {
-        Item::PKCS8Key(key) => Ok(rustls::PrivateKey(key)),
-        _ => Err(anyhow!("Not a valid private key.")),
-    }?;
+    let pk = read_private_key(key)?;
 
     let mut cert_chain = Vec::new();
     for (i, cert) in certs.iter().enumerate() {
-        let mut cert = cert.as_bytes();
-        let cert = rustls_pemfile::read_one(&mut cert)?.unwrap();
-        let cert = match cert {
-            Item::X509Certificate(cert) => Ok(rustls::Certificate(cert)),
-            _ => Err(anyhow!("Not a valid certificate")),
-        }?;
+        let cert = read_certificate(cert)?;
         if i != 0 {
-            roots.add(&cert)?;
+            roots.add(cert.clone())?;
         }
         cert_chain.push(cert);
     }
 
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_safe_defaults()
-        .with_client_cert_verifier(Arc::new(AllowAnyAuthenticatedClient::new(roots)))
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_verifier =
+        WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone()).build()?;
+    let server_crypto = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, pk)?;
-    let mut server_config = ServerConfig::with_crypto(Arc::new(server_crypto));
+    let mut server_config =
+        ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(server_crypto)?));
     Arc::get_mut(&mut server_config.transport)
         .unwrap()
         .keep_alive_interval(Some(Duration::from_millis(100)));
@@ -250,7 +259,7 @@ pub async fn handle_registry_server(
 
 async fn handle_quic_connection_registry(
     client: distributed::Client,
-    conn: Connecting,
+    conn: Incoming,
 ) -> Result<()> {
     let conn = conn.await?;
     get_cert_attrs(&conn)?;
@@ -303,7 +312,7 @@ impl NodeEnvPermission {
 
 async fn handle_quic_connection_node<T, E>(
     ctx: distributed::server::ServerCtx<T, E>,
-    conn: Connecting,
+    conn: Incoming,
 ) -> Result<()>
 where
     T: ProcessState

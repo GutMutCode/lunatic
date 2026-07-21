@@ -14,7 +14,7 @@ use tokio::sync::oneshot;
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_quic_framing_dispatches_a_multi_chunk_message() -> Result<()> {
     let root = cert::test_root_cert()?;
-    let ca_pem = root.serialize_pem()?;
+    let ca_pem = root.certificate_pem().to_owned();
     let (server_cert, server_key) = cert::default_server_certificates(&root)?;
     let node_cert = gen_node_cert("transport-test-node")?;
     let node_cert_pem = node_cert.serialize_pem_with_signer(&root)?;
@@ -63,7 +63,7 @@ async fn production_quic_framing_dispatches_a_multi_chunk_message() -> Result<()
         data: payload,
     };
     write_message(&mut send, 23, message::serialize_message(&request)?.into()).await?;
-    send.finish().await?;
+    send.finish()?;
 
     let (message_id, dispatched) =
         tokio::time::timeout(Duration::from_secs(5), dispatch_rx).await??;
@@ -75,5 +75,46 @@ async fn production_quic_framing_dispatches_a_multi_chunk_message() -> Result<()
 
     connection.close(0u32.into(), b"test complete");
     tokio::time::timeout(Duration::from_secs(5), server_task).await???;
+    Ok(())
+}
+
+#[test]
+fn invalid_quic_pem_inputs_return_errors() -> Result<()> {
+    let addr = "127.0.0.1:0".parse()?;
+    let root = cert::test_root_cert()?;
+    let ca_pem = root.certificate_pem();
+    let key_pem = root.private_key_pem();
+
+    assert!(new_quic_client("", "", "").is_err());
+    assert!(new_quic_client("not a PEM certificate", "", "").is_err());
+    assert!(new_quic_client(ca_pem, "", key_pem).is_err());
+    assert!(new_quic_client(ca_pem, ca_pem, "not a PEM key").is_err());
+    assert!(new_quic_server(addr, Vec::new(), "", "").is_err());
+    assert!(new_quic_server(addr, vec![ca_pem.to_owned()], "not a PEM key", ca_pem,).is_err());
+    assert!(new_quic_server(
+        addr,
+        vec!["not a PEM certificate".to_owned()],
+        key_pem,
+        ca_pem,
+    )
+    .is_err());
+
+    Ok(())
+}
+
+#[test]
+fn duplicate_quic_pem_items_return_errors() -> Result<()> {
+    let root = cert::test_root_cert()?;
+    let ca_pem = root.certificate_pem();
+    let node_cert = gen_node_cert("duplicate-pem-test-node")?;
+    let node_cert_pem = node_cert.serialize_pem_with_signer(&root)?;
+    let node_key_pem = node_cert.serialize_private_key_pem();
+
+    let duplicate_certificates = format!("{ca_pem}{ca_pem}");
+    assert!(new_quic_client(&duplicate_certificates, &node_cert_pem, &node_key_pem).is_err());
+
+    let duplicate_keys = format!("{node_key_pem}{node_key_pem}");
+    assert!(new_quic_client(ca_pem, &node_cert_pem, &duplicate_keys).is_err());
+
     Ok(())
 }

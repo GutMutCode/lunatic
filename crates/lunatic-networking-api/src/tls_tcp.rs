@@ -10,18 +10,20 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
+use tokio_rustls::rustls::{
+    self,
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName},
+};
+use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
-use webpki::TrustAnchor;
 
 use crate::dns::DnsIterator;
 use crate::{
     socket_address, NetworkingCtx, TlsClientConnectionMetadata, TlsConnection, TlsListener,
 };
-use tokio_rustls::rustls::{self, OwnedTrustAnchor};
-use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 
 // Register TLS networking APIs to the linker
 pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
@@ -246,14 +248,13 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
             .tls_listener_resources()
             .get(listener_id)
             .or_trap("lunatic::network::tls_accept")?;
-        let keys = tls_listener.keys.clone();
+        let keys = tls_listener.keys.clone_key();
         let certs = tls_listener.certs.clone();
 
         let (tls_stream_or_error_id, peer_addr_iter, result) =
             match tls_listener.listener.accept().await {
                 Ok((stream, socket_addr)) => {
                     let config = rustls::ServerConfig::builder()
-                        .with_safe_defaults()
                         .with_no_client_auth()
                         .with_single_cert(vec![certs], keys)
                         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
@@ -297,26 +298,26 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
 }
 
 // Load private key from file.
-fn load_private_key(file: &[u8]) -> io::Result<rustls::PrivateKey> {
+fn load_private_key(file: &[u8]) -> io::Result<PrivateKeyDer<'static>> {
     let mut reader = io::BufReader::new(file);
 
-    // Load and return a single private key.
-    let keys = rustls_pemfile::pkcs8_private_keys(&mut reader)?;
-    if keys.len() != 1 {
+    let key = rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| io::Error::other("expected a single private key"))?;
+    if rustls_pemfile::private_key(&mut reader)?.is_some() {
         return Err(io::Error::other("expected a single private key"));
     }
 
-    Ok(rustls::PrivateKey(keys[0].clone()))
+    Ok(key)
 }
 
-fn load_certs(file: &[u8]) -> io::Result<rustls::Certificate> {
+fn load_certs(file: &[u8]) -> io::Result<CertificateDer<'static>> {
     let mut reader = io::BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader)?;
+    let certs = rustls_pemfile::certs(&mut reader).collect::<io::Result<Vec<_>>>()?;
     if certs.len() != 1 {
-        return Err(io::Error::other("expected a single private key"));
+        return Err(io::Error::other("expected a single certificate"));
     }
 
-    Ok(rustls::Certificate(certs[0].clone()))
+    Ok(certs.into_iter().next().expect("certificate count checked"))
 }
 
 // If timeout is specified (value different from `u64::MAX`), the function will return on timeout
@@ -364,7 +365,7 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                 .or_trap("lunatic::networking::tls_connect")?
                 .to_vec();
 
-            let vec_slices: Result<Vec<_>> = certs_list
+            let vec_slices = certs_list
                 .chunks_exact(8)
                 .map(|ciovec| {
                     let ciovec_ptr = u32::from_le_bytes(
@@ -383,43 +384,28 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                         .or_trap("lunatic::networking::tls_connect")?;
                     Ok(slice.to_vec())
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             Some(vec_slices)
         };
 
         let mut root_cert_store = rustls::RootCertStore::empty();
-        let custom_certs = if let Some(Ok(ref pem_list)) = cafile {
-            let trust_anchors = pem_list
-                .iter()
-                .map(|pem| {
-                    let certs =
-                        load_certs(pem).or_trap("lunatic::networking::tls_connect::load_certs")?;
-                    let ta = TrustAnchor::try_from_cert_der(&certs.0[..])
-                        .or_trap("lunatic::networking::tls_connect::load_cert DER")?;
-                    Ok(OwnedTrustAnchor::from_subject_spki_name_constraints(
-                        ta.subject,
-                        ta.spki,
-                        ta.name_constraints,
-                    ))
-                })
-                .filter_map(|r: Result<OwnedTrustAnchor>| r.ok());
-            root_cert_store.add_trust_anchors(trust_anchors);
+        let custom_certs = if let Some(ref pem_list) = cafile {
+            for pem in pem_list {
+                let cert =
+                    load_certs(pem).or_trap("lunatic::networking::tls_connect::load_certs")?;
+                root_cert_store
+                    .add(cert)
+                    .or_trap("lunatic::networking::tls_connect::load_cert DER")?;
+            }
             pem_list.clone()
         } else {
-            root_cert_store.add_trust_anchors(webpki_roots::TLS_SERVER_ROOTS.iter().map(|ta| {
-                OwnedTrustAnchor::from_subject_spki_name_constraints(
-                    ta.subject,
-                    ta.spki,
-                    ta.name_constraints,
-                )
-            }));
+            root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             Vec::new()
         };
 
         let config = rustls::ClientConfig::builder()
-            .with_safe_defaults()
             .with_root_certificates(root_cert_store)
-            .with_no_client_auth(); // i guess this was previously the default?
+            .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
         let connect = TcpStream::connect((&socket_addr[..], port as u16));
@@ -433,8 +419,7 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                 Ok(tcp_stream) => {
                     let peer_addr = tcp_stream.peer_addr().ok();
                     let local_addr = tcp_stream.local_addr().ok();
-                    let domain = &socket_addr[..];
-                    let domain = rustls::ServerName::try_from(domain)
+                    let domain = ServerName::try_from(socket_addr.clone())
                         .or_trap("lunatic::networking::tls_connect::invalid_dnsname")?;
 
                     let tls_stream = connector
@@ -787,4 +772,36 @@ fn tls_flush<T: NetworkingCtx + ErrorCtx + Send>(
             .or_trap("lunatic::networking::tls_flush")?;
         Ok(result)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_certs, load_private_key};
+
+    const CERT_PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    const KEY_PEM: &[u8] = b"-----BEGIN PRIVATE KEY-----\nMAMCAQE=\n-----END PRIVATE KEY-----\n";
+
+    #[test]
+    fn pem_loaders_accept_exactly_one_item() {
+        let cert = load_certs(CERT_PEM).expect("one certificate should load");
+        assert_eq!(cert.as_ref(), &[1, 2, 3]);
+
+        let key = load_private_key(KEY_PEM).expect("one private key should load");
+        assert_eq!(key.secret_der(), &[0x30, 0x03, 0x02, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn pem_loaders_reject_empty_input() {
+        assert!(load_certs(&[]).is_err());
+        assert!(load_private_key(&[]).is_err());
+    }
+
+    #[test]
+    fn pem_loaders_reject_multiple_items() {
+        let certs = [CERT_PEM, CERT_PEM].concat();
+        assert!(load_certs(&certs).is_err());
+
+        let keys = [KEY_PEM, KEY_PEM].concat();
+        assert!(load_private_key(&keys).is_err());
+    }
 }

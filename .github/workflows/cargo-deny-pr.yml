@@ -25,8 +25,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Keep accepted advisory debt visible in the log. Only the exact IDs documented in
-          # deny.toml are notes; every new advisory remains a blocking error.
+          # Keep advisory output detailed. deny.toml has no advisory exceptions, so every
+          # known vulnerability remains a blocking error.
           - checks: advisories
             log_level: info
           - checks: bans licenses sources

@@ -10,10 +10,11 @@ use lunatic_process::{
     state::ProcessState,
     Signal,
 };
-use rcgen::*;
+use rcgen::{CertificateParams, DnType};
 use wasmtime::ResourceLimiter;
 
 use crate::{
+    control::cert::CertificateRequest,
     distributed::message::{Request, Response},
     quic::{self, NodeEnvPermission},
     DistributedCtx, DistributedProcessState,
@@ -55,14 +56,15 @@ pub fn root_cert(ca_cert: &str) -> Result<String> {
     Ok(std::str::from_utf8(&cert)?.to_string())
 }
 
-pub fn gen_node_cert(node_name: &str) -> Result<Certificate> {
-    let mut params = CertificateParams::new(vec![node_name.to_string()]);
+pub fn gen_node_cert(node_name: &str) -> Result<CertificateRequest> {
+    let mut params = CertificateParams::new(vec![node_name.to_string()])
+        .map_err(|error| anyhow!("Error while generating node certificate parameters: {error}"))?;
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Lunatic Inc.");
     params.distinguished_name.push(DnType::CommonName, "Node");
-    Certificate::from_params(params)
-        .map_err(|_| anyhow!("Error while generating node certificate."))
+    CertificateRequest::new(params)
+        .map_err(|error| anyhow!("Error while generating node certificate: {error}"))
 }
 
 pub async fn node_server<T, E>(
@@ -344,6 +346,35 @@ where
     Ok(Ok(proc.id()))
 }
 
+async fn handle_process_message<T, E>(
+    ctx: ServerCtx<T, E>,
+    environment_id: u64,
+    process_id: u64,
+    tag: Option<i64>,
+    data: Vec<u8>,
+) -> std::result::Result<(), ClientError>
+where
+    T: ProcessState
+        + DistributedCtx<E>
+        + ResourceLimiter
+        + Send
+        + lunatic_process::reloadable_state::ReloadableState
+        + 'static,
+    E: Environment,
+{
+    let env = ctx.envs.get(environment_id).await;
+    if let Some(env) = env {
+        if let Some(proc) = env.get_process(process_id) {
+            proc.send(Signal::Message(Message::Data(DataMessage::new_from_vec(
+                tag, data,
+            ))));
+        } else {
+            return Err(ClientError::ProcessNotFound);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use lunatic_process::config::ProcessConfig;
@@ -402,33 +433,4 @@ mod tests {
         assert!(error.to_string().contains("denied by receiver"));
         assert!(error.to_string().contains("host-local"));
     }
-}
-
-async fn handle_process_message<T, E>(
-    ctx: ServerCtx<T, E>,
-    environment_id: u64,
-    process_id: u64,
-    tag: Option<i64>,
-    data: Vec<u8>,
-) -> std::result::Result<(), ClientError>
-where
-    T: ProcessState
-        + DistributedCtx<E>
-        + ResourceLimiter
-        + Send
-        + lunatic_process::reloadable_state::ReloadableState
-        + 'static,
-    E: Environment,
-{
-    let env = ctx.envs.get(environment_id).await;
-    if let Some(env) = env {
-        if let Some(proc) = env.get_process(process_id) {
-            proc.send(Signal::Message(Message::Data(DataMessage::new_from_vec(
-                tag, data,
-            ))));
-        } else {
-            return Err(ClientError::ProcessNotFound);
-        }
-    }
-    Ok(())
 }

@@ -34,7 +34,7 @@ struct QuicDispatchHarness {
 impl QuicDispatchHarness {
     async fn new() -> Result<Self> {
         let root = cert::test_root_cert()?;
-        let ca_pem = root.serialize_pem()?;
+        let ca_pem = root.certificate_pem().to_owned();
         let (server_cert, server_key) = cert::default_server_certificates(&root)?;
         let node_cert = gen_node_cert("bench-node")?;
         let node_cert_pem = node_cert.serialize_pem_with_signer(&root)?;
@@ -148,7 +148,7 @@ impl QuicDispatchHarness {
     }
 
     async fn shutdown(mut self) {
-        let _ = self.send.finish().await;
+        let _ = self.send.finish();
         self.connection.close(0u32.into(), b"bench complete");
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());

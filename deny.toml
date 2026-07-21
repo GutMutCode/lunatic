@@ -41,21 +41,10 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 unmaintained = "none"
 # The lint level for crates that have been yanked from their source registry
 yanked = "warn"
-# Fail once an accepted advisory disappears so its temporary exception must be removed.
+# Fail if a future advisory exception becomes stale.
 unused-ignored-advisory = "deny"
-# A list of advisory IDs to ignore. Note that ignored advisories will still
-# output a note when they are encountered.
-ignore = [
-    # Temporary, explicit security debt. cargo-deny still reports ignored advisories, while any
-    # newly discovered advisory remains blocking. Remove these entries when Hanary #1670
-    # completes the QUIC/TLS/PKI migration.
-    { id = "RUSTSEC-2025-0009", reason = "TEMPORARY: ring 0.16.20 via QUIC/certificate stack; tracked by Hanary #1670; remove after network stack migration" },
-    { id = "RUSTSEC-2026-0037", reason = "TEMPORARY: quinn-proto 0.10.6; tracked by Hanary #1670; remove after QUIC stack migration" },
-    { id = "RUSTSEC-2026-0098", reason = "TEMPORARY: rustls-webpki 0.101.7; tracked by Hanary #1670; remove after TLS stack migration" },
-    { id = "RUSTSEC-2026-0099", reason = "TEMPORARY: rustls-webpki 0.101.7; tracked by Hanary #1670; remove after TLS stack migration" },
-    { id = "RUSTSEC-2026-0104", reason = "TEMPORARY: rustls-webpki 0.101.7; tracked by Hanary #1670; remove after TLS stack migration" },
-    { id = "RUSTSEC-2026-0185", reason = "TEMPORARY: quinn-proto 0.10.6; tracked by Hanary #1670; remove after QUIC stack migration" },
-]
+# A list of advisory IDs to ignore. Keep this empty so every known vulnerability is blocking.
+ignore = []
 # Threshold for security vulnerabilities, any vulnerability with a CVSS score
 # lower than the range specified will be ignored. Note that ignored advisories
 # will still output a note when they are encountered.
@@ -92,6 +81,8 @@ allow = [
     "BSD-3-Clause",
     # OSI-approved license used by foldhash in Wasmtime's Cranelift stack.
     "Zlib",
+    # Permissive data license used by Mozilla's TLS root certificate dataset.
+    "CDLA-Permissive-2.0",
     # OpenSSL is Apache License v2.0 (ASL v2)
     # https://www.openssl.org/blog/blog/2017/03/22/license/
     # ring crate is ISC & MIT

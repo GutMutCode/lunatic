@@ -4,12 +4,15 @@ use lunatic_control::{
     NodeInfo,
 };
 use lunatic_distributed::{
-    control,
+    control::{
+        self,
+        cert::{CertificateAuthority, CertificateRequest},
+    },
     distributed::{Client, GlobalProcessId},
     quic, CertAttrs, SUBJECT_DIR_ATTRS,
 };
 use quinn::{Endpoint, VarInt};
-use rcgen::{Certificate, CertificateParams, CustomExtension, DnType};
+use rcgen::{CertificateParams, CustomExtension, DnType};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,7 +36,7 @@ struct TestCluster {
 impl TestCluster {
     async fn new(node_count: usize) -> Result<Self> {
         let root = control::cert::test_root_cert()?;
-        let root_cert = control::cert::TEST_ROOT_CERT.to_string();
+        let root_cert = root.certificate_pem().to_owned();
         let mut materials = Vec::with_capacity(node_count);
 
         for id in 1..=node_count as u64 {
@@ -157,8 +160,8 @@ fn spawn_registry_server(mut endpoint: Endpoint, client: Client) -> JoinHandle<(
     })
 }
 
-fn node_certificate(root: &Certificate, name: &str) -> Result<(String, String)> {
-    let mut params = CertificateParams::new(vec![name.to_string()]);
+fn node_certificate(root: &CertificateAuthority, name: &str) -> Result<(String, String)> {
+    let mut params = CertificateParams::new(vec![name.to_string()])?;
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Lunatic Inc.");
@@ -173,7 +176,7 @@ fn node_certificate(root: &Certificate, name: &str) -> Result<(String, String)> 
             &SUBJECT_DIR_ATTRS,
             der_utf8_string(&attributes),
         ));
-    let cert = Certificate::from_params(params)?;
+    let cert = CertificateRequest::new(params)?;
     Ok((
         cert.serialize_pem_with_signer(root)?,
         cert.serialize_private_key_pem(),
