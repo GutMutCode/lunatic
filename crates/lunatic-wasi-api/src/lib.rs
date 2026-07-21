@@ -361,6 +361,9 @@ mod tests {
         assert_eq!(cancelled["result"], "cancelled");
         assert_eq!(cancelled["reason"], "cancelled");
         drop(events);
+        // Windows does not allow removing a directory while the capability
+        // directory still owns an open handle to it.
+        drop(audited);
         fs::remove_dir_all(root)?;
         Ok(())
     }
