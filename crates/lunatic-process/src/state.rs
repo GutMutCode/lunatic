@@ -37,6 +37,21 @@ pub trait ProcessState: Sized + crate::reloadable_state::ReloadableState {
         config: Arc<Self::Config>,
     ) -> Result<Self>;
 
+    /// Create the replacement state used by an in-process hot reload.
+    ///
+    /// Unlike [`ProcessState::new_state`], which creates a child process, a
+    /// replacement must retain the current process identity and share its
+    /// signal and message mailboxes. Implementations that support hot reload
+    /// must override this method. The default fails closed so a reload cannot
+    /// silently turn into a different process or lose queued messages.
+    fn new_state_for_reload(
+        &self,
+        _module: Arc<WasmtimeCompiledModule<Self>>,
+        _config: Arc<Self::Config>,
+    ) -> Result<Self> {
+        anyhow::bail!("ProcessState does not implement in-process hot reload replacement")
+    }
+
     /// Register all host functions to the linker.
     fn register(linker: &mut Linker<Self>) -> Result<()>;
     /// Marks a wasm instance as initialized

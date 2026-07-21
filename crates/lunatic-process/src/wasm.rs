@@ -1,14 +1,127 @@
-use std::sync::Arc;
+use std::sync::{atomic::Ordering, Arc};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use log::trace;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
 use wasmtime::{ResourceLimiter, Val};
 
 use crate::env::Environment;
 use crate::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use crate::state::ProcessState;
-use crate::{Process, Signal, WasmProcess};
+use crate::{ExecutionResult, Process, ProcessContext, ReloadCommand, Signal, WasmProcess};
+
+enum WasmExecutionEvent {
+    CallFinished(Result<()>),
+    Reload(ReloadCommand),
+    ReloadDriverClosed,
+}
+
+/// Optional lifecycle metadata for a Wasm process spawn.
+pub struct WasmSpawnOptions {
+    pub link: Option<(Option<i64>, Arc<dyn Process>)>,
+    pub initial_module_version: Option<(u64, u32)>,
+}
+
+/// Owns the active Wasmtime call and its reload control channel in one future.
+///
+/// A signal handler must never wait for the instance lock while `call_ref` is
+/// alive: the call borrows the Store until its future is dropped. Selecting the
+/// command here makes the call future leave scope first, which cancels the
+/// suspended Wasmtime fiber and returns exclusive access to the instance before
+/// snapshotting it.
+async fn run_wasm_execution<S>(
+    context: ProcessContext<S>,
+    env: Arc<dyn Environment>,
+    mut reload_receiver: UnboundedReceiver<ReloadCommand>,
+    function: String,
+    params: Vec<Val>,
+) -> ExecutionResult<S>
+where
+    S: ProcessState + Send + ResourceLimiter + 'static,
+{
+    loop {
+        let mut instance_guard = context.instance.write().await;
+        let event = {
+            let instance = instance_guard
+                .as_mut()
+                .expect("the Wasm execution driver must own an instance");
+            let call = instance.call_ref(&function, params.clone());
+            tokio::pin!(call);
+
+            tokio::select! {
+                biased;
+                command = reload_receiver.recv() => match command {
+                    Some(command) => WasmExecutionEvent::Reload(command),
+                    None => WasmExecutionEvent::ReloadDriverClosed,
+                },
+                result = &mut call => WasmExecutionEvent::CallFinished(result),
+            }
+        };
+
+        match event {
+            WasmExecutionEvent::CallFinished(result) => {
+                let instance = instance_guard
+                    .take()
+                    .expect("the completed Wasm call must retain its instance");
+                return instance.into_execution_result(result);
+            }
+            WasmExecutionEvent::ReloadDriverClosed => {
+                let instance = instance_guard
+                    .take()
+                    .expect("the Wasm call must retain its instance");
+                return instance.into_execution_result(Err(anyhow!(
+                    "Wasm reload execution driver closed unexpectedly"
+                )));
+            }
+            WasmExecutionEvent::Reload(command) => {
+                // The call future has left its lexical scope, so its Store
+                // borrow and suspended fiber are cancelled before this lock is
+                // released and the transaction reacquires it.
+                drop(instance_guard);
+
+                let module_id = command.module_id();
+                let target_version = command.target_version();
+                let old_version = context.current_version(module_id);
+                context.reload_in_progress.store(true, Ordering::SeqCst);
+
+                let result = crate::perform_pending_reload(
+                    &context,
+                    env.clone(),
+                    module_id,
+                    old_version,
+                    target_version,
+                )
+                .await;
+
+                match result {
+                    Ok(()) => {
+                        context.set_current_version(module_id, target_version);
+                        log::info!(
+                            "Wasm reload committed for module {}: {} -> {}",
+                            module_id,
+                            old_version,
+                            target_version
+                        );
+                    }
+                    Err(error) => {
+                        // perform_pending_reload restores the untouched old
+                        // instance before returning. Re-enter the same export
+                        // with the same parameters on the next loop iteration.
+                        log::error!(
+                            "Wasm reload rolled back for module {} at version {}: {}",
+                            module_id,
+                            old_version,
+                            error
+                        );
+                    }
+                }
+
+                context.reload_in_progress.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
 
 /// Spawns a new wasm process from a compiled module.
 ///
@@ -36,6 +149,45 @@ where
         + crate::reloadable_state::ReloadableState
         + 'static,
 {
+    spawn_wasm_with_options(
+        env,
+        runtime,
+        module,
+        state,
+        function,
+        params,
+        WasmSpawnOptions {
+            link,
+            initial_module_version: None,
+        },
+    )
+    .await
+}
+
+/// Spawns a Wasm process and records the registry version that backs its
+/// initial instance. Reload-enabled entry points should use this function so a
+/// later compatibility check compares against the version actually running.
+pub async fn spawn_wasm_with_options<S>(
+    env: Arc<dyn Environment>,
+    runtime: WasmtimeRuntime,
+    module: &WasmtimeCompiledModule<S>,
+    state: S,
+    function: &str,
+    params: Vec<Val>,
+    options: WasmSpawnOptions,
+) -> Result<(JoinHandle<Result<S>>, Arc<dyn Process>)>
+where
+    S: ProcessState
+        + Send
+        + Sync
+        + ResourceLimiter
+        + crate::reloadable_state::ReloadableState
+        + 'static,
+{
+    let WasmSpawnOptions {
+        link,
+        initial_module_version,
+    } = options;
     let id = state.id();
     trace!("Spawning process: {}", id);
     let signal_mailbox = state.signal_mailbox().clone();
@@ -44,19 +196,21 @@ where
     let instance = runtime.instantiate(module, state).await?;
     let function = function.to_string();
     let context = crate::ProcessContext::new(instance);
-    let context_clone = context.instance.clone();
+    if let Some((module_id, version)) = initial_module_version {
+        context.set_current_version(module_id, version);
+    }
+    let reload_receiver = context.take_reload_receiver();
 
-    // Note: Epoch ticker is now global (started in WasmtimeRuntime::new())
-    // No need for per-process ticker - all processes share the global ticker
+    // The runtime owns one epoch ticker per Engine, shared by every process
+    // instantiated from that runtime.
 
-    let fut = async move {
-        if let Some(instance) = context_clone.write().await.take() {
-            instance.call(&function, params).await
-        } else {
-            // Instance was swapped during reload
-            panic!("Instance was swapped during execution");
-        }
-    };
+    let fut = run_wasm_execution(
+        context.clone(),
+        env.clone(),
+        reload_receiver,
+        function,
+        params,
+    );
     let child_process = crate::new(
         fut,
         id,

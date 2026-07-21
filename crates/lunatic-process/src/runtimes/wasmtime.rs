@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
@@ -12,9 +11,6 @@ use crate::{
 
 use super::RawWasm;
 
-/// Global flag to control the epoch ticker
-static EPOCH_TICKER_STARTED: AtomicBool = AtomicBool::new(false);
-
 #[derive(Clone)]
 pub struct WasmtimeRuntime {
     engine: wasmtime::Engine,
@@ -23,11 +19,10 @@ pub struct WasmtimeRuntime {
 impl WasmtimeRuntime {
     pub fn new(config: &wasmtime::Config) -> Result<Self> {
         let engine = wasmtime::Engine::new(config)?;
-
-        // Start global epoch ticker once
-        if !EPOCH_TICKER_STARTED.swap(true, Ordering::SeqCst) {
-            Self::start_global_epoch_ticker(engine.clone());
-        }
+        // Each runtime owns a distinct Engine. Every Engine therefore needs its
+        // own epoch ticker; a process-wide "started" flag leaves all later
+        // runtimes unable to yield CPU-bound guests for signals or reloads.
+        Self::start_epoch_ticker(engine.clone());
 
         Ok(Self { engine })
     }
@@ -40,12 +35,11 @@ impl WasmtimeRuntime {
         &self.engine
     }
 
-    /// Starts a single global epoch ticker for all processes in the runtime.
-    /// This replaces the per-process epoch ticker approach to reduce overhead.
-    fn start_global_epoch_ticker(engine: wasmtime::Engine) {
+    /// Starts one epoch ticker shared by all processes using this Engine.
+    fn start_epoch_ticker(engine: wasmtime::Engine) {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
-            log::debug!("Global epoch ticker started (10ms interval)");
+            log::debug!("Wasmtime engine epoch ticker started (10ms interval)");
 
             loop {
                 interval.tick().await;
@@ -201,11 +195,22 @@ where
             .call_async(&mut self.store, &params, &mut [])
             .await;
 
+        self.into_execution_result(result)
+    }
+
+    pub(crate) fn into_execution_result<E>(
+        self,
+        result: std::result::Result<(), E>,
+    ) -> ExecutionResult<T>
+    where
+        E: Into<anyhow::Error>,
+    {
         ExecutionResult {
             state: self.store.into_data(),
             result: match result {
                 Ok(()) => ResultValue::Ok,
                 Err(err) => {
+                    let err = err.into();
                     // If the trap is a result of calling `proc_exit(0)`, treat it as an no-error finish.
                     match err.downcast_ref::<wasi_common::I32Exit>() {
                         Some(wasi_common::I32Exit(0)) => ResultValue::Ok,
@@ -237,22 +242,14 @@ where
 
         let memory_data = memory.data(&self.store).to_vec();
 
-        let stack_ptr = self
-            .instance
-            .get_global(&mut self.store, "__stack_pointer")
-            .and_then(|g| g.get(&mut self.store).i32())
-            .map(|v| v as u32);
-
-        let heap_ptr = self
-            .instance
-            .get_global(&mut self.store, "__heap_base")
-            .and_then(|g| g.get(&mut self.store).i32())
-            .map(|v| v as u32);
-
         Ok(MemorySnapshot {
             memory: memory_data,
-            stack_ptr,
-            heap_ptr,
+            // A cancelled Wasmtime fiber cannot resume its instruction pointer
+            // or native control stack. Restoring an interrupted stack pointer
+            // before re-entering the export would instead accumulate abandoned
+            // frames. `__heap_base` is a layout constant, not runtime state.
+            stack_ptr: None,
+            heap_ptr: None,
             metadata: HashMap::new(),
         })
     }
@@ -263,21 +260,20 @@ where
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| anyhow::anyhow!("No memory export found"))?;
 
+        let current_len = memory.data_size(&self.store);
+        if current_len < snapshot.memory.len() {
+            let missing = snapshot.memory.len() - current_len;
+            const WASM_PAGE_SIZE: usize = 64 * 1024;
+            let pages = missing.div_ceil(WASM_PAGE_SIZE) as u64;
+            memory.grow(&mut self.store, pages)?;
+        }
+
         let data = memory.data_mut(&mut self.store);
-        let copy_len = snapshot.memory.len().min(data.len());
-        data[..copy_len].copy_from_slice(&snapshot.memory[..copy_len]);
-
-        if let Some(stack_ptr) = snapshot.stack_ptr {
-            if let Some(global) = self.instance.get_global(&mut self.store, "__stack_pointer") {
-                global.set(&mut self.store, wasmtime::Val::I32(stack_ptr as i32))?;
-            }
-        }
-
-        if let Some(heap_ptr) = snapshot.heap_ptr {
-            if let Some(global) = self.instance.get_global(&mut self.store, "__heap_base") {
-                global.set(&mut self.store, wasmtime::Val::I32(heap_ptr as i32))?;
-            }
-        }
+        anyhow::ensure!(
+            data.len() >= snapshot.memory.len(),
+            "replacement memory is smaller than the captured process memory"
+        );
+        data[..snapshot.memory.len()].copy_from_slice(&snapshot.memory);
 
         Ok(())
     }

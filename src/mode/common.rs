@@ -7,7 +7,7 @@ use lunatic_distributed::DistributedProcessState;
 use lunatic_process::{
     env::{Environment, LunaticEnvironment, LunaticEnvironments},
     runtimes::{wasmtime::WasmtimeRuntime, RawWasm},
-    wasm::spawn_wasm,
+    wasm::{spawn_wasm_with_options, WasmSpawnOptions},
 };
 use lunatic_process_api::ProcessConfigCtx;
 use lunatic_runtime::{DefaultProcessConfig, DefaultProcessState};
@@ -25,6 +25,7 @@ pub struct RunWasm {
     pub envs: Arc<LunaticEnvironments>,
     pub env: Arc<LunaticEnvironment>,
     pub distributed: Option<DistributedProcessState>,
+    pub initial_module_version: Option<(u64, u32)>,
 }
 
 pub async fn run_wasm(args: RunWasm) -> Result<()> {
@@ -77,14 +78,17 @@ pub async fn run_wasm(args: RunWasm) -> Result<()> {
     .unwrap();
 
     args.env.can_spawn_next_process().await?;
-    let (task, _) = spawn_wasm(
+    let (task, _) = spawn_wasm_with_options(
         args.env,
         args.runtime,
         &module,
         state,
         "_start",
         Vec::new(),
-        None,
+        WasmSpawnOptions {
+            link: None,
+            initial_module_version: args.initial_module_version,
+        },
     )
     .await
     .context(format!(

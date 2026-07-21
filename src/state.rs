@@ -202,6 +202,40 @@ impl ProcessState for DefaultProcessState {
         Ok(state)
     }
 
+    fn new_state_for_reload(
+        &self,
+        module: Arc<WasmtimeCompiledModule<Self>>,
+        config: Arc<DefaultProcessConfig>,
+    ) -> Result<Self> {
+        self.config
+            .validate_child_config(config.as_ref())
+            .map_err(anyhow::Error::msg)?;
+
+        Ok(Self {
+            id: self.id,
+            environment: self.environment.clone(),
+            distributed: self.distributed.clone(),
+            runtime: self.runtime.clone(),
+            module: Some(module),
+            config: config.clone(),
+            message: None,
+            signal_mailbox: self.signal_mailbox.clone(),
+            message_mailbox: self.message_mailbox.clone(),
+            resources: Resources::default(),
+            wasi: build_wasi(
+                Some(config.command_line_arguments()),
+                Some(config.environment_variables()),
+                config.preopened_dirs(),
+            )?,
+            wasi_stdout: None,
+            wasi_stderr: None,
+            initialized: false,
+            registry: self.registry.clone(),
+            db_resources: DbResources::default(),
+            resource_stats: ResourceStats::default(),
+        })
+    }
+
     fn register(linker: &mut Linker<Self>) -> Result<()> {
         lunatic_error_api::register(linker)?;
         lunatic_process_api::register(linker)?;
@@ -290,17 +324,19 @@ impl ProcessState for DefaultProcessState {
             dns_iterators: self.resources.dns_iterators.len(),
         };
 
-        // Move the maps themselves so their ID seeds and live host objects are
-        // preserved. In particular, this keeps the exact TCP/TLS sessions and
-        // does not serialize cryptographic state or substitute a fresh stream.
-        target.resources.tcp_listeners = std::mem::take(&mut self.resources.tcp_listeners);
-        target.resources.tcp_streams = std::mem::take(&mut self.resources.tcp_streams);
-        target.resources.tls_listeners = std::mem::take(&mut self.resources.tls_listeners);
-        target.resources.tls_streams = std::mem::take(&mut self.resources.tls_streams);
-        target.resources.udp_sockets = std::mem::take(&mut self.resources.udp_sockets);
-        target.resources.dns_iterators = std::mem::take(&mut self.resources.dns_iterators);
-        target.resource_stats.open_network_connections =
-            std::mem::take(&mut self.resource_stats.open_network_connections);
+        // Swap the complete host-owned state only after every fallible check has
+        // succeeded. This preserves resource IDs, live network sessions,
+        // configuration/module handles, timers, errors, SQLite handles, WASI
+        // descriptors and message scratch state as one commit operation. The
+        // old instance receives the replacement's fresh state and can then be
+        // dropped without closing resources now owned by the new instance.
+        std::mem::swap(&mut self.resources, &mut target.resources);
+        std::mem::swap(&mut self.db_resources, &mut target.db_resources);
+        std::mem::swap(&mut self.wasi, &mut target.wasi);
+        std::mem::swap(&mut self.wasi_stdout, &mut target.wasi_stdout);
+        std::mem::swap(&mut self.wasi_stderr, &mut target.wasi_stderr);
+        std::mem::swap(&mut self.message, &mut target.message);
+        std::mem::swap(&mut self.resource_stats, &mut target.resource_stats);
 
         Ok(report)
     }

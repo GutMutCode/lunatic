@@ -35,24 +35,15 @@ use crate::{mailbox::MessageMailbox, message::Message};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 
-/// Perform a pending hot reload with instance swap
-async fn perform_pending_reload<S>(
-    context: &ProcessContext<S>,
-    env: Arc<dyn Environment>,
+fn validate_reload_target<S>(
+    env: &Arc<dyn Environment>,
     module_id: u64,
     old_version: u32,
     new_version: u32,
-) -> Result<()>
+) -> Result<Arc<runtimes::wasmtime::WasmtimeCompiledModule<S>>>
 where
-    S: ProcessState + Send + wasmtime::ResourceLimiter + 'static,
+    S: ProcessState + Send + 'static,
 {
-    log::info!(
-        "Starting hot reload: module_id={}, {} -> {}",
-        module_id,
-        old_version,
-        new_version
-    );
-
     let module_registry = env
         .get_module_registry()
         .ok_or_else(|| anyhow!("ModuleRegistry not available in environment"))?;
@@ -69,15 +60,12 @@ where
         .get_version(module_id, old_version)
         .ok_or_else(|| anyhow!("Old module version {} not found", old_version))?;
 
-    // Validate signature compatibility
-    log::info!("Validating module compatibility...");
     let validation_errors =
         signature_validation::SignatureValidator::validate_compatibility(&old_module, &new_module)?;
 
     if !validation_errors.is_empty() {
-        log::error!("Module incompatibility detected:");
         for error in &validation_errors {
-            log::error!("  - {}", error);
+            log::error!("Hot reload incompatibility: {}", error);
         }
         return Err(anyhow!(
             "Module signature validation failed: {} incompatibilities found",
@@ -85,6 +73,29 @@ where
         ));
     }
 
+    Ok(new_module)
+}
+
+/// Perform a pending hot reload with an atomic instance swap.
+pub(crate) async fn perform_pending_reload<S>(
+    context: &ProcessContext<S>,
+    env: Arc<dyn Environment>,
+    module_id: u64,
+    old_version: u32,
+    new_version: u32,
+) -> Result<()>
+where
+    S: ProcessState + Send + wasmtime::ResourceLimiter + 'static,
+{
+    log::info!(
+        "Starting hot reload: module_id={}, {} -> {}",
+        module_id,
+        old_version,
+        new_version
+    );
+
+    log::info!("Validating module compatibility...");
+    let new_module = validate_reload_target::<S>(&env, module_id, old_version, new_version)?;
     log::info!("Module signatures are compatible");
 
     let mut instance_guard = context.instance.write().await;
@@ -94,24 +105,25 @@ where
 
     let reload_result = async {
         let memory_snapshot = old_instance.snapshot_memory()?;
-        let mailbox_snapshot = old_instance.state().message_mailbox().snapshot();
+        let remaining_fuel = old_instance.store().get_fuel()?;
+        let queued_messages = old_instance.state().message_mailbox().len();
 
         log::info!(
             "Captured {} bytes of memory and {} messages",
             memory_snapshot.memory.len(),
-            mailbox_snapshot.len()
+            queued_messages
         );
 
         let runtime = old_instance.state().runtime().clone();
         let config = old_instance.state().config().clone();
-        let new_state = old_instance.state().new_state(new_module.clone(), config)?;
+        let new_state = old_instance
+            .state()
+            .new_state_for_reload(new_module.clone(), config)?;
         let mut new_instance = runtime.instantiate(&new_module, new_state).await?;
 
         new_instance.restore_memory(&memory_snapshot)?;
-        new_instance
-            .state_mut()
-            .message_mailbox()
-            .restore(mailbox_snapshot);
+        // A reload must not replenish the process instruction budget.
+        new_instance.store_mut().set_fuel(remaining_fuel)?;
 
         let transfer_report = old_instance
             .state_mut()
@@ -140,19 +152,57 @@ where
     }
 }
 
-/// Context for managing process execution and hot reload state
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ReloadCommand {
+    HotReload { module_id: u64, new_version: u32 },
+    Rollback { module_id: u64, target_version: u32 },
+}
+
+impl ReloadCommand {
+    pub(crate) fn module_id(self) -> u64 {
+        match self {
+            Self::HotReload { module_id, .. } | Self::Rollback { module_id, .. } => module_id,
+        }
+    }
+
+    pub(crate) fn target_version(self) -> u32 {
+        match self {
+            Self::HotReload { new_version, .. } => new_version,
+            Self::Rollback { target_version, .. } => target_version,
+        }
+    }
+}
+
+/// Context for managing process execution and hot reload state.
 pub struct ProcessContext<S: Send + 'static> {
     pub instance: Arc<RwLock<Option<crate::runtimes::wasmtime::WasmtimeInstance<S>>>>,
     pub reload_in_progress: Arc<AtomicBool>,
-    pub pending_reload: Arc<std::sync::Mutex<Option<(u64, u32)>>>,
+    reload_sender: UnboundedSender<ReloadCommand>,
+    reload_receiver: Arc<std::sync::Mutex<Option<UnboundedReceiver<ReloadCommand>>>>,
+    current_versions: Arc<std::sync::Mutex<HashMap<u64, u32>>>,
+}
+
+impl<S: Send + 'static> Clone for ProcessContext<S> {
+    fn clone(&self) -> Self {
+        Self {
+            instance: self.instance.clone(),
+            reload_in_progress: self.reload_in_progress.clone(),
+            reload_sender: self.reload_sender.clone(),
+            reload_receiver: self.reload_receiver.clone(),
+            current_versions: self.current_versions.clone(),
+        }
+    }
 }
 
 impl<S: Send + 'static> ProcessContext<S> {
     pub fn new(instance: crate::runtimes::wasmtime::WasmtimeInstance<S>) -> Self {
+        let (reload_sender, reload_receiver) = unbounded_channel();
         Self {
             instance: Arc::new(RwLock::new(Some(instance))),
             reload_in_progress: Arc::new(AtomicBool::new(false)),
-            pending_reload: Arc::new(std::sync::Mutex::new(None)),
+            reload_sender,
+            reload_receiver: Arc::new(std::sync::Mutex::new(Some(reload_receiver))),
+            current_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -165,19 +215,34 @@ impl<S: Send + 'static> ProcessContext<S> {
         instance.replace(new_instance)
     }
 
-    /// Check if reload is pending
-    pub fn check_pending_reload(&self) -> Option<(u64, u32)> {
-        *self.pending_reload.lock().unwrap()
+    pub(crate) fn take_reload_receiver(&self) -> UnboundedReceiver<ReloadCommand> {
+        self.reload_receiver
+            .lock()
+            .unwrap()
+            .take()
+            .expect("reload receiver can only be owned by the Wasm execution driver")
     }
 
-    /// Set pending reload
-    pub fn set_pending_reload(&self, module_id: u64, new_version: u32) {
-        *self.pending_reload.lock().unwrap() = Some((module_id, new_version));
+    pub(crate) fn request_reload(&self, command: ReloadCommand) -> Result<()> {
+        self.reload_sender
+            .send(command)
+            .map_err(|_| anyhow!("Wasm reload execution driver is no longer running"))
     }
 
-    /// Clear pending reload
-    pub fn clear_pending_reload(&self) {
-        *self.pending_reload.lock().unwrap() = None;
+    pub(crate) fn current_version(&self, module_id: u64) -> u32 {
+        self.current_versions
+            .lock()
+            .unwrap()
+            .get(&module_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_current_version(&self, module_id: u64, version: u32) {
+        self.current_versions
+            .lock()
+            .unwrap()
+            .insert(module_id, version);
     }
 }
 
@@ -758,43 +823,35 @@ where
                     Ok(Signal::HotReload { module_id, new_version }) => {
                         if let Some(context) = &context {
                             log::info!("Processing HotReload signal for module {} version {}", module_id, new_version);
-
-                            // Check if reload already in progress
-                            if context.reload_in_progress.load(Ordering::SeqCst) {
-                                log::warn!("Hot reload already in progress, ignoring signal");
-                                continue;
-                            }
-
-                            // Set reload flag
-                            context.reload_in_progress.store(true, Ordering::SeqCst);
-
-                            // Get the old version from pending reload or default to 0
-                            let old_version = {
-                                let pending = context.pending_reload.lock().unwrap();
-                                pending.map(|(_, v)| v).unwrap_or(0)
-                            };
-
-                            // Perform the hot reload immediately
-                            match perform_pending_reload(
-                                context,
-                                env.clone(),
+                            let old_version = context.current_version(module_id);
+                            match validate_reload_target::<S>(
+                                &env,
                                 module_id,
                                 old_version,
                                 new_version,
-                            ).await {
+                            ) {
                                 Ok(_) => {
-                                    log::info!("Hot reload completed successfully for module {} -> version {}", module_id, new_version);
-                                    context.clear_pending_reload();
+                                    if context.reload_in_progress.load(Ordering::SeqCst) {
+                                        log::info!("Queueing hot reload behind the active transaction");
+                                    }
+                                    if let Err(error) = context.request_reload(ReloadCommand::HotReload {
+                                        module_id,
+                                        new_version,
+                                    }) {
+                                        log::error!("Failed to queue hot reload: {}", error);
+                                    }
                                 }
-                                Err(e) => {
-                                    log::error!("Hot reload failed for module {}: {}", module_id, e);
-                                    // Keep pending reload for retry
-                                    context.set_pending_reload(module_id, new_version);
+                                Err(error) => {
+                                    // Preflight happens in the signal loop while the current
+                                    // call future remains alive. An incompatible module is thus
+                                    // rejected without interrupting the running guest.
+                                    log::error!(
+                                        "Rejected hot reload for module {}: {}",
+                                        module_id,
+                                        error
+                                    );
                                 }
                             }
-
-                            // Clear reload flag
-                            context.reload_in_progress.store(false, Ordering::SeqCst);
                         } else {
                             log::warn!("Hot reload signal received but no context available (native process?)");
                         }
@@ -803,41 +860,29 @@ where
                     Ok(Signal::Rollback { module_id, target_version }) => {
                         if let Some(context) = &context {
                             log::info!("Processing Rollback signal for module {} to version {}", module_id, target_version);
-
-                            // Check if reload already in progress
-                            if context.reload_in_progress.load(Ordering::SeqCst) {
-                                log::warn!("Reload in progress, deferring rollback");
-                                continue;
-                            }
-
-                            // Set reload flag
-                            context.reload_in_progress.store(true, Ordering::SeqCst);
-
-                            // Get current version to perform downgrade
-                            let current_version = {
-                                let pending = context.pending_reload.lock().unwrap();
-                                pending.map(|(_, v)| v).unwrap_or(target_version + 1)
-                            };
-
-                            // Perform rollback as a regular reload to previous version
-                            match perform_pending_reload(
-                                context,
-                                env.clone(),
+                            let current_version = context.current_version(module_id);
+                            match validate_reload_target::<S>(
+                                &env,
                                 module_id,
                                 current_version,
                                 target_version,
-                            ).await {
+                            ) {
                                 Ok(_) => {
-                                    log::info!("Rollback completed successfully for module {} to version {}", module_id, target_version);
-                                    context.clear_pending_reload();
+                                    if let Err(error) = context.request_reload(ReloadCommand::Rollback {
+                                        module_id,
+                                        target_version,
+                                    }) {
+                                        log::error!("Failed to queue rollback: {}", error);
+                                    }
                                 }
-                                Err(e) => {
-                                    log::error!("Rollback failed for module {}: {}", module_id, e);
+                                Err(error) => {
+                                    log::error!(
+                                        "Rejected rollback for module {}: {}",
+                                        module_id,
+                                        error
+                                    );
                                 }
                             }
-
-                            // Clear reload flag
-                            context.reload_in_progress.store(false, Ordering::SeqCst);
                         } else {
                             log::warn!("Rollback signal received but no context available (native process?)");
                         }

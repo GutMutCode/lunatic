@@ -25,7 +25,11 @@ pub struct MessageMailbox {
 struct InnerMessageMailbox {
     waker: Option<Waker>,
     tags: Option<Vec<i64>>,
-    found: Option<Message>,
+    // A message selected for a waiting receive plus its arrival position in
+    // `messages`. If the receive is cancelled after being woken, restoring at
+    // this position preserves FIFO relative to both older unmatched messages
+    // and messages that arrived after it.
+    found: Option<(usize, Message)>,
     messages: VecDeque<Message>,
 }
 
@@ -43,8 +47,9 @@ impl MessageMailbox {
 
             // If a found message exists here, it means that the previous `.await` was canceled
             // after a `wake()` call. To not lose this message it should be put into the queue.
-            if let Some(found) = mailbox.found.take() {
-                mailbox.messages.push_back(found);
+            if let Some((index, found)) = mailbox.found.take() {
+                let index = index.min(mailbox.messages.len());
+                mailbox.messages.insert(index, found);
             }
 
             // When looking for specific tags, loop through all messages to check for it
@@ -99,8 +104,9 @@ impl MessageMailbox {
 
             // If a found message exists here, it means that the previous `.await` was canceled
             // after a `wake()` call. To not lose this message it should be put into the queue.
-            if let Some(found) = mailbox.found.take() {
-                mailbox.messages.push_back(found);
+            if let Some((index, found)) = mailbox.found.take() {
+                let index = index.min(mailbox.messages.len());
+                mailbox.messages.insert(index, found);
             }
 
             // Mark the tags to wait on.
@@ -127,7 +133,8 @@ impl MessageMailbox {
                         .unwrap()
                         .contains(&message.tag().unwrap()))
             {
-                mailbox.found = Some(message);
+                let restore_index = mailbox.messages.len();
+                mailbox.found = Some((restore_index, message));
                 waker.wake();
                 return;
             } else {
@@ -163,8 +170,9 @@ impl MessageMailbox {
 
         let mut messages = Vec::new();
 
-        if let Some(found) = mailbox.found.take() {
-            messages.push(found);
+        if let Some((index, found)) = mailbox.found.take() {
+            let index = index.min(mailbox.messages.len());
+            mailbox.messages.insert(index, found);
         }
 
         while let Some(message) = mailbox.messages.pop_front() {
@@ -192,7 +200,7 @@ impl Future for &MessageMailbox {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut mailbox = self.inner.lock().expect("only accessed by one process");
-        if let Some(message) = mailbox.found.take() {
+        if let Some((_, message)) = mailbox.found.take() {
             Poll::Ready(message)
         } else {
             mailbox.waker = Some(cx.waker().clone());
@@ -382,5 +390,43 @@ mod tests {
             Poll::Ready(Message::LinkDied(tags)) => assert_eq!(tags, None),
             _ => panic!("Unexpected message"),
         }
+    }
+
+    #[tokio::test]
+    async fn canceled_no_tag_receive_preserves_fifo_with_later_messages() {
+        let mailbox = MessageMailbox::default();
+        let waker = FlagWaker(Arc::new(Mutex::new(false)));
+        let waker = &Arc::new(waker).into();
+        let mut context = Context::from_waker(waker);
+
+        let mut receive = Box::pin(mailbox.pop(None));
+        assert!(receive.as_mut().poll(&mut context).is_pending());
+
+        mailbox.push(Message::LinkDied(Some(1)));
+        mailbox.push(Message::LinkDied(Some(2)));
+        drop(receive);
+
+        assert_eq!(mailbox.pop(None).await.tag(), Some(1));
+        assert_eq!(mailbox.pop(None).await.tag(), Some(2));
+    }
+
+    #[tokio::test]
+    async fn canceled_selective_receive_preserves_global_fifo() {
+        let mailbox = MessageMailbox::default();
+        let waker = FlagWaker(Arc::new(Mutex::new(false)));
+        let waker = &Arc::new(waker).into();
+        let mut context = Context::from_waker(waker);
+
+        mailbox.push(Message::LinkDied(Some(1)));
+        let mut receive = Box::pin(mailbox.pop(Some(&[2])));
+        assert!(receive.as_mut().poll(&mut context).is_pending());
+
+        mailbox.push(Message::LinkDied(Some(2)));
+        mailbox.push(Message::LinkDied(Some(3)));
+        drop(receive);
+
+        assert_eq!(mailbox.pop(None).await.tag(), Some(1));
+        assert_eq!(mailbox.pop(None).await.tag(), Some(2));
+        assert_eq!(mailbox.pop(None).await.tag(), Some(3));
     }
 }
