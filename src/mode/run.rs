@@ -1,12 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use lunatic_process::{
     env::{Environment, Environments, LunaticEnvironment, LunaticEnvironments},
+    hot_reload::ReloadCoordinator,
     module_registry::ModuleRegistry,
     runtimes::{self},
 };
@@ -70,8 +68,66 @@ pub(crate) async fn start(mut args: Args) -> Result<()> {
             env,
             distributed: None,
             initial_module_version: None,
+            compiled_module: None,
+            spawn_ready: None,
         })
         .await
+    }
+}
+
+struct WatchProcessLauncher {
+    runtime: runtimes::wasmtime::WasmtimeRuntime,
+    path: PathBuf,
+    wasm_args: Vec<String>,
+    dir: Vec<PathBuf>,
+    envs: Arc<LunaticEnvironments>,
+    env: Arc<LunaticEnvironment>,
+    module_registry: Arc<ModuleRegistry<DefaultProcessState>>,
+}
+
+impl WatchProcessLauncher {
+    async fn start(
+        &self,
+        initial_module_version: (u64, u32),
+    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
+        let compiled_module = self
+            .module_registry
+            .get_version(initial_module_version.0, initial_module_version.1)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Module {} version {} is not registered",
+                    initial_module_version.0,
+                    initial_module_version.1
+                )
+            })?;
+        let (spawn_ready, ready) = tokio::sync::oneshot::channel();
+        let args = RunWasm {
+            path: self.path.clone(),
+            wasm_args: self.wasm_args.clone(),
+            dir: self.dir.clone(),
+            runtime: self.runtime.clone(),
+            envs: self.envs.clone(),
+            env: self.env.clone(),
+            distributed: None,
+            initial_module_version: Some(initial_module_version),
+            compiled_module: Some(compiled_module),
+            spawn_ready: Some(spawn_ready),
+        };
+
+        let handle = tokio::spawn(async move { run_wasm(args).await });
+        if ready.await.is_err() {
+            return match handle.await {
+                Ok(Err(error)) => Err(error).context("Wasm process failed before registration"),
+                Ok(Ok(())) => Err(anyhow::anyhow!(
+                    "Wasm process exited before confirming registry membership"
+                )),
+                Err(error) => Err(anyhow::anyhow!(
+                    "Wasm process task failed before registration: {}",
+                    error
+                )),
+            };
+        }
+        Ok(handle)
     }
 }
 
@@ -89,11 +145,12 @@ async fn run_with_watch(
     info!("Watching file: {:?}", args.path);
 
     let module_registry = Arc::new(ModuleRegistry::<DefaultProcessState>::new());
+    let reload_coordinator = ReloadCoordinator::<DefaultProcessState>::new();
 
     let initial_bytes = std::fs::read(&args.path)?;
     let initial_module = runtime.compile_module(initial_bytes.into())?;
     let module_id = 0u64;
-    let initial_version = module_registry.add_version(module_id, initial_module);
+    let initial_version = module_registry.add_version(module_id, initial_module)?;
 
     info!("Module registry initialized with version 0");
 
@@ -122,47 +179,17 @@ async fn run_with_watch(
     let mut last_reload_time = tokio::time::Instant::now();
     let reload_debounce = tokio::time::Duration::from_millis(500);
 
-    async fn start_process(
-        runtime: &runtimes::wasmtime::WasmtimeRuntime,
-        path: &Path,
-        wasm_args: &[String],
-        dir: &[PathBuf],
-        envs: Arc<LunaticEnvironments>,
-        env: Arc<LunaticEnvironment>,
-        initial_module_version: (u64, u32),
-    ) -> Result<tokio::task::JoinHandle<Result<()>>> {
-        let runtime_clone = runtime.clone();
-        let path_clone = path.to_path_buf();
-        let wasm_args_clone = wasm_args.to_vec();
-        let dir_clone = dir.to_vec();
-
-        let handle = tokio::spawn(async move {
-            run_wasm(RunWasm {
-                path: path_clone,
-                wasm_args: wasm_args_clone,
-                dir: dir_clone,
-                runtime: runtime_clone,
-                envs,
-                env,
-                distributed: None,
-                initial_module_version: Some(initial_module_version),
-            })
-            .await
-        });
-        Ok(handle)
-    }
-
+    let launcher = WatchProcessLauncher {
+        runtime: runtime.clone(),
+        path: path.clone(),
+        wasm_args: wasm_args.clone(),
+        dir: dir.clone(),
+        envs: envs.clone(),
+        env: env.clone(),
+        module_registry: module_registry.clone(),
+    };
     let mut launch_version = initial_version;
-    let handle = start_process(
-        &runtime,
-        &path,
-        &wasm_args,
-        &dir,
-        envs.clone(),
-        env.clone(),
-        (module_id, launch_version),
-    )
-    .await?;
+    let handle = launcher.start((module_id, launch_version)).await?;
     let mut process_info = Some(ProcessInfo { handle, env_id: 1 });
     info!("Initial process started with hot reload support");
 
@@ -186,18 +213,18 @@ async fn run_with_watch(
                             &runtime,
                             &module_registry,
                             &env_for_reload,
+                            &reload_coordinator,
                             module_id,
                             new_bytes,
-                        ) {
+                        ).await {
                             Ok(new_version) => {
                                 launch_version = new_version;
-                                info!("Compiled new module version: {}", new_version);
-                                println!("✅ Hot reload signal sent (version {})\n", new_version);
-                                info!("Hot reload signal queued for version {}", new_version);
+                                info!("Committed new module version: {}", new_version);
+                                println!("✅ Hot reload committed (version {})\n", new_version);
                             }
                             Err(e) => {
-                                error!("Failed to compile new module: {}", e);
-                                println!("❌ Compilation failed: {}\n", e);
+                                error!("Hot reload failed: {}", e);
+                                println!("❌ Hot reload failed: {}\n", e);
                             }
                         }
                     }
@@ -222,15 +249,7 @@ async fn run_with_watch(
                         error!("Process error: {}", e);
                         info!("Restarting process...");
 
-                        let new_handle = start_process(
-                            &runtime,
-                            &path,
-                            &wasm_args,
-                            &dir,
-                            envs.clone(),
-                            env.clone(),
-                            (module_id, launch_version),
-                        ).await?;
+                        let new_handle = launcher.start((module_id, launch_version)).await?;
                         process_info = Some(ProcessInfo { handle: new_handle, env_id: 1 });
                         info!("Process restarted");
                     }

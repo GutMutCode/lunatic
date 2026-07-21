@@ -43,7 +43,7 @@ fn bench_hot_reload_registry_operations(c: &mut Criterion) {
                 .unwrap();
 
             let start = Instant::now();
-            let version = registry.add_version(1, module);
+            let version = registry.add_version(1, module).unwrap();
             let registry_time = start.elapsed();
 
             black_box((version, registry_time))
@@ -56,7 +56,7 @@ fn bench_hot_reload_registry_operations(c: &mut Criterion) {
         let module = runtime
             .compile_module::<DefaultProcessState>(raw_module.into())
             .unwrap();
-        registry.add_version(1, module);
+        registry.add_version(1, module).unwrap();
 
         b.iter(|| {
             let start = Instant::now();
@@ -165,7 +165,7 @@ fn bench_hot_reload_full_cycle(c: &mut Criterion) {
 
             // 2. Create registry and add v1
             let registry = ModuleRegistry::<DefaultProcessState>::new();
-            let v1 = registry.add_version(1, module_v1.clone());
+            let v1 = registry.add_version(1, module_v1.clone()).unwrap();
 
             // 3. Create instance with v1
             let config = Arc::new(DefaultProcessConfig::default());
@@ -194,7 +194,7 @@ fn bench_hot_reload_full_cycle(c: &mut Criterion) {
                 .unwrap();
 
             // 6. Add v2 to registry
-            let v2 = registry.add_version(1, module_v2.clone());
+            let v2 = registry.add_version(1, module_v2.clone()).unwrap();
 
             // 7. Create new instance with v2
             let state_v2 = DefaultProcessState::new(

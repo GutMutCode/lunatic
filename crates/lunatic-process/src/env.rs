@@ -139,12 +139,21 @@ impl Environment for LunaticEnvironment {
             }
             Signal::HotReload {
                 module_id,
+                expected_version,
                 new_version,
+                acknowledgement,
             } => {
+                if acknowledgement.is_some() {
+                    log::warn!(
+                        "A single acknowledgement channel cannot be broadcast; use ReloadCoordinator"
+                    );
+                }
                 for entry in self.processes.iter() {
                     entry.value().send(Signal::HotReload {
                         module_id,
+                        expected_version,
                         new_version,
+                        acknowledgement: None,
                     });
                 }
             }

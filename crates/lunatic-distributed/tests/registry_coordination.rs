@@ -16,8 +16,13 @@ use rcgen::{CertificateParams, CustomExtension, DnType};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Mutex};
 use tokio::task::JoinHandle;
+
+// The QUIC coordination harness uses the same logical node identities. Keep
+// clusters from separate tests from overlapping and routing messages into a
+// concurrently running cluster with the same node IDs.
+static TEST_CLUSTER_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct TestNode {
     address: SocketAddr,
@@ -218,6 +223,7 @@ fn test_registration(node_id: u64, root_cert: &str, cert: &str) -> Registration 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn same_name_concurrent_registration_has_one_winner_in_2_3_5_node_clusters() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
     for node_count in [2usize, 3, 5] {
         let cluster = TestCluster::new(node_count).await?;
         let barrier = Arc::new(Barrier::new(node_count));
@@ -260,6 +266,7 @@ async fn same_name_concurrent_registration_has_one_winner_in_2_3_5_node_clusters
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn request_ids_from_different_nodes_do_not_collide_at_the_coordinator() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
     let cluster = TestCluster::new(3).await?;
     let barrier = Arc::new(Barrier::new(3));
     let mut registrations = Vec::new();
@@ -283,6 +290,7 @@ async fn request_ids_from_different_nodes_do_not_collide_at_the_coordinator() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn registration_does_not_succeed_before_a_majority_responds() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
     let mut cluster = TestCluster::new(3).await?;
     cluster.pause(1).await;
     cluster.pause(2).await;
@@ -310,6 +318,7 @@ async fn registration_does_not_succeed_before_a_majority_responds() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn recovered_node_resynchronizes_a_commit_missed_during_partition() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
     let mut cluster = TestCluster::new(3).await?;
     cluster.pause(2).await;
 

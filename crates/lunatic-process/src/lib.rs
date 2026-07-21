@@ -16,7 +16,7 @@ use std::{
     any::Any, collections::HashMap, fmt::Debug, future::Future, panic::AssertUnwindSafe, sync::Arc,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
 use env::Environment;
 use futures_util::FutureExt;
 use log::{debug, log_enabled, trace, warn, Level};
@@ -26,12 +26,16 @@ use state::ProcessState;
 use tokio::{
     sync::{
         mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-        Mutex,
+        oneshot, Mutex,
     },
     task::JoinHandle,
 };
 
-use crate::{mailbox::MessageMailbox, message::Message};
+use crate::{
+    mailbox::MessageMailbox,
+    message::Message,
+    module_registry::{ModuleRegistry, ProcessKey},
+};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::RwLock;
 
@@ -152,49 +156,192 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessReloadStatus {
+    Applied,
+    AlreadyAtTarget,
+    Failed(String),
+}
+
+impl ProcessReloadStatus {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Applied | Self::AlreadyAtTarget)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReloadAcknowledgement {
+    pub process_id: u64,
+    pub module_id: u64,
+    pub previous_version: u32,
+    pub current_version: u32,
+    pub status: ProcessReloadStatus,
+}
+
+pub type ReloadAckSender = oneshot::Sender<ReloadAcknowledgement>;
+
+pub(crate) fn acknowledge_reload(
+    acknowledgement: Option<ReloadAckSender>,
+    process_id: u64,
+    module_id: u64,
+    previous_version: u32,
+    current_version: u32,
+    status: ProcessReloadStatus,
+) {
+    if let Some(acknowledgement) = acknowledgement {
+        let _ = acknowledgement.send(ReloadAcknowledgement {
+            process_id,
+            module_id,
+            previous_version,
+            current_version,
+            status,
+        });
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReloadAction {
+    HotReload,
+    Rollback,
+}
+
+#[derive(Debug)]
 pub(crate) enum ReloadCommand {
-    HotReload { module_id: u64, new_version: u32 },
-    Rollback { module_id: u64, target_version: u32 },
+    HotReload {
+        module_id: u64,
+        expected_version: Option<u32>,
+        new_version: u32,
+        acknowledgement: Option<ReloadAckSender>,
+    },
+    Rollback {
+        module_id: u64,
+        expected_version: Option<u32>,
+        target_version: u32,
+        acknowledgement: Option<ReloadAckSender>,
+    },
 }
 
 impl ReloadCommand {
-    pub(crate) fn module_id(self) -> u64 {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (ReloadAction, u64, Option<u32>, u32, Option<ReloadAckSender>) {
         match self {
-            Self::HotReload { module_id, .. } | Self::Rollback { module_id, .. } => module_id,
+            Self::HotReload {
+                module_id,
+                expected_version,
+                new_version,
+                acknowledgement,
+            } => (
+                ReloadAction::HotReload,
+                module_id,
+                expected_version,
+                new_version,
+                acknowledgement,
+            ),
+            Self::Rollback {
+                module_id,
+                expected_version,
+                target_version,
+                acknowledgement,
+            } => (
+                ReloadAction::Rollback,
+                module_id,
+                expected_version,
+                target_version,
+                acknowledgement,
+            ),
+        }
+    }
+}
+
+struct ProcessVersionState<S: ProcessState> {
+    registry: Option<Arc<ModuleRegistry<S>>>,
+    process: Option<ProcessKey>,
+    current_versions: HashMap<u64, u32>,
+}
+
+struct ProcessVersionTracking<S: ProcessState> {
+    state: std::sync::Mutex<ProcessVersionState<S>>,
+}
+
+struct ProcessVersionRegistrations<S: ProcessState> {
+    registry: Option<Arc<ModuleRegistry<S>>>,
+    process: Option<ProcessKey>,
+    versions: HashMap<u64, u32>,
+}
+
+impl<S: ProcessState> ProcessVersionTracking<S> {
+    fn take_registrations(&self) -> ProcessVersionRegistrations<S> {
+        let mut state = self.state.lock().expect("version tracking mutex poisoned");
+        ProcessVersionRegistrations {
+            registry: state.registry.take(),
+            process: state.process.take(),
+            versions: std::mem::take(&mut state.current_versions),
         }
     }
 
-    pub(crate) fn target_version(self) -> u32 {
-        match self {
-            Self::HotReload { new_version, .. } => new_version,
-            Self::Rollback { target_version, .. } => target_version,
+    fn unregister_all(&self) {
+        let ProcessVersionRegistrations {
+            registry,
+            process,
+            versions,
+        } = self.take_registrations();
+        if let (Some(registry), Some(process)) = (registry, process) {
+            for (module_id, version) in versions {
+                if let Err(error) = registry.unregister_process(module_id, version, process) {
+                    log::error!(
+                        "Failed to unregister process {} from module {} version {}: {}",
+                        process.process_id,
+                        module_id,
+                        version,
+                        error
+                    );
+                }
+            }
         }
+    }
+}
+
+impl<S: ProcessState> Default for ProcessVersionTracking<S> {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(ProcessVersionState {
+                registry: None,
+                process: None,
+                current_versions: HashMap::new(),
+            }),
+        }
+    }
+}
+
+impl<S: ProcessState> Drop for ProcessVersionTracking<S> {
+    fn drop(&mut self) {
+        self.unregister_all();
     }
 }
 
 /// Context for managing process execution and hot reload state.
-pub struct ProcessContext<S: Send + 'static> {
+pub struct ProcessContext<S: ProcessState + Send + 'static> {
     pub instance: Arc<RwLock<Option<crate::runtimes::wasmtime::WasmtimeInstance<S>>>>,
     pub reload_in_progress: Arc<AtomicBool>,
     reload_sender: UnboundedSender<ReloadCommand>,
     reload_receiver: Arc<std::sync::Mutex<Option<UnboundedReceiver<ReloadCommand>>>>,
-    current_versions: Arc<std::sync::Mutex<HashMap<u64, u32>>>,
+    version_tracking: Arc<ProcessVersionTracking<S>>,
 }
 
-impl<S: Send + 'static> Clone for ProcessContext<S> {
+impl<S: ProcessState + Send + 'static> Clone for ProcessContext<S> {
     fn clone(&self) -> Self {
         Self {
             instance: self.instance.clone(),
             reload_in_progress: self.reload_in_progress.clone(),
             reload_sender: self.reload_sender.clone(),
             reload_receiver: self.reload_receiver.clone(),
-            current_versions: self.current_versions.clone(),
+            version_tracking: self.version_tracking.clone(),
         }
     }
 }
 
-impl<S: Send + 'static> ProcessContext<S> {
+impl<S: ProcessState + Send + 'static> ProcessContext<S> {
     pub fn new(instance: crate::runtimes::wasmtime::WasmtimeInstance<S>) -> Self {
         let (reload_sender, reload_receiver) = unbounded_channel();
         Self {
@@ -202,7 +349,7 @@ impl<S: Send + 'static> ProcessContext<S> {
             reload_in_progress: Arc::new(AtomicBool::new(false)),
             reload_sender,
             reload_receiver: Arc::new(std::sync::Mutex::new(Some(reload_receiver))),
-            current_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            version_tracking: Arc::new(ProcessVersionTracking::default()),
         }
     }
 
@@ -223,26 +370,90 @@ impl<S: Send + 'static> ProcessContext<S> {
             .expect("reload receiver can only be owned by the Wasm execution driver")
     }
 
-    pub(crate) fn request_reload(&self, command: ReloadCommand) -> Result<()> {
-        self.reload_sender
-            .send(command)
-            .map_err(|_| anyhow!("Wasm reload execution driver is no longer running"))
+    pub(crate) fn request_reload(
+        &self,
+        command: ReloadCommand,
+    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<ReloadCommand>> {
+        self.reload_sender.send(command)
     }
 
-    pub(crate) fn current_version(&self, module_id: u64) -> u32 {
-        self.current_versions
+    pub(crate) fn track_initial_version(
+        &self,
+        registry: Arc<ModuleRegistry<S>>,
+        module_id: u64,
+        version: u32,
+        process: ProcessKey,
+    ) -> Result<()> {
+        let mut tracking = self
+            .version_tracking
+            .state
             .lock()
-            .unwrap()
+            .expect("version tracking mutex poisoned");
+        ensure!(
+            !tracking.current_versions.contains_key(&module_id),
+            "Process {} already tracks module {}",
+            process.process_id,
+            module_id
+        );
+        if let Some(existing_registry) = &tracking.registry {
+            ensure!(
+                Arc::ptr_eq(existing_registry, &registry),
+                "A process cannot track versions from multiple module registries"
+            );
+        }
+        if let Some(existing_process) = tracking.process {
+            ensure!(
+                existing_process == process,
+                "Version tracking process identity cannot change"
+            );
+        }
+
+        registry.register_process(module_id, version, process)?;
+        tracking.registry = Some(registry);
+        tracking.process = Some(process);
+        tracking.current_versions.insert(module_id, version);
+        Ok(())
+    }
+
+    pub(crate) fn current_version(&self, module_id: u64) -> Option<u32> {
+        self.version_tracking
+            .state
+            .lock()
+            .expect("version tracking mutex poisoned")
+            .current_versions
             .get(&module_id)
             .copied()
-            .unwrap_or(0)
     }
 
-    pub(crate) fn set_current_version(&self, module_id: u64, version: u32) {
-        self.current_versions
+    pub(crate) fn transition_current_version(
+        &self,
+        module_id: u64,
+        old_version: u32,
+        new_version: u32,
+    ) -> Result<()> {
+        let mut tracking = self
+            .version_tracking
+            .state
             .lock()
-            .unwrap()
-            .insert(module_id, version);
+            .expect("version tracking mutex poisoned");
+        ensure!(
+            tracking.current_versions.get(&module_id).copied() == Some(old_version),
+            "Process version changed while reload was in progress"
+        );
+        let registry = tracking
+            .registry
+            .as_ref()
+            .ok_or_else(|| anyhow!("Process has no module registry version tracking"))?;
+        let process = tracking
+            .process
+            .ok_or_else(|| anyhow!("Process has no version tracking identity"))?;
+        registry.transition_process(module_id, old_version, new_version, process)?;
+        tracking.current_versions.insert(module_id, new_version);
+        Ok(())
+    }
+
+    fn unregister_all_versions(&self) {
+        self.version_tracking.unregister_all();
     }
 }
 
@@ -266,11 +477,22 @@ pub enum Signal {
     ProcessDied(u64),
     /// Kill the process
     Kill,
-    /// Hot reload signal
-    HotReload { module_id: u64, new_version: u32 },
-    /// Rollback to previous version after failed reload
-    /// Note: Rollback is best-effort and may not preserve all state
-    Rollback { module_id: u64, target_version: u32 },
+    /// Hot reload request. Coordinated callers provide an expected version and
+    /// acknowledgement channel; fire-and-forget callers may omit both.
+    HotReload {
+        module_id: u64,
+        expected_version: Option<u32>,
+        new_version: u32,
+        acknowledgement: Option<ReloadAckSender>,
+    },
+    /// Rollback request. The same acknowledgement contract applies so a
+    /// coordinator can distinguish confirmed rollback from an in-doubt state.
+    Rollback {
+        module_id: u64,
+        expected_version: Option<u32>,
+        target_version: u32,
+        acknowledgement: Option<ReloadAckSender>,
+    },
 }
 
 /// Reason why a process died
@@ -604,11 +826,39 @@ where
                             message_mailbox.push(Message::ProcessDied(process_id));
                         }
                         Some(Signal::Kill) => break Finished::KillSignal,
-                        Some(Signal::HotReload { .. }) => {
+                        Some(Signal::HotReload {
+                            module_id,
+                            acknowledgement,
+                            ..
+                        }) => {
                             warn!("Hot reload is not supported for native process {}", id);
+                            acknowledge_reload(
+                                acknowledgement,
+                                id,
+                                module_id,
+                                0,
+                                0,
+                                ProcessReloadStatus::Failed(
+                                    "Hot reload is not supported for native processes".to_string(),
+                                ),
+                            );
                         }
-                        Some(Signal::Rollback { .. }) => {
+                        Some(Signal::Rollback {
+                            module_id,
+                            acknowledgement,
+                            ..
+                        }) => {
                             warn!("Rollback is not supported for native process {}", id);
+                            acknowledge_reload(
+                                acknowledgement,
+                                id,
+                                module_id,
+                                0,
+                                0,
+                                ProcessReloadStatus::Failed(
+                                    "Rollback is not supported for native processes".to_string(),
+                                ),
+                            );
                         }
                         None => has_sender = false,
                     }
@@ -820,71 +1070,132 @@ where
                     // Kill the process
                     Ok(Signal::Kill) => break Finished::KillSignal,
                     // Hot reload signal - perform true hot reload
-                    Ok(Signal::HotReload { module_id, new_version }) => {
+                    Ok(Signal::HotReload {
+                        module_id,
+                        expected_version,
+                        new_version,
+                        acknowledgement,
+                    }) => {
                         if let Some(context) = &context {
                             log::info!("Processing HotReload signal for module {} version {}", module_id, new_version);
-                            let old_version = context.current_version(module_id);
-                            match validate_reload_target::<S>(
-                                &env,
+                            let Some(old_version) = context.current_version(module_id) else {
+                                acknowledge_reload(
+                                    acknowledgement,
+                                    id,
+                                    module_id,
+                                    0,
+                                    0,
+                                    ProcessReloadStatus::Failed(format!(
+                                        "Process does not run registered module {}",
+                                        module_id
+                                    )),
+                                );
+                                continue;
+                            };
+
+                            if context.reload_in_progress.load(Ordering::SeqCst) {
+                                log::info!("Queueing hot reload behind the active transaction");
+                            }
+                            // Version equality, expected-version checks, and compatibility are
+                            // authoritative only in the execution driver. The tracked version can
+                            // still describe the preceding queued transaction at this point.
+                            let command = ReloadCommand::HotReload {
                                 module_id,
-                                old_version,
+                                expected_version,
                                 new_version,
-                            ) {
-                                Ok(_) => {
-                                    if context.reload_in_progress.load(Ordering::SeqCst) {
-                                        log::info!("Queueing hot reload behind the active transaction");
-                                    }
-                                    if let Err(error) = context.request_reload(ReloadCommand::HotReload {
-                                        module_id,
-                                        new_version,
-                                    }) {
-                                        log::error!("Failed to queue hot reload: {}", error);
-                                    }
-                                }
-                                Err(error) => {
-                                    // Preflight happens in the signal loop while the current
-                                    // call future remains alive. An incompatible module is thus
-                                    // rejected without interrupting the running guest.
-                                    log::error!(
-                                        "Rejected hot reload for module {}: {}",
-                                        module_id,
-                                        error
-                                    );
-                                }
+                                acknowledgement,
+                            };
+                            if let Err(error) = context.request_reload(command) {
+                                log::error!("Failed to queue hot reload: {}", error);
+                                let (_, _, _, _, acknowledgement) = error.0.into_parts();
+                                acknowledge_reload(
+                                    acknowledgement,
+                                    id,
+                                    module_id,
+                                    old_version,
+                                    old_version,
+                                    ProcessReloadStatus::Failed(
+                                        "Wasm reload execution driver is no longer running"
+                                            .to_string(),
+                                    ),
+                                );
                             }
                         } else {
                             log::warn!("Hot reload signal received but no context available (native process?)");
+                            acknowledge_reload(
+                                acknowledgement,
+                                id,
+                                module_id,
+                                0,
+                                0,
+                                ProcessReloadStatus::Failed(
+                                    "Process has no Wasm reload context".to_string(),
+                                ),
+                            );
                         }
                     }
                     // Rollback signal - restore previous version
-                    Ok(Signal::Rollback { module_id, target_version }) => {
+                    Ok(Signal::Rollback {
+                        module_id,
+                        expected_version,
+                        target_version,
+                        acknowledgement,
+                    }) => {
                         if let Some(context) = &context {
                             log::info!("Processing Rollback signal for module {} to version {}", module_id, target_version);
-                            let current_version = context.current_version(module_id);
-                            match validate_reload_target::<S>(
-                                &env,
+                            let Some(current_version) = context.current_version(module_id) else {
+                                acknowledge_reload(
+                                    acknowledgement,
+                                    id,
+                                    module_id,
+                                    0,
+                                    0,
+                                    ProcessReloadStatus::Failed(format!(
+                                        "Process does not run registered module {}",
+                                        module_id
+                                    )),
+                                );
+                                continue;
+                            };
+
+                            // Always enqueue rollback, even when the process still reports the
+                            // target version here. A timed-out apply may already be queued or
+                            // executing without having updated version accounting yet. FIFO at
+                            // the execution driver is what makes the late apply run before this
+                            // idempotent rollback; only the driver may acknowledge final state.
+                            let command = ReloadCommand::Rollback {
                                 module_id,
-                                current_version,
+                                expected_version,
                                 target_version,
-                            ) {
-                                Ok(_) => {
-                                    if let Err(error) = context.request_reload(ReloadCommand::Rollback {
-                                        module_id,
-                                        target_version,
-                                    }) {
-                                        log::error!("Failed to queue rollback: {}", error);
-                                    }
-                                }
-                                Err(error) => {
-                                    log::error!(
-                                        "Rejected rollback for module {}: {}",
-                                        module_id,
-                                        error
-                                    );
-                                }
+                                acknowledgement,
+                            };
+                            if let Err(error) = context.request_reload(command) {
+                                log::error!("Failed to queue rollback: {}", error);
+                                let (_, _, _, _, acknowledgement) = error.0.into_parts();
+                                acknowledge_reload(
+                                    acknowledgement,
+                                    id,
+                                    module_id,
+                                    current_version,
+                                    current_version,
+                                    ProcessReloadStatus::Failed(
+                                        "Wasm reload execution driver is no longer running"
+                                            .to_string(),
+                                    ),
+                                );
                             }
                         } else {
                             log::warn!("Rollback signal received but no context available (native process?)");
+                            acknowledge_reload(
+                                acknowledgement,
+                                id,
+                                module_id,
+                                0,
+                                0,
+                                ProcessReloadStatus::Failed(
+                                    "Process has no Wasm reload context".to_string(),
+                                ),
+                            );
                         }
                     }
                     Err(_) => {
@@ -905,7 +1216,11 @@ where
     };
 
     // The guest future, including an active Wasmtime fiber, is fully cancelled and dropped before
-    // the process disappears from the environment or lifecycle notifications are emitted.
+    // the process disappears from lifecycle tracking or notifications are emitted. Membership is
+    // cleared synchronously with environment removal so a new reload cannot snapshot a dead PID.
+    if let Some(context) = &context {
+        context.unregister_all_versions();
+    }
     env.remove_process(id);
 
     let (final_result, death_reason) = match result {

@@ -7,9 +7,13 @@ use tokio::task::JoinHandle;
 use wasmtime::{ResourceLimiter, Val};
 
 use crate::env::Environment;
+use crate::module_registry::{ModuleRegistry, ProcessKey};
 use crate::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use crate::state::ProcessState;
-use crate::{ExecutionResult, Process, ProcessContext, ReloadCommand, Signal, WasmProcess};
+use crate::{
+    ExecutionResult, Process, ProcessContext, ProcessReloadStatus, ReloadCommand, Signal,
+    WasmProcess,
+};
 
 enum WasmExecutionEvent {
     CallFinished(Result<()>),
@@ -78,11 +82,58 @@ where
                 // The call future has left its lexical scope, so its Store
                 // borrow and suspended fiber are cancelled before this lock is
                 // released and the transaction reacquires it.
+                let process_id = {
+                    let instance = instance_guard
+                        .as_ref()
+                        .expect("the Wasm execution driver must retain an instance");
+                    instance.state().id()
+                };
                 drop(instance_guard);
 
-                let module_id = command.module_id();
-                let target_version = command.target_version();
-                let old_version = context.current_version(module_id);
+                let (action, module_id, expected_version, target_version, acknowledgement) =
+                    command.into_parts();
+                let Some(old_version) = context.current_version(module_id) else {
+                    crate::acknowledge_reload(
+                        acknowledgement,
+                        process_id,
+                        module_id,
+                        0,
+                        0,
+                        ProcessReloadStatus::Failed(format!(
+                            "Process does not run registered module {}",
+                            module_id
+                        )),
+                    );
+                    continue;
+                };
+
+                if old_version == target_version {
+                    crate::acknowledge_reload(
+                        acknowledgement,
+                        process_id,
+                        module_id,
+                        old_version,
+                        old_version,
+                        ProcessReloadStatus::AlreadyAtTarget,
+                    );
+                    continue;
+                }
+
+                if expected_version.is_some_and(|expected| expected != old_version) {
+                    crate::acknowledge_reload(
+                        acknowledgement,
+                        process_id,
+                        module_id,
+                        old_version,
+                        old_version,
+                        ProcessReloadStatus::Failed(format!(
+                            "Version conflict: expected {:?}, running {}",
+                            expected_version, old_version
+                        )),
+                    );
+                    continue;
+                }
+
                 context.reload_in_progress.store(true, Ordering::SeqCst);
 
                 let result = crate::perform_pending_reload(
@@ -96,13 +147,75 @@ where
 
                 match result {
                     Ok(()) => {
-                        context.set_current_version(module_id, target_version);
-                        log::info!(
-                            "Wasm reload committed for module {}: {} -> {}",
+                        match context.transition_current_version(
                             module_id,
                             old_version,
-                            target_version
-                        );
+                            target_version,
+                        ) {
+                            Ok(()) => {
+                                log::info!(
+                                    "Wasm {:?} applied for module {}: {} -> {}",
+                                    action,
+                                    module_id,
+                                    old_version,
+                                    target_version
+                                );
+                                context.reload_in_progress.store(false, Ordering::SeqCst);
+                                crate::acknowledge_reload(
+                                    acknowledgement,
+                                    process_id,
+                                    module_id,
+                                    old_version,
+                                    target_version,
+                                    ProcessReloadStatus::Applied,
+                                );
+                            }
+                            Err(accounting_error) => {
+                                let revert_result = crate::perform_pending_reload(
+                                    &context,
+                                    env.clone(),
+                                    module_id,
+                                    target_version,
+                                    old_version,
+                                )
+                                .await;
+                                context.reload_in_progress.store(false, Ordering::SeqCst);
+
+                                match revert_result {
+                                    Ok(()) => crate::acknowledge_reload(
+                                        acknowledgement,
+                                        process_id,
+                                        module_id,
+                                        old_version,
+                                        old_version,
+                                        ProcessReloadStatus::Failed(format!(
+                                            "Version accounting commit failed and the instance was reverted: {}",
+                                            accounting_error
+                                        )),
+                                    ),
+                                    Err(revert_error) => {
+                                        let message = format!(
+                                            "Version accounting failed ({}) and instance rollback failed ({})",
+                                            accounting_error, revert_error
+                                        );
+                                        crate::acknowledge_reload(
+                                            acknowledgement,
+                                            process_id,
+                                            module_id,
+                                            old_version,
+                                            target_version,
+                                            ProcessReloadStatus::Failed(message.clone()),
+                                        );
+                                        let mut instance_guard = context.instance.write().await;
+                                        let instance = instance_guard.take().expect(
+                                            "failed accounting rollback must retain an instance",
+                                        );
+                                        return instance
+                                            .into_execution_result(Err(anyhow!(message)));
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
                         // perform_pending_reload restores the untouched old
@@ -114,10 +227,17 @@ where
                             old_version,
                             error
                         );
+                        context.reload_in_progress.store(false, Ordering::SeqCst);
+                        crate::acknowledge_reload(
+                            acknowledgement,
+                            process_id,
+                            module_id,
+                            old_version,
+                            old_version,
+                            ProcessReloadStatus::Failed(error.to_string()),
+                        );
                     }
                 }
-
-                context.reload_in_progress.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -197,7 +317,20 @@ where
     let function = function.to_string();
     let context = crate::ProcessContext::new(instance);
     if let Some((module_id, version)) = initial_module_version {
-        context.set_current_version(module_id, version);
+        let registry = env
+            .get_module_registry()
+            .ok_or_else(|| anyhow!("ModuleRegistry not available in environment"))?
+            .downcast::<ModuleRegistry<S>>()
+            .map_err(|_| anyhow!("Failed to downcast ModuleRegistry"))?;
+        context.track_initial_version(
+            registry,
+            module_id,
+            version,
+            ProcessKey {
+                environment_id: env.id(),
+                process_id: id,
+            },
+        )?;
     }
     let reload_receiver = context.take_reload_receiver();
 

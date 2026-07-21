@@ -146,6 +146,8 @@ pub(crate) async fn start(args: Args) -> Result<()> {
                 env,
                 distributed: Some(dist),
                 initial_module_version: None,
+                compiled_module: None,
+                spawn_ready: None,
             })
             .await
             {

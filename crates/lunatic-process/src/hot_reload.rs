@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Result};
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tokio::sync::{oneshot, RwLock};
+use tokio::time::{sleep_until, Instant};
 
 use crate::{
     module_registry::ModuleRegistry,
@@ -11,7 +14,7 @@ use crate::{
         MemorySnapshot, WasmtimeCompiledModule, WasmtimeInstance, WasmtimeRuntime,
     },
     state::ProcessState,
-    Signal,
+    ProcessReloadStatus, ReloadAcknowledgement, Signal,
 };
 
 pub struct HotReloadContext<S: ProcessState + Send> {
@@ -23,69 +26,119 @@ pub struct HotReloadContext<S: ProcessState + Send> {
     _phantom: std::marker::PhantomData<S>,
 }
 
-/// Coordinator for managing hot reloads across multiple processes
+const DEFAULT_APPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A process-level failure observed by the reload coordinator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessReloadError {
+    pub process_id: u64,
+    pub message: String,
+    /// The version reported by the process, when an acknowledgement arrived.
+    /// Delivery failures and timeouts have no known version.
+    pub known_version: Option<u32>,
+}
+
+/// Observable state of a coordinated reload.
+///
+/// `Committed` and `RolledBack` are terminal and allow a later operation for
+/// the same module. `InDoubt` deliberately keeps the module blocked until an
+/// operator or a future reconciliation API establishes a single version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReloadStatus {
+    Applying,
+    RollingBack {
+        apply_errors: Vec<ProcessReloadError>,
+    },
+    Committed {
+        acknowledgements: Vec<ReloadAcknowledgement>,
+    },
+    RolledBack {
+        apply_errors: Vec<ProcessReloadError>,
+        acknowledgements: Vec<ReloadAcknowledgement>,
+    },
+    InDoubt {
+        apply_errors: Vec<ProcessReloadError>,
+        rollback_errors: Vec<ProcessReloadError>,
+        acknowledgements: Vec<ReloadAcknowledgement>,
+    },
+}
+
+impl ReloadStatus {
+    fn blocks_new_operation(&self) -> bool {
+        matches!(
+            self,
+            Self::Applying | Self::RollingBack { .. } | Self::InDoubt { .. }
+        )
+    }
+}
+
+/// Coordinator for acknowledgement-based reloads across multiple processes.
 pub struct ReloadCoordinator<S: Send + Sync> {
-    /// Active reloads by module_id
-    active_reloads: Arc<RwLock<HashMap<u64, ReloadOperation<S>>>>,
+    operations: Arc<RwLock<HashMap<u64, ReloadOperation<S>>>>,
+    apply_timeout: Duration,
+    rollback_timeout: Duration,
 }
 
 struct ReloadOperation<S> {
-    #[allow(dead_code)]
-    module_id: u64,
-    #[allow(dead_code)]
-    old_version: u32,
-    #[allow(dead_code)]
-    new_version: u32,
     affected_processes: Vec<u64>,
     status: ReloadStatus,
-    /// Backup of old states for rollback
-    old_states: HashMap<u64, Vec<u8>>,
     _phantom: std::marker::PhantomData<S>,
 }
 
-#[derive(Debug, Clone)]
-enum ReloadStatus {
-    InProgress,
-    Completed,
-    #[allow(dead_code)]
-    Failed(String),
+struct AcknowledgementCollection {
+    acknowledgements: Vec<ReloadAcknowledgement>,
+    errors: Vec<ProcessReloadError>,
 }
 
 impl<S: Send + Sync> ReloadCoordinator<S> {
     pub fn new() -> Self {
+        Self::with_timeouts(DEFAULT_APPLY_TIMEOUT, DEFAULT_ROLLBACK_TIMEOUT)
+    }
+
+    pub fn with_timeouts(apply_timeout: Duration, rollback_timeout: Duration) -> Self {
         Self {
-            active_reloads: Arc::new(RwLock::new(HashMap::new())),
+            operations: Arc::new(RwLock::new(HashMap::new())),
+            apply_timeout,
+            rollback_timeout,
         }
     }
 
-    /// Start a coordinated reload for a module
+    /// Reserve a module for a coordinated reload.
+    ///
+    /// Terminal committed/rolled-back records are replaced by the new
+    /// operation. An in-progress or in-doubt operation keeps the module locked.
     pub async fn start_reload(
         &self,
         module_id: u64,
         old_version: u32,
         new_version: u32,
-        affected_processes: Vec<u64>,
+        mut affected_processes: Vec<u64>,
     ) -> Result<()> {
-        let mut reloads = self.active_reloads.write().await;
+        affected_processes.sort_unstable();
+        affected_processes.dedup();
 
-        if reloads.contains_key(&module_id) {
-            return Err(anyhow!(
-                "Reload already in progress for module {}",
-                module_id
-            ));
+        let mut operations = self.operations.write().await;
+        if let Some(operation) = operations.get(&module_id) {
+            if operation.status.blocks_new_operation() {
+                return Err(anyhow!(
+                    "Reload for module {} is blocked by status {:?}",
+                    module_id,
+                    operation.status
+                ));
+            }
         }
 
-        let operation = ReloadOperation {
+        operations.insert(
             module_id,
-            old_version,
-            new_version,
-            affected_processes,
-            status: ReloadStatus::InProgress,
-            old_states: HashMap::new(),
-            _phantom: std::marker::PhantomData,
-        };
+            ReloadOperation {
+                affected_processes,
+                status: ReloadStatus::Applying,
+                _phantom: std::marker::PhantomData,
+            },
+        );
+        drop(operations);
 
-        reloads.insert(module_id, operation);
         info!(
             "Started coordinated reload for module {}: {} -> {}",
             module_id, old_version, new_version
@@ -93,94 +146,180 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         Ok(())
     }
 
-    /// Mark a reload as completed
-    pub async fn complete_reload(&self, module_id: u64) -> Result<()> {
-        let mut reloads = self.active_reloads.write().await;
-
-        if let Some(operation) = reloads.get_mut(&module_id) {
-            operation.status = ReloadStatus::Completed;
-            info!("Completed coordinated reload for module {}", module_id);
-            Ok(())
-        } else {
-            Err(anyhow!("No active reload found for module {}", module_id))
-        }
+    /// Return the latest observable state for a module.
+    pub async fn status(&self, module_id: u64) -> Option<ReloadStatus> {
+        self.operations
+            .read()
+            .await
+            .get(&module_id)
+            .map(|operation| operation.status.clone())
     }
 
-    /// Mark a reload as failed
-    pub async fn fail_reload(&self, module_id: u64, error: String) -> Result<()> {
-        let mut reloads = self.active_reloads.write().await;
-
-        if let Some(operation) = reloads.get_mut(&module_id) {
-            operation.status = ReloadStatus::Failed(error.clone());
-            warn!(
-                "Failed coordinated reload for module {}: {}",
-                module_id, error
-            );
-            Ok(())
-        } else {
-            Err(anyhow!("No active reload found for module {}", module_id))
-        }
+    /// Alias retained for callers that prefer a getter-style API.
+    pub async fn get_status(&self, module_id: u64) -> Option<ReloadStatus> {
+        self.status(module_id).await
     }
 
-    /// Check if a reload is in progress for a module
+    /// Check whether a module is applying, rolling back, or awaiting manual
+    /// reconciliation after an in-doubt result.
     pub async fn is_reload_in_progress(&self, module_id: u64) -> bool {
-        let reloads = self.active_reloads.read().await;
-        reloads.contains_key(&module_id)
+        self.operations
+            .read()
+            .await
+            .get(&module_id)
+            .is_some_and(|operation| operation.status.blocks_new_operation())
     }
 
-    /// Get the processes affected by a reload
     pub async fn get_affected_processes(&self, module_id: u64) -> Option<Vec<u64>> {
-        let reloads = self.active_reloads.read().await;
-        reloads
+        self.operations
+            .read()
+            .await
             .get(&module_id)
-            .map(|op| op.affected_processes.clone())
+            .map(|operation| operation.affected_processes.clone())
     }
 
-    /// Store old state for a process for potential rollback
-    pub async fn store_old_state(
-        &self,
-        module_id: u64,
+    async fn set_status(&self, module_id: u64, status: ReloadStatus) -> Result<()> {
+        let mut operations = self.operations.write().await;
+        let operation = operations
+            .get_mut(&module_id)
+            .ok_or_else(|| anyhow!("No reload operation found for module {}", module_id))?;
+        operation.status = status;
+        Ok(())
+    }
+
+    fn dispatch_hot_reload(
+        env: &dyn crate::env::Environment,
         process_id: u64,
-        state_bytes: Vec<u8>,
-    ) -> Result<()> {
-        let mut reloads = self.active_reloads.write().await;
-
-        if let Some(operation) = reloads.get_mut(&module_id) {
-            operation.old_states.insert(process_id, state_bytes);
-            Ok(())
-        } else {
-            Err(anyhow!("No active reload found for module {}", module_id))
+        module_id: u64,
+        old_version: u32,
+        new_version: u32,
+    ) -> oneshot::Receiver<ReloadAcknowledgement> {
+        let (acknowledgement, receiver) = oneshot::channel();
+        if let Some(process) = env.get_process(process_id) {
+            process.send(Signal::HotReload {
+                module_id,
+                expected_version: Some(old_version),
+                new_version,
+                acknowledgement: Some(acknowledgement),
+            });
         }
+        // When lookup or mailbox delivery fails, dropping the sender closes the
+        // receiver. That is an observed failure, never a successful reload.
+        receiver
     }
 
-    /// Rollback a reload by restoring old states
-    pub async fn rollback_reload(&self, module_id: u64) -> Result<HashMap<u64, Vec<u8>>> {
-        let mut reloads = self.active_reloads.write().await;
+    fn dispatch_rollback(
+        env: &dyn crate::env::Environment,
+        process_id: u64,
+        module_id: u64,
+        new_version: u32,
+        old_version: u32,
+    ) -> oneshot::Receiver<ReloadAcknowledgement> {
+        let (acknowledgement, receiver) = oneshot::channel();
+        if let Some(process) = env.get_process(process_id) {
+            process.send(Signal::Rollback {
+                module_id,
+                expected_version: Some(new_version),
+                target_version: old_version,
+                acknowledgement: Some(acknowledgement),
+            });
+        }
+        receiver
+    }
 
-        if let Some(operation) = reloads.get_mut(&module_id) {
-            if let ReloadStatus::Failed(_) = &operation.status {
-                let old_states = operation.old_states.clone();
-                operation.status = ReloadStatus::Completed; // Mark as rolled back
-                info!("Rolled back reload for module {}", module_id);
-                Ok(old_states)
-            } else {
-                Err(anyhow!("Cannot rollback reload that hasn't failed"))
+    async fn collect_acknowledgements(
+        receivers: Vec<(u64, oneshot::Receiver<ReloadAcknowledgement>)>,
+        module_id: u64,
+        target_version: u32,
+        timeout: Duration,
+        phase: &'static str,
+    ) -> AcknowledgementCollection {
+        let mut pending_ids: HashSet<u64> = receivers.iter().map(|(id, _)| *id).collect();
+        let mut pending = receivers
+            .into_iter()
+            .map(|(process_id, receiver)| async move { (process_id, receiver.await) })
+            .collect::<FuturesUnordered<_>>();
+        let deadline = Instant::now() + timeout;
+        let timer = sleep_until(deadline);
+        tokio::pin!(timer);
+
+        let mut acknowledgements = Vec::new();
+        let mut errors = Vec::new();
+
+        while !pending.is_empty() {
+            tokio::select! {
+                biased;
+                result = pending.next() => {
+                    let Some((process_id, result)) = result else {
+                        break;
+                    };
+                    pending_ids.remove(&process_id);
+                    match result {
+                        Ok(acknowledgement) => {
+                            let protocol_error = if acknowledgement.process_id != process_id {
+                                Some(format!(
+                                    "{} acknowledgement reported process {}",
+                                    phase, acknowledgement.process_id
+                                ))
+                            } else if acknowledgement.module_id != module_id {
+                                Some(format!(
+                                    "{} acknowledgement reported module {}",
+                                    phase, acknowledgement.module_id
+                                ))
+                            } else if !acknowledgement.status.is_success() {
+                                match &acknowledgement.status {
+                                    ProcessReloadStatus::Failed(message) => Some(message.clone()),
+                                    _ => Some(format!("{} acknowledgement was not successful", phase)),
+                                }
+                            } else if acknowledgement.current_version != target_version {
+                                Some(format!(
+                                    "{} acknowledgement reported version {}, expected {}",
+                                    phase, acknowledgement.current_version, target_version
+                                ))
+                            } else {
+                                None
+                            };
+
+                            if let Some(message) = protocol_error {
+                                errors.push(ProcessReloadError {
+                                    process_id,
+                                    message,
+                                    known_version: Some(acknowledgement.current_version),
+                                });
+                            } else {
+                                acknowledgements.push(acknowledgement);
+                            }
+                        }
+                        Err(_) => errors.push(ProcessReloadError {
+                            process_id,
+                            message: format!("{} acknowledgement channel closed", phase),
+                            known_version: None,
+                        }),
+                    }
+                }
+                _ = &mut timer => break,
             }
-        } else {
-            Err(anyhow!("No active reload found for module {}", module_id))
+        }
+
+        for process_id in pending_ids {
+            errors.push(ProcessReloadError {
+                process_id,
+                message: format!("{} acknowledgement timed out after {:?}", phase, timeout),
+                known_version: None,
+            });
+        }
+
+        acknowledgements.sort_by_key(|acknowledgement| acknowledgement.process_id);
+        errors.sort_by_key(|error| error.process_id);
+        AcknowledgementCollection {
+            acknowledgements,
+            errors,
         }
     }
 
-    /// Get old state for a specific process
-    pub async fn get_old_state(&self, module_id: u64, process_id: u64) -> Option<Vec<u8>> {
-        let reloads = self.active_reloads.read().await;
-        reloads
-            .get(&module_id)
-            .and_then(|op| op.old_states.get(&process_id))
-            .cloned()
-    }
-
-    /// Perform atomic reload - all processes reload or none do
+    /// Apply a module version to every target, waiting for process-level
+    /// acknowledgement before reporting commit. Any apply failure causes a
+    /// separately timed rollback request to the complete original target set.
     pub async fn perform_atomic_reload(
         &self,
         env: &dyn crate::env::Environment,
@@ -189,87 +328,128 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         new_version: u32,
         affected_processes: Vec<u64>,
     ) -> Result<()> {
-        // Start the reload operation
-        self.start_reload(
-            module_id,
-            old_version,
-            new_version,
-            affected_processes.clone(),
-        )
-        .await?;
+        self.start_reload(module_id, old_version, new_version, affected_processes)
+            .await?;
 
+        let targets = self
+            .get_affected_processes(module_id)
+            .await
+            .ok_or_else(|| anyhow!("No reload operation found for module {}", module_id))?;
         info!(
-            "Starting atomic reload for module {}: {} -> {} ({} processes)",
+            "Starting acknowledged reload for module {}: {} -> {} ({} processes)",
             module_id,
             old_version,
             new_version,
-            affected_processes.len()
+            targets.len()
         );
 
-        // Track successful reloads for potential rollback
-        let mut reloaded = Vec::new();
-
-        // Send reload signals to all affected processes
-        for process_id in &affected_processes {
-            match send_hot_reload_signal(*process_id, module_id, new_version, env) {
-                Ok(_) => {
-                    reloaded.push(*process_id);
-                    info!("Sent reload signal to process {}", process_id);
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to send reload signal to process {}: {}",
-                        process_id, e
-                    );
-
-                    // Atomic reload failed - attempt rollback
-                    self.fail_reload(
+        let apply_receivers = targets
+            .iter()
+            .map(|process_id| {
+                (
+                    *process_id,
+                    Self::dispatch_hot_reload(
+                        env,
+                        *process_id,
                         module_id,
-                        format!("Failed to signal process {}: {}", process_id, e),
-                    )
-                    .await?;
+                        old_version,
+                        new_version,
+                    ),
+                )
+            })
+            .collect();
+        let apply = Self::collect_acknowledgements(
+            apply_receivers,
+            module_id,
+            new_version,
+            self.apply_timeout,
+            "reload",
+        )
+        .await;
 
-                    // Send rollback signals to successfully reloaded processes
-                    info!(
-                        "Attempting to rollback {} processes after atomic reload failure",
-                        reloaded.len()
-                    );
-
-                    for rollback_pid in &reloaded {
-                        match send_rollback_signal(*rollback_pid, module_id, old_version, env) {
-                            Ok(_) => {
-                                info!("Sent rollback signal to process {}", rollback_pid);
-                            }
-                            Err(rollback_err) => {
-                                warn!(
-                                    "Failed to send rollback signal to process {}: {}",
-                                    rollback_pid, rollback_err
-                                );
-                            }
-                        }
-                    }
-
-                    return Err(anyhow!(
-                        "Atomic reload failed at process {}: {}. Attempted rollback for {} processes.",
-                        process_id,
-                        e,
-                        reloaded.len()
-                    ));
-                }
-            }
+        if apply.errors.is_empty() {
+            self.set_status(
+                module_id,
+                ReloadStatus::Committed {
+                    acknowledgements: apply.acknowledgements,
+                },
+            )
+            .await?;
+            info!(
+                "Committed acknowledged reload for module {}: {} -> {}",
+                module_id, old_version, new_version
+            );
+            return Ok(());
         }
 
-        // All signals sent successfully
-        self.complete_reload(module_id).await?;
+        let apply_errors = apply.errors;
+        self.set_status(
+            module_id,
+            ReloadStatus::RollingBack {
+                apply_errors: apply_errors.clone(),
+            },
+        )
+        .await?;
+        warn!(
+            "Reload for module {} failed for {} process(es); rolling back all {} targets",
+            module_id,
+            apply_errors.len(),
+            targets.len()
+        );
 
-        info!(
-            "Completed atomic reload for module {}: {} -> {} ({} processes updated)",
+        let rollback_receivers = targets
+            .iter()
+            .map(|process_id| {
+                (
+                    *process_id,
+                    Self::dispatch_rollback(env, *process_id, module_id, new_version, old_version),
+                )
+            })
+            .collect();
+        let rollback = Self::collect_acknowledgements(
+            rollback_receivers,
             module_id,
             old_version,
-            new_version,
-            reloaded.len()
-        );
-        Ok(())
+            self.rollback_timeout,
+            "rollback",
+        )
+        .await;
+
+        if rollback.errors.is_empty() {
+            self.set_status(
+                module_id,
+                ReloadStatus::RolledBack {
+                    apply_errors: apply_errors.clone(),
+                    acknowledgements: rollback.acknowledgements,
+                },
+            )
+            .await?;
+            return Err(anyhow!(
+                "Reload for module {} did not commit; rollback to version {} was confirmed for all {} targets: {}",
+                module_id,
+                old_version,
+                targets.len(),
+                format_process_errors(&apply_errors)
+            ));
+        }
+
+        let rollback_errors = rollback.errors;
+        self.set_status(
+            module_id,
+            ReloadStatus::InDoubt {
+                apply_errors: apply_errors.clone(),
+                rollback_errors: rollback_errors.clone(),
+                acknowledgements: rollback.acknowledgements,
+            },
+        )
+        .await?;
+        Err(anyhow!(
+            "Reload for module {} is in doubt after rollback to version {} failed: apply failures [{}]; rollback failures [{}]",
+            module_id,
+            old_version,
+            format_process_errors(&apply_errors),
+            format_process_errors(&rollback_errors)
+        ))
     }
 
     /// Perform coordinated reload including dependent modules
@@ -298,7 +478,7 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
 
         // Collect all affected processes for each module
         for &mid in &reload_order {
-            let processes = env.get_processes_for_module(mid);
+            let processes = registry.processes_for_module(mid, env.id());
             info!("Module {} has {} active processes", mid, processes.len());
 
             all_affected_processes.extend(processes.iter().copied());
@@ -307,7 +487,8 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
 
         // Perform reloads in dependency order
         for &mid in &reload_order {
-            let old_version = registry.get_latest_version_number(mid);
+            let _transaction = registry.lock_transaction(mid).await;
+            let old_version = registry.get_committed_version_number(mid);
             let affected_processes = module_process_map.get(&mid).cloned().unwrap_or_default();
 
             if affected_processes.is_empty() {
@@ -341,6 +522,7 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
                 .await
             {
                 Ok(_) => {
+                    registry.mark_committed(mid, version_to_use)?;
                     info!("Successfully reloaded module {}", mid);
                 }
                 Err(e) => {
@@ -362,6 +544,20 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
         );
         Ok(())
     }
+}
+
+fn format_process_errors(errors: &[ProcessReloadError]) -> String {
+    errors
+        .iter()
+        .map(|error| match error.known_version {
+            Some(version) => format!(
+                "process {} at version {}: {}",
+                error.process_id, version, error.message
+            ),
+            None => format!("process {}: {}", error.process_id, error.message),
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 impl<S: Send + Sync> Default for ReloadCoordinator<S> {
@@ -628,7 +824,9 @@ pub fn send_hot_reload_signal(
     if let Some(process) = env.get_process(process_id) {
         process.send(Signal::HotReload {
             module_id,
+            expected_version: None,
             new_version,
+            acknowledgement: None,
         });
         info!(
             "Sent hot reload signal to process {} for module {} version {}",
@@ -653,7 +851,9 @@ pub fn send_rollback_signal(
     if let Some(process) = env.get_process(process_id) {
         process.send(Signal::Rollback {
             module_id,
+            expected_version: None,
             target_version,
+            acknowledgement: None,
         });
         info!(
             "Sent rollback signal to process {} for module {} version {}",
@@ -673,69 +873,271 @@ pub fn send_rollback_signal(
 mod tests {
     use super::*;
     use crate::reloadable_state::ReloadableState;
+    use crate::{env::Environment, env::LunaticEnvironment, Process, ReloadAckSender};
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Copy)]
+    enum AckBehavior {
+        Success,
+        RejectApply,
+        HoldApplyRejectRollback,
+    }
+
+    struct AckProcess {
+        id: u64,
+        behavior: AckBehavior,
+        held_acknowledgements: StdMutex<Vec<ReloadAckSender>>,
+        signals: StdMutex<Vec<&'static str>>,
+    }
+
+    impl AckProcess {
+        fn new(id: u64, behavior: AckBehavior) -> Self {
+            Self {
+                id,
+                behavior,
+                held_acknowledgements: StdMutex::new(Vec::new()),
+                signals: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn signal_count(&self, signal: &'static str) -> usize {
+            self.signals
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|observed| **observed == signal)
+                .count()
+        }
+    }
+
+    fn acknowledge(
+        acknowledgement: Option<ReloadAckSender>,
+        process_id: u64,
+        module_id: u64,
+        previous_version: u32,
+        current_version: u32,
+        status: ProcessReloadStatus,
+    ) {
+        if let Some(acknowledgement) = acknowledgement {
+            let _ = acknowledgement.send(ReloadAcknowledgement {
+                process_id,
+                module_id,
+                previous_version,
+                current_version,
+                status,
+            });
+        }
+    }
+
+    impl Process for AckProcess {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn send(&self, signal: Signal) {
+            match signal {
+                Signal::HotReload {
+                    module_id,
+                    expected_version,
+                    new_version,
+                    acknowledgement,
+                } => {
+                    self.signals.lock().unwrap().push("apply");
+                    let old_version = expected_version.unwrap_or(0);
+                    match self.behavior {
+                        AckBehavior::Success => acknowledge(
+                            acknowledgement,
+                            self.id,
+                            module_id,
+                            old_version,
+                            new_version,
+                            ProcessReloadStatus::Applied,
+                        ),
+                        AckBehavior::RejectApply => acknowledge(
+                            acknowledgement,
+                            self.id,
+                            module_id,
+                            old_version,
+                            old_version,
+                            ProcessReloadStatus::Failed("injected apply rejection".into()),
+                        ),
+                        AckBehavior::HoldApplyRejectRollback => {
+                            if let Some(acknowledgement) = acknowledgement {
+                                self.held_acknowledgements
+                                    .lock()
+                                    .unwrap()
+                                    .push(acknowledgement);
+                            }
+                        }
+                    }
+                }
+                Signal::Rollback {
+                    module_id,
+                    expected_version,
+                    target_version,
+                    acknowledgement,
+                } => {
+                    self.signals.lock().unwrap().push("rollback");
+                    match self.behavior {
+                        AckBehavior::Success => acknowledge(
+                            acknowledgement,
+                            self.id,
+                            module_id,
+                            expected_version.unwrap_or(target_version),
+                            target_version,
+                            ProcessReloadStatus::Applied,
+                        ),
+                        AckBehavior::RejectApply => acknowledge(
+                            acknowledgement,
+                            self.id,
+                            module_id,
+                            target_version,
+                            target_version,
+                            ProcessReloadStatus::AlreadyAtTarget,
+                        ),
+                        AckBehavior::HoldApplyRejectRollback => acknowledge(
+                            acknowledgement,
+                            self.id,
+                            module_id,
+                            expected_version.unwrap_or(target_version),
+                            expected_version.unwrap_or(target_version),
+                            ProcessReloadStatus::Failed("injected rollback rejection".into()),
+                        ),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn add_ack_process(
+        environment: &LunaticEnvironment,
+        id: u64,
+        behavior: AckBehavior,
+    ) -> Arc<AckProcess> {
+        let process = Arc::new(AckProcess::new(id, behavior));
+        environment.add_process(id, process.clone());
+        process
+    }
 
     #[tokio::test]
     async fn test_reload_coordinator_basic() {
         let coordinator = ReloadCoordinator::<()>::new();
         assert!(!coordinator.is_reload_in_progress(1).await);
+        assert_eq!(coordinator.status(1).await, None);
     }
 
     #[tokio::test]
-    async fn test_reload_coordinator_lifecycle() {
+    async fn status_query_reports_applying_and_rejects_concurrent_reload() {
         let coordinator = ReloadCoordinator::<()>::new();
-        let module_id = 1;
-        let old_version = 0;
-        let new_version = 1;
-
-        // Start a reload
         coordinator
-            .start_reload(module_id, old_version, new_version, vec![100, 101])
+            .start_reload(1, 0, 1, vec![101, 100, 101])
             .await
             .unwrap();
-
-        // Check it's in progress
-        assert!(coordinator.is_reload_in_progress(module_id).await);
-
-        // Get affected processes
-        let processes = coordinator.get_affected_processes(module_id).await.unwrap();
+        assert_eq!(coordinator.status(1).await, Some(ReloadStatus::Applying));
+        assert!(coordinator.is_reload_in_progress(1).await);
+        let processes = coordinator.get_affected_processes(1).await.unwrap();
         assert_eq!(processes, vec![100, 101]);
-
-        // Store old state
-        coordinator
-            .store_old_state(module_id, 100, vec![1, 2, 3])
-            .await
-            .unwrap();
-
-        // Complete the reload
-        coordinator.complete_reload(module_id).await.unwrap();
+        assert!(coordinator.start_reload(1, 0, 2, vec![100]).await.is_err());
     }
 
     #[tokio::test]
-    async fn test_reload_coordinator_rollback() {
-        let coordinator = ReloadCoordinator::<()>::new();
-        let module_id = 1;
+    async fn all_acknowledgements_commit_and_allow_the_next_reload() {
+        let environment = LunaticEnvironment::new(7);
+        add_ack_process(&environment, 100, AckBehavior::Success);
+        add_ack_process(&environment, 101, AckBehavior::Success);
+        let coordinator = ReloadCoordinator::<()>::with_timeouts(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
 
-        // Start a reload
         coordinator
-            .start_reload(module_id, 0, 1, vec![100])
+            .perform_atomic_reload(&environment, 1, 0, 1, vec![100, 101])
             .await
             .unwrap();
+        match coordinator.get_status(1).await.unwrap() {
+            ReloadStatus::Committed { acknowledgements } => {
+                assert_eq!(acknowledgements.len(), 2);
+            }
+            status => panic!("unexpected status: {status:?}"),
+        }
+        assert!(!coordinator.is_reload_in_progress(1).await);
 
-        // Store state
         coordinator
-            .store_old_state(module_id, 100, vec![1, 2, 3])
+            .perform_atomic_reload(&environment, 1, 1, 2, vec![100, 101])
             .await
             .unwrap();
+        assert!(matches!(
+            coordinator.status(1).await,
+            Some(ReloadStatus::Committed { .. })
+        ));
+    }
 
-        // Fail the reload
-        coordinator
-            .fail_reload(module_id, "Test failure".to_string())
+    #[tokio::test]
+    async fn nack_rolls_back_the_original_target_and_allows_retry() {
+        let environment = LunaticEnvironment::new(7);
+        let applied = add_ack_process(&environment, 100, AckBehavior::Success);
+        let rejected = add_ack_process(&environment, 101, AckBehavior::RejectApply);
+        let coordinator = ReloadCoordinator::<()>::with_timeouts(
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+
+        let error = coordinator
+            .perform_atomic_reload(&environment, 1, 0, 1, vec![100, 101])
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("rollback to version 0 was confirmed"));
+        assert_eq!(applied.signal_count("rollback"), 1);
+        assert_eq!(rejected.signal_count("rollback"), 1);
+        match coordinator.status(1).await.unwrap() {
+            ReloadStatus::RolledBack {
+                apply_errors,
+                acknowledgements,
+            } => {
+                assert_eq!(apply_errors.len(), 1);
+                assert_eq!(apply_errors[0].process_id, 101);
+                assert_eq!(acknowledgements.len(), 2);
+            }
+            status => panic!("unexpected status: {status:?}"),
+        }
+        assert!(!coordinator.is_reload_in_progress(1).await);
+        assert!(coordinator.start_reload(1, 0, 2, vec![100]).await.is_ok());
+    }
 
-        // Rollback
-        let old_states = coordinator.rollback_reload(module_id).await.unwrap();
-        assert_eq!(old_states.get(&100).unwrap(), &vec![1, 2, 3]);
+    #[tokio::test]
+    async fn timeout_and_rollback_nack_leave_the_module_in_doubt() {
+        let environment = LunaticEnvironment::new(7);
+        let process = add_ack_process(&environment, 100, AckBehavior::HoldApplyRejectRollback);
+        let coordinator = ReloadCoordinator::<()>::with_timeouts(
+            Duration::from_millis(10),
+            Duration::from_millis(100),
+        );
+
+        let error = coordinator
+            .perform_atomic_reload(&environment, 1, 0, 1, vec![100])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("is in doubt"));
+        assert_eq!(process.signal_count("rollback"), 1);
+        match coordinator.status(1).await.unwrap() {
+            ReloadStatus::InDoubt {
+                apply_errors,
+                rollback_errors,
+                acknowledgements,
+            } => {
+                assert_eq!(apply_errors.len(), 1);
+                assert!(apply_errors[0].message.contains("timed out"));
+                assert_eq!(rollback_errors.len(), 1);
+                assert_eq!(rollback_errors[0].known_version, Some(1));
+                assert!(acknowledgements.is_empty());
+            }
+            status => panic!("unexpected status: {status:?}"),
+        }
+        assert!(coordinator.is_reload_in_progress(1).await);
+        assert!(coordinator.start_reload(1, 0, 2, vec![100]).await.is_err());
     }
 
     #[test]

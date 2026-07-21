@@ -6,7 +6,10 @@ use clap::Args;
 use lunatic_distributed::DistributedProcessState;
 use lunatic_process::{
     env::{Environment, LunaticEnvironment, LunaticEnvironments},
-    runtimes::{wasmtime::WasmtimeRuntime, RawWasm},
+    runtimes::{
+        wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime},
+        RawWasm,
+    },
     wasm::{spawn_wasm_with_options, WasmSpawnOptions},
 };
 use lunatic_process_api::ProcessConfigCtx;
@@ -26,6 +29,12 @@ pub struct RunWasm {
     pub env: Arc<LunaticEnvironment>,
     pub distributed: Option<DistributedProcessState>,
     pub initial_module_version: Option<(u64, u32)>,
+    /// An exact registry-backed module to launch. Watch-mode restarts use this
+    /// instead of recompiling whatever bytes happen to be on disk.
+    pub compiled_module: Option<Arc<WasmtimeCompiledModule<DefaultProcessState>>>,
+    /// Watch mode waits for this acknowledgement before accepting file events,
+    /// closing the gap between task spawn and registry membership.
+    pub spawn_ready: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub async fn run_wasm(args: RunWasm) -> Result<()> {
@@ -55,18 +64,23 @@ pub async fn run_wasm(args: RunWasm) -> Result<()> {
         }
     }
 
-    // Spawn main process
-    let module = std::fs::read(&path).map_err(|err| match err.kind() {
-        std::io::ErrorKind::NotFound => anyhow!("Module '{}' not found", path.display()),
-        _ => err.into(),
-    })?;
-    let module: RawWasm = if let Some(dist) = args.distributed.as_ref() {
-        dist.control.add_module(module).await?
+    // Spawn the main process. A watch-mode restart must use the exact module
+    // that the registry marked committed, even if the watched file has since
+    // changed to a candidate that failed to reload.
+    let module = if let Some(module) = args.compiled_module {
+        module
     } else {
-        module.into()
+        let module = std::fs::read(&path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => anyhow!("Module '{}' not found", path.display()),
+            _ => err.into(),
+        })?;
+        let module: RawWasm = if let Some(dist) = args.distributed.as_ref() {
+            dist.control.add_module(module).await?
+        } else {
+            module.into()
+        };
+        Arc::new(args.runtime.compile_module::<DefaultProcessState>(module)?)
     };
-
-    let module = Arc::new(args.runtime.compile_module::<DefaultProcessState>(module)?);
     let state = DefaultProcessState::new(
         args.env.clone(),
         args.distributed,
@@ -95,9 +109,13 @@ pub async fn run_wasm(args: RunWasm) -> Result<()> {
         "Failed to spawn process from {}::_start()",
         path.to_string_lossy()
     ))?;
+    if let Some(spawn_ready) = args.spawn_ready {
+        let _ = spawn_ready.send(());
+    }
 
     // Wait on the main process to finish
-    task.await.map(|_| ()).map_err(|e| anyhow!(e.to_string()))
+    task.await.map_err(|error| anyhow!(error.to_string()))??;
+    Ok(())
 }
 
 #[cfg(feature = "prometheus")]
