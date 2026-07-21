@@ -34,6 +34,18 @@ pub trait ProcessConfigCtx {
     fn set_can_create_configs(&mut self, can: bool);
     fn can_spawn_processes(&self) -> bool;
     fn set_can_spawn_processes(&mut self, can: bool);
+    fn get_max_table_elements(&self) -> u32 {
+        0
+    }
+    fn set_max_table_elements(&mut self, _max: u32) {}
+    fn get_max_file_descriptors(&self) -> u32 {
+        0
+    }
+    fn set_max_file_descriptors(&mut self, _max: u32) {}
+    fn get_max_network_connections(&self) -> u32 {
+        0
+    }
+    fn set_max_network_connections(&mut self, _max: u32) {}
     fn can_access_fs_location(&self, path: &Path) -> Result<(), String>;
 }
 
@@ -118,7 +130,7 @@ where
 
     linker.func_wrap("lunatic::process", "create_config", create_config)?;
     linker.func_wrap("lunatic::process", "drop_config", drop_config)?;
-    linker.func_wrap(
+    linker.func_wrap2_async(
         "lunatic::process",
         "config_set_max_memory",
         config_set_max_memory,
@@ -128,7 +140,7 @@ where
         "config_get_max_memory",
         config_get_max_memory,
     )?;
-    linker.func_wrap(
+    linker.func_wrap2_async(
         "lunatic::process",
         "config_set_max_fuel",
         config_set_max_fuel,
@@ -138,12 +150,43 @@ where
         "config_get_max_fuel",
         config_get_max_fuel,
     )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_table_elements",
+        config_set_max_table_elements,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_table_elements",
+        config_get_max_table_elements,
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_file_descriptors",
+        config_set_max_file_descriptors,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_file_descriptors",
+        config_get_max_file_descriptors,
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_network_connections",
+        config_set_max_network_connections,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_network_connections",
+        config_get_max_network_connections,
+    )?;
+    linker.func_wrap("lunatic::process", "config_set_checked", config_set_checked)?;
     linker.func_wrap(
         "lunatic::process",
         "config_can_compile_modules",
         config_can_compile_modules,
     )?;
-    linker.func_wrap(
+    linker.func_wrap2_async(
         "lunatic::process",
         "config_set_can_compile_modules",
         config_set_can_compile_modules,
@@ -153,7 +196,7 @@ where
         "config_can_create_configs",
         config_can_create_configs,
     )?;
-    linker.func_wrap(
+    linker.func_wrap2_async(
         "lunatic::process",
         "config_set_can_create_configs",
         config_set_can_create_configs,
@@ -163,7 +206,7 @@ where
         "config_can_spawn_processes",
         config_can_spawn_processes,
     )?;
-    linker.func_wrap(
+    linker.func_wrap2_async(
         "lunatic::process",
         "config_set_can_spawn_processes",
         config_set_can_spawn_processes,
@@ -233,7 +276,7 @@ where
                 .add(Arc::new(module)),
             0,
         ),
-        Err(error) => (caller.data_mut().error_resources_mut().add(error), 1),
+        Err(error) => (caller.data_mut().add_error_resource(error), 1),
     };
 
     #[cfg(feature = "metrics")]
@@ -269,9 +312,8 @@ fn drop_module<T: ProcessState + ProcessCtx<T>>(
     Ok(())
 }
 
-// Create a new configuration with all permissions denied.
-//
-// There is no memory or fuel limit set on the newly created configuration.
+// Create a new configuration with all capabilities denied and resource ceilings
+// inherited from the caller.
 //
 // Returns:
 // * ID of newly created configuration in case of success
@@ -282,14 +324,41 @@ where
     T::Config: ProcessConfigCtx,
 {
     if !caller.data().config().can_create_configs() {
+        audit_log(
+            "capability_delegation",
+            format!(
+                "parent_process={} operation=create_config outcome=denied",
+                caller.data().id()
+            ),
+        );
         return -1;
     }
-    let config = T::Config::default();
+    let parent_process = caller.data().id();
+    let config = match caller.data().config().new_child_config() {
+        Ok(config) => config,
+        Err(_reason) => {
+            audit_log(
+                "capability_delegation",
+                format!(
+                    "parent_process={} operation=create_config outcome=denied",
+                    caller.data().id()
+                ),
+            );
+            return -1;
+        }
+    };
     #[cfg(feature = "metrics")]
     metrics::increment_counter!("lunatic.process.configs.created");
     #[cfg(feature = "metrics")]
     metrics::increment_gauge!("lunatic.process.configs.active", 1.0);
-    caller.data_mut().config_resources_mut().add(config) as i64
+    let config_id = caller.data_mut().config_resources_mut().add(config);
+    audit_log(
+        "capability_delegation",
+        format!(
+            "parent_process={parent_process} config_id={config_id} operation=create_config outcome=allowed"
+        ),
+    );
+    config_id as i64
 }
 
 // Drops the configuration from resources.
@@ -312,25 +381,209 @@ fn drop_config<T: ProcessState + ProcessCtx<T>>(
     Ok(())
 }
 
-// Sets the memory limit on a configuration.
-//
-// Traps:
-// * If max_memory is bigger than the platform maximum.
-// * If the config ID doesn't exist.
-fn config_set_max_memory<T: ProcessState + ProcessCtx<T>>(
-    mut caller: Caller<T>,
+/// Applies a child-config mutation atomically after checking it against the
+/// caller's authority. Failed mutations never remain in the resource table.
+fn mutate_child_config<T, F>(
+    caller: &mut Caller<T>,
     config_id: u64,
-    max_memory: u64,
-) -> Result<()> {
-    let max_memory = usize::try_from(max_memory)
-        .or_trap("lunatic::process::config_set_max_memory: max_memory exceeds platform max")?;
-    caller
+    operation: &'static str,
+    mutate: F,
+) -> Result<()>
+where
+    T: ProcessState,
+    F: FnOnce(&mut T::Config),
+{
+    let parent_process = caller.data().id();
+    let parent_config = caller.data().config().clone();
+    let mut candidate = caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap(format!(
+            "lunatic::process::{operation}: Config ID doesn't exist"
+        ))?
+        .clone();
+
+    mutate(&mut candidate);
+    if let Err(reason) = parent_config.validate_child_config(&candidate) {
+        audit_log(
+            "capability_delegation",
+            format!(
+                "parent_process={parent_process} config_id={config_id} operation={operation} outcome=denied"
+            ),
+        );
+        return Err(anyhow!(
+            "lunatic::process::{operation}: delegation denied: {reason}"
+        ));
+    }
+
+    *caller
         .data_mut()
         .config_resources_mut()
         .get_mut(config_id)
-        .or_trap("lunatic::process::config_set_max_memory: Config ID doesn't exist")?
-        .set_max_memory(max_memory);
+        .or_trap(format!(
+            "lunatic::process::{operation}: Config ID doesn't exist"
+        ))? = candidate;
+    audit_log(
+        "capability_delegation",
+        format!(
+            "parent_process={parent_process} config_id={config_id} operation={operation} outcome=allowed"
+        ),
+    );
     Ok(())
+}
+
+fn validate_delegated_config<T: ProcessState>(
+    state: &T,
+    config_id: u64,
+    child: &T::Config,
+    operation: &'static str,
+) -> Result<()> {
+    let parent_process = state.id();
+    if let Err(reason) = state.config().validate_child_config(child) {
+        audit_log(
+            "capability_delegation",
+            format!(
+                "parent_process={parent_process} config_id={config_id} operation={operation} outcome=denied"
+            ),
+        );
+        return Err(anyhow!(
+            "lunatic::process::{operation}: delegated config denied: {reason}"
+        ));
+    }
+    audit_log(
+        "capability_delegation",
+        format!(
+            "parent_process={parent_process} config_id={config_id} operation={operation} outcome=allowed"
+        ),
+    );
+    Ok(())
+}
+
+fn return_process_error<T: ErrorCtx>(
+    caller: &mut Caller<T>,
+    id_ptr: u32,
+    error: anyhow::Error,
+) -> Result<u32> {
+    let error_id = caller.data_mut().add_error_resource(error);
+    let memory = get_memory(caller)?;
+    memory
+        .write(caller, id_ptr as usize, &error_id.to_le_bytes())
+        .or_trap("lunatic::process::spawn: write error ID")?;
+    Ok(1)
+}
+
+fn return_process_error_in_state<T: ErrorCtx>(
+    state: &mut T,
+    memory: &mut [u8],
+    id_ptr: u32,
+    error: anyhow::Error,
+) -> Result<u32> {
+    let error_id = state.add_error_resource(error);
+    memory
+        .get_mut(id_ptr as usize..(id_ptr + 8) as usize)
+        .or_trap("lunatic::process::get_or_spawn: write error ID")?
+        .write(&error_id.to_le_bytes())
+        .or_trap("lunatic::process::get_or_spawn: write error ID")?;
+    Ok(1)
+}
+
+// Applies a configuration mutation without crossing a host trap on validation
+// failure. Returns -1 on success or an error-resource ID on failure.
+//
+// Setting IDs: 0=memory, 1=fuel, 2=table elements, 3=file descriptors,
+// 4=network connections, 5=compile, 6=create-config, 7=spawn.
+fn config_set_checked<T>(mut caller: Caller<T>, config_id: u64, setting: u32, value: u64) -> i64
+where
+    T: ProcessState + ProcessCtx<T> + ErrorCtx,
+    T::Config: ProcessConfigCtx,
+{
+    let result = match setting {
+        0 => usize::try_from(value)
+            .map_err(|_| anyhow!("max_memory exceeds platform max"))
+            .and_then(|value| {
+                mutate_child_config(&mut caller, config_id, "config_set_max_memory", |config| {
+                    config.set_max_memory(value)
+                })
+            }),
+        1 => mutate_child_config(&mut caller, config_id, "config_set_max_fuel", |config| {
+            config.set_max_fuel((value != 0).then_some(value))
+        }),
+        2 => u32::try_from(value)
+            .map_err(|_| anyhow!("max_table_elements exceeds u32"))
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_table_elements",
+                    |config| config.set_max_table_elements(value),
+                )
+            }),
+        3 => u32::try_from(value)
+            .map_err(|_| anyhow!("max_file_descriptors exceeds u32"))
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_file_descriptors",
+                    |config| config.set_max_file_descriptors(value),
+                )
+            }),
+        4 => u32::try_from(value)
+            .map_err(|_| anyhow!("max_network_connections exceeds u32"))
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_network_connections",
+                    |config| config.set_max_network_connections(value),
+                )
+            }),
+        5 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_compile_modules",
+            |config| config.set_can_compile_modules(value != 0),
+        ),
+        6 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_create_configs",
+            |config| config.set_can_create_configs(value != 0),
+        ),
+        7 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_spawn_processes",
+            |config| config.set_can_spawn_processes(value != 0),
+        ),
+        _ => Err(anyhow!("unknown config setting ID {setting}")),
+    };
+
+    match result {
+        Ok(()) => -1,
+        Err(error) => caller.data_mut().add_error_resource(error) as i64,
+    }
+}
+
+// Sets the memory limit on a configuration.
+//
+// Legacy void ABI: invalid or denied mutations are safe no-ops. Use
+// `config_set_checked` to receive a guest-readable error resource.
+fn config_set_max_memory<T: ProcessState + ProcessCtx<T> + Send>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max_memory: u64,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_> {
+    Box::new(async move {
+        if let Ok(max_memory) = usize::try_from(max_memory) {
+            let _ =
+                mutate_child_config(&mut caller, config_id, "config_set_max_memory", |config| {
+                    config.set_max_memory(max_memory)
+                });
+        }
+        Ok(())
+    })
 }
 
 // Returns the memory limit of a configuration.
@@ -354,25 +607,24 @@ fn config_get_max_memory<T: ProcessState + ProcessCtx<T>>(
 //
 // A value of 0 indicates no fuel limit.
 //
-// Traps:
-// * If the config ID doesn't exist.
-fn config_set_max_fuel<T: ProcessState + ProcessCtx<T>>(
+// Legacy void ABI: invalid or denied mutations are safe no-ops. Use
+// `config_set_checked` to receive a guest-readable error resource.
+fn config_set_max_fuel<T: ProcessState + ProcessCtx<T> + Send>(
     mut caller: Caller<T>,
     config_id: u64,
     max_fuel: u64,
-) -> Result<()> {
-    let max_fuel = match max_fuel {
-        0 => None,
-        max_fuel => Some(max_fuel),
-    };
+) -> Box<dyn Future<Output = Result<()>> + Send + '_> {
+    Box::new(async move {
+        let max_fuel = match max_fuel {
+            0 => None,
+            max_fuel => Some(max_fuel),
+        };
 
-    caller
-        .data_mut()
-        .config_resources_mut()
-        .get_mut(config_id)
-        .or_trap("lunatic::process::config_set_max_fuel: Config ID doesn't exist")?
-        .set_max_fuel(max_fuel);
-    Ok(())
+        let _ = mutate_child_config(&mut caller, config_id, "config_set_max_fuel", |config| {
+            config.set_max_fuel(max_fuel)
+        });
+        Ok(())
+    })
 }
 
 // Returns the fuel limit of a configuration.
@@ -397,6 +649,114 @@ fn config_get_max_fuel<T: ProcessState + ProcessCtx<T>>(
     }
 }
 
+// Sets the maximum number of table elements on a child configuration.
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_max_table_elements<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_table_elements",
+            |config| config.set_max_table_elements(max),
+        );
+        Ok(())
+    })
+}
+
+// Returns the maximum number of table elements on a child configuration.
+fn config_get_max_table_elements<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_table_elements: Config ID doesn't exist")?
+        .get_max_table_elements())
+}
+
+// Sets the maximum number of file descriptors on a child configuration.
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_max_file_descriptors<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_file_descriptors",
+            |config| config.set_max_file_descriptors(max),
+        );
+        Ok(())
+    })
+}
+
+// Returns the maximum number of file descriptors on a child configuration.
+fn config_get_max_file_descriptors<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_file_descriptors: Config ID doesn't exist")?
+        .get_max_file_descriptors())
+}
+
+// Sets the maximum number of network connections on a child configuration.
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_max_network_connections<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_network_connections",
+            |config| config.set_max_network_connections(max),
+        );
+        Ok(())
+    })
+}
+
+// Returns the maximum number of network connections on a child configuration.
+fn config_get_max_network_connections<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_network_connections: Config ID doesn't exist")?
+        .get_max_network_connections())
+}
+
 // Returns 1 if processes spawned from this configuration can compile Wasm modules, otherwise 0.
 //
 // Traps:
@@ -418,20 +778,25 @@ where
 // If set to a value >0 (true), processes spawned from this configuration will be able to compile
 // Wasm modules.
 //
-// Traps:
-// * If the config ID doesn't exist.
-fn config_set_can_compile_modules<T>(mut caller: Caller<T>, config_id: u64, can: u32) -> Result<()>
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_can_compile_modules<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    can: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
 where
-    T: ProcessState + ProcessCtx<T>,
+    T: ProcessState + ProcessCtx<T> + Send,
     T::Config: ProcessConfigCtx,
 {
-    caller
-        .data_mut()
-        .config_resources_mut()
-        .get_mut(config_id)
-        .or_trap("lunatic::process::config_set_can_compile_modules: Config ID doesn't exist")?
-        .set_can_compile_modules(can != 0);
-    Ok(())
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_compile_modules",
+            |config| config.set_can_compile_modules(can != 0),
+        );
+        Ok(())
+    })
 }
 
 // Returns 1 if processes spawned from this configuration can create other configurations,
@@ -456,20 +821,25 @@ where
 // If set to a value >0 (true), processes spawned from this configuration will be able to create
 // other configuration.
 //
-// Traps:
-// * If the config ID doesn't exist.
-fn config_set_can_create_configs<T>(mut caller: Caller<T>, config_id: u64, can: u32) -> Result<()>
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_can_create_configs<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    can: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
 where
-    T: ProcessState + ProcessCtx<T>,
+    T: ProcessState + ProcessCtx<T> + Send,
     T::Config: ProcessConfigCtx,
 {
-    caller
-        .data_mut()
-        .config_resources_mut()
-        .get_mut(config_id)
-        .or_trap("lunatic::process::config_set_can_create_configs: Config ID doesn't exist")?
-        .set_can_create_configs(can != 0);
-    Ok(())
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_create_configs",
+            |config| config.set_can_create_configs(can != 0),
+        );
+        Ok(())
+    })
 }
 
 // Returns 1 if processes spawned from this configuration can spawn sub-processes, otherwise 0.
@@ -493,20 +863,25 @@ where
 // If set to a value >0 (true), processes spawned from this configuration will be able to spawn
 // sub-processes.
 //
-// Traps:
-// * If the config ID doesn't exist.
-fn config_set_can_spawn_processes<T>(mut caller: Caller<T>, config_id: u64, can: u32) -> Result<()>
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_can_spawn_processes<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    can: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
 where
-    T: ProcessState + ProcessCtx<T>,
+    T: ProcessState + ProcessCtx<T> + Send,
     T::Config: ProcessConfigCtx,
 {
-    caller
-        .data_mut()
-        .config_resources_mut()
-        .get_mut(config_id)
-        .or_trap("lunatic::process::config_set_can_spawn_processes: Config ID doesn't exist")?
-        .set_can_spawn_processes(can != 0);
-    Ok(())
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_spawn_processes",
+            |config| config.set_can_spawn_processes(can != 0),
+        );
+        Ok(())
+    })
 }
 
 // Spawns a new process using the passed in function inside a module as the entry point.
@@ -561,36 +936,50 @@ where
 {
     Box::new(async move {
         if !caller.data().config().can_spawn_processes() {
-            return Err(anyhow!(
-                "Process doesn't have permissions to spawn sub-processes"
-            ));
+            return return_process_error(
+                &mut caller,
+                id_ptr,
+                anyhow!("Process doesn't have permissions to spawn sub-processes"),
+            );
         }
 
         let env = caller.data().environment();
-        env.can_spawn_next_process()
-            .await
-            .or_trap("lunatic::process:spawn: Process spawn limit reached.")?;
+        if let Err(error) = env.can_spawn_next_process().await {
+            return return_process_error(
+                &mut caller,
+                id_ptr,
+                anyhow!("Process spawn limit reached: {error}"),
+            );
+        }
 
-        let state = caller.data();
-
-        if !state.is_initialized() {
-            return Err(anyhow!("Cannot spawn process during module initialization"));
+        if !caller.data().is_initialized() {
+            return return_process_error(
+                &mut caller,
+                id_ptr,
+                anyhow!("Cannot spawn process during module initialization"),
+            );
         }
 
         let config = match config_id {
-            -1 => state.config().clone(),
-            config_id => Arc::new(
-                caller
+            -1 => caller.data().config().clone(),
+            config_id => {
+                let config = caller
                     .data()
                     .config_resources()
                     .get(config_id as u64)
                     .or_trap("lunatic::process::spawn: Config ID doesn't exist")?
-                    .clone(),
-            ),
+                    .clone();
+                if let Err(error) =
+                    validate_delegated_config(caller.data(), config_id as u64, &config, "spawn")
+                {
+                    return return_process_error(&mut caller, id_ptr, error);
+                }
+                Arc::new(config)
+            }
         };
 
         let module = match module_id {
-            -1 => state.module().clone(),
+            -1 => caller.data().module().clone(),
             module_id => caller
                 .data()
                 .module_resources()
@@ -599,7 +988,10 @@ where
                 .clone(),
         };
 
-        let mut new_state = state.new_state(module.clone(), config)?;
+        let mut new_state = match caller.data().new_state(module.clone(), config) {
+            Ok(state) => state,
+            Err(error) => return return_process_error(&mut caller, id_ptr, error),
+        };
 
         let memory = get_memory(&mut caller)?;
         let func_str = memory
@@ -680,7 +1072,7 @@ where
                 );
                 (process.id(), 0)
             }
-            Err(error) => (caller.data_mut().error_resources_mut().add(error), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error), 1),
         };
 
         memory
@@ -772,31 +1164,52 @@ where
             // Spawn a new process. This is copy of the code in `spawn` because host functions can't call
             // each other.
             if !state.config().can_spawn_processes() {
-                return Err(anyhow!(
-                    "lunatic::process:get_or_spawn: Process doesn't have permissions to spawn sub-processes"
-                ));
+                return return_process_error_in_state(
+                    state,
+                    memory_slice,
+                    id_ptr,
+                    anyhow!(
+                        "lunatic::process:get_or_spawn: Process doesn't have permissions to spawn sub-processes"
+                    ),
+                );
             }
 
             let env = state.environment();
-            env.can_spawn_next_process()
-                .await
-                .or_trap("lunatic::process:get_or_spawn: Process spawn limit reached.")?;
+            if let Err(error) = env.can_spawn_next_process().await {
+                return return_process_error_in_state(
+                    state,
+                    memory_slice,
+                    id_ptr,
+                    anyhow!("lunatic::process:get_or_spawn: Process spawn limit reached: {error}"),
+                );
+            }
 
             if !state.is_initialized() {
-                return Err(
-                    anyhow!("lunatic::process:get_or_spawn: Cannot spawn process during module initialization")
+                return return_process_error_in_state(
+                    state,
+                    memory_slice,
+                    id_ptr,
+                    anyhow!(
+                        "lunatic::process:get_or_spawn: Cannot spawn process during module initialization"
+                    ),
                 );
             }
 
             let config = match config_id {
                 -1 => state.config().clone(),
-                config_id => Arc::new(
-                    state
+                config_id => {
+                    let config = state
                         .config_resources()
                         .get(config_id as u64)
                         .or_trap("lunatic::process::get_or_spawn: Config ID doesn't exist")?
-                        .clone(),
-                ),
+                        .clone();
+                    if let Err(error) =
+                        validate_delegated_config(state, config_id as u64, &config, "get_or_spawn")
+                    {
+                        return return_process_error_in_state(state, memory_slice, id_ptr, error);
+                    }
+                    Arc::new(config)
+                }
             };
 
             let module = match module_id {
@@ -808,7 +1221,12 @@ where
                     .clone(),
             };
 
-            let mut new_state = state.new_state(module.clone(), config)?;
+            let mut new_state = match state.new_state(module.clone(), config) {
+                Ok(new_state) => new_state,
+                Err(error) => {
+                    return return_process_error_in_state(state, memory_slice, id_ptr, error)
+                }
+            };
 
             let func_str = memory_slice
                 .get(func_str_ptr as usize..(func_str_ptr + func_str_len) as usize)
@@ -879,7 +1297,7 @@ where
             .await
             {
                 Ok((_, process)) => (process.id(), 0),
-                Err(error) => (state.error_resources_mut().add(error), 1),
+                Err(error) => (state.add_error_resource(error), 1),
             };
 
             let node_id = state
@@ -1078,4 +1496,61 @@ fn exists<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>, process_id: u64) -
         .environment()
         .get_process(process_id)
         .is_some() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::ProcessConfigCtx;
+
+    #[derive(Default)]
+    struct PreResourceCeilingConfig {
+        compile: bool,
+        create: bool,
+        spawn: bool,
+    }
+
+    // This intentionally implements only the methods required before the
+    // table/FD/network ceiling imports were added.
+    impl ProcessConfigCtx for PreResourceCeilingConfig {
+        fn can_compile_modules(&self) -> bool {
+            self.compile
+        }
+
+        fn set_can_compile_modules(&mut self, can: bool) {
+            self.compile = can;
+        }
+
+        fn can_create_configs(&self) -> bool {
+            self.create
+        }
+
+        fn set_can_create_configs(&mut self, can: bool) {
+            self.create = can;
+        }
+
+        fn can_spawn_processes(&self) -> bool {
+            self.spawn
+        }
+
+        fn set_can_spawn_processes(&mut self, can: bool) {
+            self.spawn = can;
+        }
+
+        fn can_access_fs_location(&self, _path: &Path) -> Result<(), String> {
+            Err("denied".into())
+        }
+    }
+
+    #[test]
+    fn existing_config_contexts_compile_with_fail_closed_resource_defaults() {
+        let mut config = PreResourceCeilingConfig::default();
+        config.set_max_table_elements(100);
+        config.set_max_file_descriptors(100);
+        config.set_max_network_connections(100);
+        assert_eq!(config.get_max_table_elements(), 0);
+        assert_eq!(config.get_max_file_descriptors(), 0);
+        assert_eq!(config.get_max_network_connections(), 0);
+    }
 }

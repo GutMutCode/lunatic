@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-21
 
-Reviewed baseline: `6ea4521f40cadaf36c610857ba67740c4bd767f8`
+Reviewed working tree based on: `1110c0ab91d9c44aecd4ab03d39318b8b62698fe`
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -21,7 +21,7 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Robust | Partial | Wasm isolation and host-side supervision components exist. Wasm link death reasons and acknowledged reload/rollback semantics remain incomplete. |
 | Scalable | Emerging | Concurrent registries and quotas exist, but mailboxes/signals are unbounded and cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
-| Security Through Isolation | Partial | Several syscall checks and resource limits are enforced. Least-privilege defaults, capability attenuation, complete accounting, and structured audit events remain open. |
+| Security Through Isolation | Partial | Process configs now default to denied capabilities and enforce non-increasing child authority. Remote preopens fail closed; complete accounting, a usable receiver path policy, and structured audit events remain open. |
 | Fault Tolerance & HA | Partial | Links, monitors, host-side OTP components, snapshots, and registry quorum components exist. Critical production paths below are not complete. |
 | Async by Default | Partial | Wasmtime preemption and several async host paths exist. Unbounded queues and unverified blocking host calls prevent a stronger claim. |
 | Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
@@ -34,9 +34,8 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 
 1. **Live Wasm hot reload is not connected.** The running guest future takes ownership of the instance from `ProcessContext`; the reload handler later attempts to take an instance from that same empty option and can return `No instance available for hot reload` (`crates/lunatic-process/src/wasm.rs`, `crates/lunatic-process/src/lib.rs`). Existing integration tests and `benches/hot_reload.rs` manually compose Wasmtime compilation, instantiation, snapshot, and restore instead of exercising the live `Signal::HotReload` path.
 2. **Wasm link failure semantics lose the exit reason.** The Wasm runner calculates error, panic, kill, or normal outcomes, but its link-notification path currently sends `DeathReason::Normal`. Normal exits are ignored by the receiver, so linked failures are not demonstrated to propagate as intended (`crates/lunatic-process/src/lib.rs`).
-3. **The default capability posture is not least privilege.** `DefaultProcessConfig` currently enables config creation, module compilation, and process spawning by default, while the process API documentation describes a newly created config as denying permissions. Arbitrary WASI preopen paths also require an explicit capability policy (`src/config.rs`, `crates/lunatic-process-api/src/lib.rs`, `crates/lunatic-wasi-api/src/lib.rs`).
-4. **Queue and environment growth are not bounded end to end.** Process message and signal channels are unbounded, and the environment does not enforce a process-count limit. Existing file, network, memory, and table checks do not close mailbox/signal/process exhaustion paths (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/env.rs`, `src/config.rs`).
-5. **Reload coordination has no process acknowledgement protocol.** Successful signal delivery is treated as successful reload; atomic commit, version lifecycle, and rollback are not proven against actual process results. Rollback send failures are logged rather than recovered (`crates/lunatic-process/src/hot_reload.rs`).
+3. **Queue and environment growth are not bounded end to end.** Process message and signal channels are unbounded, and the environment does not enforce a process-count limit. Existing file, network, memory, and table checks do not close mailbox/signal/process exhaustion paths (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/env.rs`, `src/config.rs`).
+4. **Reload coordination has no process acknowledgement protocol.** Successful signal delivery is treated as successful reload; atomic commit, version lifecycle, and rollback are not proven against actual process results. Rollback send failures are logged rather than recovered (`crates/lunatic-process/src/hot_reload.rs`).
 
 ## 1. Fast, Robust, and Scalable
 
@@ -74,14 +73,19 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 ### Verified components
 
 - Spawn, compile, and config-creation operations have capability checks (`crates/lunatic-process-api/src/lib.rs`).
+- `DefaultProcessConfig` denies compile/create/spawn and preopens by default. Child configs clear ambient arguments, environment values, preopens, and boolean capabilities while inheriting parent resource ceilings. Guest setters and local/lookup/distributed spawn boundaries enforce non-increasing capability, path, memory, fuel, table, FD, and network ceilings (`src/config.rs`, `crates/lunatic-process-api/src/lib.rs`, `crates/lunatic-wasi-api/src/lib.rs`, `crates/lunatic-distributed-api/src/lib.rs`).
+- Distributed configs with filesystem preopens fail closed at both sender and receiver boundaries because sender-local paths are not remote authority (`crates/lunatic-distributed-api/src/lib.rs`, `crates/lunatic-distributed/src/distributed/server.rs`, `src/state.rs`).
+- Production-import integration tests cover default compile/create/spawn/preopen denial, Windows-safe checked escalation errors and rollback, legacy void-setter no-op safety, checked and legacy delegation through actual child spawn, guest-readable returned error IDs, final selected-config validation through both local spawn imports, bounded error resources under repeated denial, sender-side remote-preopen rejection, and allowed/denied formatted audit emission (`tests/capability_attenuation.rs`). Receiver tests deserialize and validate configs through the production receive helper (`crates/lunatic-distributed/src/distributed/server.rs`).
 - Networking paths enforce several per-process limits, and Wasmtime uses memory/table resource limiting (`crates/lunatic-networking-api`, `src/state.rs`).
 - A directly tested same-runtime helper can transfer supported live network resource maps between process states without serializing TLS traffic keys. Serialized active TLS restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
 
 ### Boundary
 
-- The default privilege mismatch, path preopen policy, and complete capability attenuation model remain unresolved.
+- Filesystem preopens are canonicalized and attenuated locally, but path replacement still has a check/open race. Remote preopens are unavailable until a receiver-controlled path mapping/allowlist is implemented; this is a functionality gap, not an ambient-authority fallback.
+- Authenticated cluster nodes are trusted for serialized non-filesystem capability flags and resource ceilings. A receiver-owned policy does not yet independently cap compile/create/spawn, memory, fuel, table, FD, or network authority from a compromised peer.
+- FD and network ceilings are attenuated as configuration values, but FD accounting is not connected to every host file operation and network accounting does not yet cover all listener/TLS/UDP/DNS resources or destination policy.
 - Resource accounting is not yet closed across processes, messages, signals, and all handles.
-- Selected successful process-spawn and network bind/accept/connect paths emit `target="audit"` formatted log records. Denial/failure coverage, a stable typed event schema, required fields, sink contract, redaction, and executable log assertions are not implemented. A persistence guide is operational guidance, not implementation evidence.
+- Capability delegation emits tested allowed/denied `target="audit"` records. Selected successful process-spawn and network bind/accept/connect paths also emit formatted records, but their denial/failure coverage, a stable typed schema, required fields, sink contract, and redaction tests remain unimplemented. A persistence guide is operational guidance, not implementation evidence.
 - The live-resource transfer helper is same-runtime only and is not currently proven reachable through running-Wasm reload. Serialized snapshots, host restarts, and cross-node migration cannot restore active TCP/TLS streams; listener restoration has separate support.
 
 ## 4. Fault Tolerance and High Availability
@@ -138,7 +142,7 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
 | Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
 
-Verification on 2026-07-21: `cargo test --all` completed with 137 passing tests, zero failures, and four ignored documentation tests. This confirms only the contracts exercised by those tests; it does not close the production-path gaps above.
+Windows verification on 2026-07-21: `cargo test --all` completed across 57 suites with 158 passing tests, zero failures, and four ignored documentation examples. The complete restricted-parent matrix runs on Windows using checked status/error-resource APIs instead of unwinding a host error through Wasmtime 8's async fiber. Default denial, final spawn-boundary rejection, bounded error resources, checked/legacy allowed delegation, distributed sender/receiver validation, compatibility defaults, import inventory, and audit assertions pass. This confirms only the contracts exercised by those tests; it does not close the production-path gaps above.
 
 The benchmark documents under `docs/benchmarks/` preserve an October 2025 measurement snapshot, but the original record omitted the tested commit and exact hardware/toolchain profile. It is therefore not a reproducible baseline. Future values must be quoted with commit, dirty state, hardware, toolchain, workload, and evidence boundary; they are not release certification by default.
 
@@ -152,12 +156,12 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 
 ## Prioritized Follow-Ups
 
-1. Enforce least-privilege defaults and explicit capability attenuation.
-2. Correct Wasm link death-reason propagation and add production-path tests.
-3. Connect and test live running-Wasm hot reload.
-4. Add reload acknowledgement, atomic commit, rollback, and version lifecycle semantics.
-5. Bound mailboxes/signals/process creation and validate resource accounting under pressure.
-6. Define structured security audit events and test schema/redaction guarantees.
+1. Correct Wasm link death-reason propagation and add production-path tests.
+2. Connect and test live running-Wasm hot reload.
+3. Add reload acknowledgement, atomic commit, rollback, and version lifecycle semantics.
+4. Bound mailboxes/signals/process creation and validate resource accounting under pressure.
+5. Define structured security audit events and test schema/redaction guarantees.
+6. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
 7. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
 8. Connect Supervisor monitor intake and OTP guest/runtime adapters.
 9. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
@@ -167,5 +171,6 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 
 - `CORE_VALUES.md` — design principles and target metrics.
 - `docs/benchmarks/BENCHMARK_RESULTS.md` — historical component measurements with scope limitations.
+- `docs/security/CAPABILITY_ATTENUATION.md` — process capability and resource-ceiling inheritance contract.
 - `examples/MULTI_LANGUAGE_GUIDE.md` — language example guide with support boundaries.
 - `docs/core_values/CORE_VALUES_COMPLIANCE_REPORT.md` — archived scorecard; this file supersedes its status claims.

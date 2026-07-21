@@ -36,9 +36,9 @@ impl Default for DefaultProcessConfig {
         Self {
             max_memory: 10_000_000, // 10MB default
             max_fuel: None,
-            can_compile_modules: true,
-            can_create_configs: true,
-            can_spawn_processes: true,
+            can_compile_modules: false,
+            can_create_configs: false,
+            can_spawn_processes: false,
             preopened_dirs: Vec::new(),
             command_line_arguments: Vec::new(),
             environment_variables: Vec::new(),
@@ -77,6 +77,85 @@ impl ProcessConfig for DefaultProcessConfig {
     fn get_max_memory(&self) -> usize {
         self.max_memory
     }
+
+    fn new_child_config(&self) -> Result<Self, String> {
+        Ok(Self {
+            max_memory: self.max_memory,
+            max_fuel: self.max_fuel,
+            can_compile_modules: false,
+            can_create_configs: false,
+            can_spawn_processes: false,
+            preopened_dirs: Vec::new(),
+            command_line_arguments: Vec::new(),
+            environment_variables: Vec::new(),
+            max_table_elements: self.max_table_elements,
+            max_file_descriptors: self.max_file_descriptors,
+            max_network_connections: self.max_network_connections,
+        })
+    }
+
+    fn validate_child_config(&self, child: &Self) -> Result<(), String> {
+        if child.can_compile_modules && !self.can_compile_modules {
+            return Err("compile-module capability exceeds parent authority".into());
+        }
+        if child.can_create_configs && !self.can_create_configs {
+            return Err("create-config capability exceeds parent authority".into());
+        }
+        if child.can_spawn_processes && !self.can_spawn_processes {
+            return Err("spawn capability exceeds parent authority".into());
+        }
+        if child.max_memory > self.max_memory {
+            return Err(format!(
+                "max_memory {} exceeds parent ceiling {}",
+                child.max_memory, self.max_memory
+            ));
+        }
+        match (self.max_fuel, child.max_fuel) {
+            (Some(parent), Some(child)) if child <= parent => {}
+            (Some(parent), Some(child)) => {
+                return Err(format!("max_fuel {child} exceeds parent ceiling {parent}"));
+            }
+            (Some(parent), None) => {
+                return Err(format!(
+                    "unlimited fuel exceeds finite parent ceiling {parent}"
+                ));
+            }
+            (None, _) => {}
+        }
+        if child.max_table_elements > self.max_table_elements {
+            return Err(format!(
+                "max_table_elements {} exceeds parent ceiling {}",
+                child.max_table_elements, self.max_table_elements
+            ));
+        }
+        if child.max_file_descriptors > self.max_file_descriptors {
+            return Err(format!(
+                "max_file_descriptors {} exceeds parent ceiling {}",
+                child.max_file_descriptors, self.max_file_descriptors
+            ));
+        }
+        if child.max_network_connections > self.max_network_connections {
+            return Err(format!(
+                "max_network_connections {} exceeds parent ceiling {}",
+                child.max_network_connections, self.max_network_connections
+            ));
+        }
+        for (_, dir) in &child.preopened_dirs {
+            self.can_delegate_preopen_dir(Path::new(dir))?;
+        }
+        Ok(())
+    }
+
+    fn validate_distributed_config(&self) -> Result<(), String> {
+        if self.preopened_dirs.is_empty() {
+            Ok(())
+        } else {
+            Err(
+                "filesystem preopens are host-local and cannot be delegated to a remote node without an explicit receiver policy"
+                    .into(),
+            )
+        }
+    }
 }
 
 impl LunaticWasiConfigCtx for DefaultProcessConfig {
@@ -89,12 +168,7 @@ impl LunaticWasiConfigCtx for DefaultProcessConfig {
     }
 
     fn preopen_dir(&mut self, dir: String) {
-        let resolved_path = if &dir == "~" {
-            dirs::home_dir().unwrap().to_str().unwrap().to_string()
-        } else {
-            dir.clone()
-        };
-        self.preopened_dirs.push((dir, resolved_path));
+        self.add_preopened_dir(dir);
     }
 }
 
@@ -129,15 +203,7 @@ impl DefaultProcessConfig {
 
     /// Grant access to the given directory with this config.
     pub fn preopen_dir<S: Into<String>>(&mut self, dir: S) {
-        let dir = dir.into();
-        let resolved_path = if &dir == "~" {
-            fs::canonicalize(dir.clone())
-                .map(|p| p.to_str().unwrap().to_string())
-                .unwrap_or_else(|_| dir.clone())
-        } else {
-            dir.clone()
-        };
-        self.preopened_dirs.push((dir, resolved_path))
+        self.add_preopened_dir(dir.into());
     }
 
     pub fn set_command_line_arguments(&mut self, args: Vec<String>) {
@@ -154,6 +220,47 @@ impl DefaultProcessConfig {
 
     pub fn environment_variables(&self) -> &Vec<(String, String)> {
         &self.environment_variables
+    }
+
+    fn add_preopened_dir(&mut self, dir: String) {
+        let path = if dir == "~" {
+            dirs::home_dir().unwrap_or_else(|| PathBuf::from(&dir))
+        } else {
+            PathBuf::from(&dir)
+        };
+        let resolved_path = get_absolute_path(&path).unwrap_or(path);
+        self.preopened_dirs
+            .push((dir, resolved_path.to_string_lossy().into_owned()));
+    }
+
+    fn can_delegate_preopen_dir(&self, path: &Path) -> Result<(), String> {
+        let requested = fs::canonicalize(path).map_err(|error| {
+            format!(
+                "preopen directory '{}' cannot be resolved: {error}",
+                path.display()
+            )
+        })?;
+        if !requested.is_dir() {
+            return Err(format!(
+                "preopen path '{}' is not a directory",
+                path.display()
+            ));
+        }
+
+        let allowed = self.preopened_dirs.iter().any(|(_, parent)| {
+            fs::canonicalize(parent)
+                .ok()
+                .filter(|parent| parent.is_dir())
+                .is_some_and(|parent| path_is_ancestor(&parent, &requested))
+        });
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "preopen directory '{}' is outside parent filesystem authority",
+                path.display()
+            ))
+        }
     }
 }
 
@@ -182,6 +289,30 @@ impl ProcessConfigCtx for DefaultProcessConfig {
         self.can_spawn_processes = can
     }
 
+    fn get_max_table_elements(&self) -> u32 {
+        self.max_table_elements
+    }
+
+    fn set_max_table_elements(&mut self, max: u32) {
+        self.max_table_elements = max;
+    }
+
+    fn get_max_file_descriptors(&self) -> u32 {
+        self.max_file_descriptors
+    }
+
+    fn set_max_file_descriptors(&mut self, max: u32) {
+        self.max_file_descriptors = max;
+    }
+
+    fn get_max_network_connections(&self) -> u32 {
+        self.max_network_connections
+    }
+
+    fn set_max_network_connections(&mut self, max: u32) {
+        self.max_network_connections = max;
+    }
+
     fn can_access_fs_location(&self, path: &std::path::Path) -> Result<(), String> {
         let (file_path, parent_dir) = match strip_file(path) {
             Ok(p) => p,
@@ -202,28 +333,10 @@ impl ProcessConfigCtx for DefaultProcessConfig {
     }
 }
 fn path_is_ancestor(ancestor: &Path, descendant: &Path) -> bool {
-    let ancestor_path = Path::new(ancestor);
-    let descendant_path = Path::new(descendant);
-
-    if !ancestor_path.is_dir() {
+    if !ancestor.is_dir() {
         return false;
     }
-
-    // If the ancestor path is root, return true
-    if ancestor_path.as_os_str() == Path::new("/").as_os_str() {
-        return true;
-    }
-
-    let descendant_components = descendant_path.ancestors();
-
-    // Check if each component of the descendant path starts with the ancestor path
-    for component in descendant_components {
-        if component.as_os_str() == ancestor_path.as_os_str() {
-            return true;
-        }
-    }
-
-    false
+    descendant.starts_with(ancestor)
 }
 
 // returns a tuple of paths, where the first is the full resolved canonicalized path
@@ -232,18 +345,51 @@ fn path_is_ancestor(ancestor: &Path, descendant: &Path) -> bool {
 fn strip_file(path: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     let absolute_path = get_absolute_path(path)?;
     if absolute_path.is_file() {
-        return Ok((absolute_path.clone(), absolute_path.join("..")));
+        let parent = absolute_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| absolute_path.clone());
+        return Ok((absolute_path, parent));
     }
     Ok((absolute_path.clone(), absolute_path))
 }
 
 fn get_absolute_path(path: &std::path::Path) -> std::io::Result<PathBuf> {
     let path = if path.is_relative() {
-        Path::join(std::env::current_dir().unwrap().as_path(), path)
+        Path::join(std::env::current_dir()?.as_path(), path)
     } else {
         path.to_path_buf()
     };
-    Ok(normalize_path(&path))
+    canonicalize_with_missing(&normalize_path(&path))
+}
+
+/// Canonicalizes the nearest existing ancestor and then restores any missing
+/// suffix. This keeps create-file checks useful while resolving symlinked
+/// ancestors before the containment comparison.
+fn canonicalize_with_missing(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let component = existing.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No existing ancestor for '{}'", path.display()),
+            )
+        })?;
+        missing.push(component.to_os_string());
+        if !existing.pop() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("No existing ancestor for '{}'", path.display()),
+            ));
+        }
+    }
+
+    let mut canonical = fs::canonicalize(existing)?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(normalize_path(&canonical))
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -278,8 +424,178 @@ mod tests {
     use std::path::Path;
 
     use crate::config::{get_absolute_path, path_is_ancestor};
+    use lunatic_process::config::ProcessConfig;
+    use lunatic_process_api::ProcessConfigCtx;
 
-    use super::normalize_path;
+    use super::{normalize_path, DefaultProcessConfig};
+
+    #[test]
+    fn default_config_denies_privileged_capabilities() {
+        let config = DefaultProcessConfig::default();
+
+        assert!(!config.can_compile_modules());
+        assert!(!config.can_create_configs());
+        assert!(!config.can_spawn_processes());
+        assert!(config.preopened_dirs().is_empty());
+    }
+
+    #[test]
+    fn child_config_is_denied_and_inherits_only_resource_ceilings() {
+        let mut parent = DefaultProcessConfig::default();
+        parent.set_max_memory(4096);
+        parent.set_max_fuel(Some(25));
+        parent.set_max_table_elements(64);
+        parent.set_max_file_descriptors(8);
+        parent.set_max_network_connections(4);
+        parent.set_can_compile_modules(true);
+        parent.set_can_create_configs(true);
+        parent.set_can_spawn_processes(true);
+        parent.preopen_dir(".");
+        parent.set_command_line_arguments(vec!["secret-argument".into()]);
+        parent.set_environment_variables(vec![("SECRET".into(), "value".into())]);
+
+        let child = parent.new_child_config().unwrap();
+
+        assert!(!child.can_compile_modules());
+        assert!(!child.can_create_configs());
+        assert!(!child.can_spawn_processes());
+        assert!(child.preopened_dirs().is_empty());
+        assert!(child.command_line_arguments().is_empty());
+        assert!(child.environment_variables().is_empty());
+        assert_eq!(child.get_max_memory(), 4096);
+        assert_eq!(child.get_max_fuel(), Some(25));
+        assert_eq!(child.get_max_table_elements(), 64);
+        assert_eq!(child.get_max_file_descriptors(), 8);
+        assert_eq!(child.get_max_network_connections(), 4);
+        parent.validate_child_config(&child).unwrap();
+    }
+
+    #[test]
+    fn validator_rejects_every_capability_and_resource_escalation() {
+        let mut parent = DefaultProcessConfig::default();
+        parent.set_max_memory(4096);
+        parent.set_max_fuel(Some(25));
+        parent.set_max_table_elements(64);
+        parent.set_max_file_descriptors(8);
+        parent.set_max_network_connections(4);
+        let child = parent.new_child_config().unwrap();
+
+        let mut candidate = child.clone();
+        candidate.set_can_compile_modules(true);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("compile-module capability"));
+
+        let mut candidate = child.clone();
+        candidate.set_can_create_configs(true);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("create-config capability"));
+
+        let mut candidate = child.clone();
+        candidate.set_can_spawn_processes(true);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("spawn capability"));
+
+        let mut candidate = child.clone();
+        candidate.set_max_memory(4097);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("max_memory"));
+
+        let mut candidate = child.clone();
+        candidate.set_max_fuel(Some(26));
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("max_fuel"));
+
+        let mut candidate = child.clone();
+        candidate.set_max_fuel(None);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("unlimited fuel"));
+
+        let mut candidate = child.clone();
+        candidate.set_max_table_elements(65);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("max_table_elements"));
+
+        let mut candidate = child.clone();
+        candidate.set_max_file_descriptors(9);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("max_file_descriptors"));
+
+        let mut candidate = child;
+        candidate.set_max_network_connections(5);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("max_network_connections"));
+    }
+
+    #[test]
+    fn validator_allows_only_filesystem_subsets() {
+        let mut parent = DefaultProcessConfig::default();
+        parent.preopen_dir("crates");
+
+        let mut allowed = parent.new_child_config().unwrap();
+        allowed.preopen_dir("crates/lunatic-process-api");
+        parent.validate_child_config(&allowed).unwrap();
+
+        let mut denied = parent.new_child_config().unwrap();
+        denied.preopen_dir(".");
+        assert!(parent
+            .validate_child_config(&denied)
+            .unwrap_err()
+            .contains("outside parent filesystem authority"));
+    }
+
+    #[test]
+    fn distributed_validator_rejects_host_local_preopens() {
+        let empty = DefaultProcessConfig::default();
+        empty.validate_distributed_config().unwrap();
+
+        let mut with_preopen = empty;
+        with_preopen.preopen_dir(".");
+        assert!(with_preopen
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("host-local"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validator_rejects_symlink_escape_from_preopen() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let root = std::env::temp_dir().join(format!("lunatic-preopen-{}", uuid::Uuid::new_v4()));
+        let allowed_dir = root.join("allowed");
+        let outside_dir = root.join("outside");
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&outside_dir).unwrap();
+        let escape = allowed_dir.join("escape");
+        symlink(&outside_dir, &escape).unwrap();
+
+        let mut parent = DefaultProcessConfig::default();
+        parent.preopen_dir(allowed_dir.to_string_lossy());
+        let mut child = parent.new_child_config().unwrap();
+        child.preopen_dir(escape.to_string_lossy());
+
+        let error = parent.validate_child_config(&child).unwrap_err();
+        assert!(error.contains("outside parent filesystem authority"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn test_accessible_paths() {

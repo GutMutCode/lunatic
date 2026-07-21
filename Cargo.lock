@@ -2075,6 +2075,7 @@ version = "0.13.2"
 dependencies = [
  "anyhow",
  "lunatic-common-api",
+ "lunatic-error-api",
  "lunatic-process",
  "lunatic-stdout-capture",
  "wasmtime",

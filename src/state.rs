@@ -169,6 +169,9 @@ impl ProcessState for DefaultProcessState {
         module: Arc<WasmtimeCompiledModule<Self>>,
         config: Arc<DefaultProcessConfig>,
     ) -> Result<Self> {
+        self.config
+            .validate_child_config(config.as_ref())
+            .map_err(anyhow::Error::msg)?;
         let signal_mailbox = unbounded_channel();
         let signal_mailbox = (signal_mailbox.0, Arc::new(Mutex::new(signal_mailbox.1)));
         let message_mailbox = MessageMailbox::default();
@@ -206,6 +209,7 @@ impl ProcessState for DefaultProcessState {
         lunatic_networking_api::register(linker)?;
         lunatic_version_api::register(linker)?;
         lunatic_wasi_api::register(linker)?;
+        lunatic_wasi_api::register_checked(linker)?;
         lunatic_registry_api::register(linker)?;
         lunatic_distributed_api::register(linker)?;
         lunatic_sqlite_api::register(linker)?;
@@ -811,6 +815,9 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
         module: Arc<WasmtimeCompiledModule<Self>>,
         config: Arc<Self::Config>,
     ) -> Result<Self> {
+        config
+            .validate_distributed_config()
+            .map_err(anyhow::Error::msg)?;
         let signal_mailbox = unbounded_channel();
         let signal_mailbox = (signal_mailbox.0, Arc::new(Mutex::new(signal_mailbox.1)));
         let message_mailbox = MessageMailbox::default();
@@ -884,7 +891,7 @@ mod tests {
         use lunatic_process::runtimes::wasmtime::WasmtimeRuntime;
         use lunatic_process::wasm::spawn_wasm;
 
-        // The default configuration includes both, the "lunatic::*" and "wasi_*" namespaces.
+        // The process-state linker registers both the "lunatic::*" and "wasi_*" namespaces.
         let config = DefaultProcessConfig::default();
 
         // Create wasmtime runtime

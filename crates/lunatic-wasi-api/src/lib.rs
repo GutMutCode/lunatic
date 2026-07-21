@@ -1,6 +1,7 @@
-use anyhow::Result;
-use lunatic_common_api::{get_memory, IntoTrap};
-use lunatic_process::state::ProcessState;
+use anyhow::{anyhow, Result};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap};
+use lunatic_error_api::ErrorCtx;
+use lunatic_process::{config::ProcessConfig, state::ProcessState};
 use lunatic_stdout_capture::StdoutCapture;
 use wasmtime::{Caller, Linker};
 use wasmtime_wasi::{ambient_authority, Dir, WasiCtx, WasiCtxBuilder};
@@ -64,7 +65,22 @@ where
         add_command_line_argument,
     )?;
     linker.func_wrap("lunatic::wasi", "config_preopen_dir", preopen_dir)?;
+    Ok(())
+}
 
+/// Registers the checked WASI configuration imports that return guest-visible
+/// error resources. Kept separate so existing embedders using [`register`]
+/// are not required to add [`ErrorCtx`] merely for the legacy WASI surface.
+pub fn register_checked<T>(linker: &mut Linker<T>) -> Result<()>
+where
+    T: ProcessState + ErrorCtx + 'static,
+    T::Config: LunaticWasiConfigCtx,
+{
+    linker.func_wrap(
+        "lunatic::wasi",
+        "config_preopen_dir_checked",
+        preopen_dir_checked,
+    )?;
     Ok(())
 }
 
@@ -147,29 +163,79 @@ where
 
 // Mark a directory as preopened in the configuration.
 //
-// Traps:
-// * If the config ID doesn't exist.
-// * If the directory string is not a valid utf8 string.
-// * If any of the memory slices falls outside the memory.
-fn preopen_dir<T>(mut caller: Caller<T>, config_id: u64, dir_ptr: u32, dir_len: u32) -> Result<()>
+// The legacy void ABI keeps denied mutations as audited no-ops. New guests
+// should call `config_preopen_dir_checked`, which returns -1 on success or a
+// guest-readable error-resource ID without crossing a host trap.
+fn preopen_dir<T>(mut caller: Caller<T>, config_id: u64, dir_ptr: u32, dir_len: u32)
 where
     T: ProcessState,
     T::Config: LunaticWasiConfigCtx,
 {
-    let memory = get_memory(&mut caller)?;
+    let _ = preopen_dir_impl(&mut caller, config_id, dir_ptr, dir_len);
+}
+
+fn preopen_dir_checked<T>(mut caller: Caller<T>, config_id: u64, dir_ptr: u32, dir_len: u32) -> i64
+where
+    T: ProcessState + ErrorCtx,
+    T::Config: LunaticWasiConfigCtx,
+{
+    match preopen_dir_impl(&mut caller, config_id, dir_ptr, dir_len) {
+        Ok(()) => -1,
+        Err(error) => caller.data_mut().add_error_resource(error) as i64,
+    }
+}
+
+fn preopen_dir_impl<T>(
+    caller: &mut Caller<T>,
+    config_id: u64,
+    dir_ptr: u32,
+    dir_len: u32,
+) -> Result<()>
+where
+    T: ProcessState,
+    T::Config: LunaticWasiConfigCtx,
+{
+    let memory = get_memory(caller)?;
     let dir_str = memory
-        .data(&caller)
+        .data(&*caller)
         .get(dir_ptr as usize..(dir_ptr + dir_len) as usize)
         .or_trap("lunatic::wasi::preopen_dir")?;
     let dir = std::str::from_utf8(dir_str)
         .or_trap("lunatic::wasi::preopen_dir")?
         .to_string();
 
-    caller
+    let parent_process = caller.data().id();
+    let parent_config = caller.data().config().clone();
+    let mut candidate = caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::wasi::preopen_dir: Config ID doesn't exist")?
+        .clone();
+    candidate.preopen_dir(dir);
+
+    if let Err(reason) = parent_config.validate_child_config(&candidate) {
+        audit_log(
+            "capability_delegation",
+            format!(
+                "parent_process={parent_process} config_id={config_id} operation=config_preopen_dir outcome=denied"
+            ),
+        );
+        return Err(anyhow!(
+            "lunatic::wasi::config_preopen_dir: delegation denied: {reason}"
+        ));
+    }
+
+    *caller
         .data_mut()
         .config_resources_mut()
         .get_mut(config_id)
-        .or_trap("lunatic::wasi::preopen_dir: Config ID doesn't exist")?
-        .preopen_dir(dir);
+        .or_trap("lunatic::wasi::preopen_dir: Config ID doesn't exist")? = candidate;
+    audit_log(
+        "capability_delegation",
+        format!(
+            "parent_process={parent_process} config_id={config_id} operation=config_preopen_dir outcome=allowed"
+        ),
+    );
     Ok(())
 }

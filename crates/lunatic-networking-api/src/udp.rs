@@ -94,7 +94,7 @@ fn udp_bind<T: NetworkingCtx + ErrorCtx + Send>(
                     0,
                 )
             }
-            Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
         memory
             .write(
@@ -153,7 +153,7 @@ fn udp_receive<T: NetworkingCtx + ErrorCtx + Send>(
 
         let (opaque, return_) = match socket.recv(buffer).await {
             Ok(bytes) => (bytes as u64, 0),
-            Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
 
         let memory = get_memory(&mut caller)?;
@@ -198,11 +198,7 @@ fn udp_receive_from<T: NetworkingCtx + ErrorCtx + Send>(
 
         let (opaque, socket_result, return_) = match socket.recv_from(buffer).await {
             Ok((bytes, socket)) => (bytes as u64, Some(socket), 0),
-            Err(error) => (
-                caller.data_mut().error_resources_mut().add(error.into()),
-                None,
-                1,
-            ),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), None, 1),
         };
 
         let memory = get_memory(&mut caller)?;
@@ -282,7 +278,7 @@ fn udp_connect<T: NetworkingCtx + ErrorCtx + Send>(
                     audit_log("udp_connect", format!("peer={}", socket_addr));
                     (0, 0)
                 }
-                Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
             };
 
             memory
@@ -438,7 +434,7 @@ fn udp_send_to<T: NetworkingCtx + ErrorCtx + Send>(
 
         let (opaque, return_) = match stream.send_to(buffer, socket_addr).await {
             Ok(bytes) => (bytes as u64, 0),
-            Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
 
         let memory = get_memory(&mut caller)?;
@@ -485,7 +481,7 @@ fn udp_send<T: NetworkingCtx + ErrorCtx + Send>(
 
         let (opaque, return_) = match stream.send(buffer).await {
             Ok(bytes) => (bytes as u64, 0),
-            Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
 
         let memory = get_memory(&mut caller)?;
@@ -524,7 +520,7 @@ fn udp_local_addr<T: NetworkingCtx + ErrorCtx + Send>(
                 .add(DnsIterator::new(vec![socket_addr].into_iter()));
             (dns_iter_id, 0)
         }
-        Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+        Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
     };
 
     let memory = get_memory(&mut caller)?;
@@ -570,9 +566,9 @@ fn udp_peer_addr<T: NetworkingCtx + ErrorCtx + Send>(
         }
         Err(error) => {
             if error.kind() == ErrorKind::NotConnected {
-                (caller.data_mut().error_resources_mut().add(error.into()), 1)
+                (caller.data_mut().add_error_resource(error.into()), 1)
             } else {
-                (caller.data_mut().error_resources_mut().add(error.into()), 2)
+                (caller.data_mut().add_error_resource(error.into()), 2)
             }
         }
     };

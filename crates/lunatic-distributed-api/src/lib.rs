@@ -2,7 +2,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use asn1_rs::ToDer;
-use lunatic_common_api::{get_memory, write_to_guest_vec, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, write_to_guest_vec, IntoTrap};
 use lunatic_distributed::{
     distributed::{
         self,
@@ -13,6 +13,7 @@ use lunatic_distributed::{
 };
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::{
+    config::ProcessConfig,
     env::Environment,
     message::{DataMessage, Message},
 };
@@ -143,7 +144,7 @@ where
                 Ok(0)
             }
             Err(error) => {
-                let error_id = caller.data_mut().error_resources_mut().add(error);
+                let error_id = caller.data_mut().add_error_resource(error);
                 memory
                     .write(&mut caller, error_ptr as usize, &error_id.to_le_bytes())
                     .or_trap("lunatic::distributed::lookup_nodes::error_ptr")?;
@@ -188,7 +189,7 @@ where
         Ok(copy_nodes_len as i32)
     } else {
         let error = anyhow!("Invalid query id");
-        let error_id = caller.data_mut().error_resources_mut().add(error);
+        let error_id = caller.data_mut().add_error_resource(error);
         memory
             .write(&mut caller, error_ptr as usize, &error_id.to_le_bytes())
             .or_trap("lunatic::distributed::copy_lookup_nodes_results::error_ptr")?;
@@ -350,7 +351,8 @@ where
 // Similar to a local spawn, it spawns a new process using the passed in function inside a module
 // as the entry point. The process is spawned on a node with id `node_id`.
 //
-// If `config_id` is 0, the same config is used as in the process calling this function.
+// If `config_id` is -1, the calling process configuration is inherited. Any
+// non-negative value selects that guest-visible configuration resource ID.
 //
 // The function arguments are passed as an array with the following structure:
 // [0 byte = type ID; 1..17 bytes = value as u128, ...]
@@ -366,12 +368,29 @@ where
 // * 0      on success - The ID of the newly created process is written to `id_ptr`
 // * 1      If node does not exist
 // * 2      If module does not exist
+// * 3      If capability/config validation or the remote node rejects the request
+// * 4      If the referenced process does not exist
 // * 9027   If node connection error occurred
 //
 // Traps:
 // * If the function string is not a valid utf8 string.
 // * If the params array is in a wrong format.
 // * If any memory outside the guest heap space is referenced.
+#[allow(clippy::too_many_arguments)]
+fn return_spawn_error<T: ErrorCtx>(
+    caller: &mut Caller<T>,
+    id_ptr: u32,
+    code: u32,
+    error: anyhow::Error,
+) -> Result<u32> {
+    let error_id = caller.data_mut().add_error_resource(error);
+    let memory = get_memory(caller)?;
+    memory
+        .write(caller, id_ptr as usize, &error_id.to_le_bytes())
+        .or_trap("lunatic::distributed::spawn::write_error_id")?;
+    Ok(code)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn<T, E>(
     mut caller: Caller<T>,
@@ -391,9 +410,12 @@ where
 {
     Box::new(async move {
         if !caller.data().can_spawn() {
-            return Err(anyhow!(
-                "Process doesn't have permissions to spawn sub-processes"
-            ));
+            return return_spawn_error(
+                &mut caller,
+                id_ptr,
+                3,
+                anyhow!("Process doesn't have permissions to spawn sub-processes"),
+            );
         }
         let memory = get_memory(&mut caller)?;
         let func_str = memory
@@ -426,15 +448,54 @@ where
 
         let config = match config_id {
             -1 => state.config().clone(),
-            config_id => Arc::new(
-                caller
-                    .data()
+            config_id => {
+                let config = state
                     .config_resources()
                     .get(config_id as u64)
                     .or_trap("lunatic::distributed::spawn: Config ID doesn't exist")?
-                    .clone(),
-            ),
+                    .clone();
+                if let Err(reason) = state.config().validate_child_config(&config) {
+                    audit_log(
+                        "capability_delegation",
+                        format!(
+                            "parent_process={} config_id={} operation=distributed_spawn outcome=denied",
+                            state.id(), config_id
+                        ),
+                    );
+                    return return_spawn_error(
+                        &mut caller,
+                        id_ptr,
+                        3,
+                        anyhow!("lunatic::distributed::spawn: delegated config denied: {reason}"),
+                    );
+                }
+                Arc::new(config)
+            }
         };
+        if let Err(reason) = config.validate_distributed_config() {
+            audit_log(
+                "capability_delegation",
+                format!(
+                    "parent_process={} config_id={} operation=distributed_spawn outcome=denied",
+                    state.id(),
+                    config_id
+                ),
+            );
+            return return_spawn_error(
+                &mut caller,
+                id_ptr,
+                3,
+                anyhow!("lunatic::distributed::spawn: remote config denied: {reason}"),
+            );
+        }
+        audit_log(
+            "capability_delegation",
+            format!(
+                "parent_process={} config_id={} operation=distributed_spawn outcome=allowed",
+                state.id(),
+                config_id
+            ),
+        );
         let config: Vec<u8> =
             rmp_serde::to_vec(config.as_ref()).map_err(|_| anyhow!("Error serializing config"))?;
 
@@ -464,19 +525,13 @@ where
             distributed::message::ResponseContent::Spawned(process_id) => Ok((process_id, 0)),
             distributed::message::ResponseContent::Error(error) => {
                 let (code, message): (u32, String) = match error {
-                    ClientError::Unexpected(cause) => Err(anyhow!(cause)),
-                    ClientError::Connection(cause) => Ok((9027, cause)),
-                    ClientError::NodeNotFound => Ok((1, "Node does not exist.".to_string())),
-                    ClientError::ModuleNotFound => Ok((2, "Module does not exist.".to_string())),
-                    ClientError::ProcessNotFound => Err(anyhow!("unreachable")),
-                }?;
-                Ok((
-                    caller
-                        .data_mut()
-                        .error_resources_mut()
-                        .add(anyhow!(message)),
-                    code,
-                ))
+                    ClientError::Unexpected(cause) => (3, cause),
+                    ClientError::Connection(cause) => (9027, cause),
+                    ClientError::NodeNotFound => (1, "Node does not exist.".to_string()),
+                    ClientError::ModuleNotFound => (2, "Module does not exist.".to_string()),
+                    ClientError::ProcessNotFound => (4, "Process does not exist.".to_string()),
+                };
+                Ok((caller.data_mut().add_error_resource(anyhow!(message)), code))
             }
             _ => Err(anyhow!("unreachable")),
         }?;

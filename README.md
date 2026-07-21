@@ -24,7 +24,7 @@ If you would like to see other languages supported or just follow the discussion
 ## Supported features
 
 - [x] Creating, cancelling & waiting on processes
-- [ ] Capability and resource isolation (core checks and quotas exist; least-privilege defaults and attenuation are still being completed)
+- [ ] Capability and resource isolation (least-privilege config defaults and attenuation are implemented; complete FD/network/process/queue accounting remains open)
 - [ ] Process supervision (host-side GenServer/Supervisor process paths exist; automatic monitor intake and guest-WASM adapters are pending)
 - [x] Channel based message passing
 - [x] TCP networking
@@ -120,8 +120,10 @@ guest memory faults, while safety still depends on the runtime, configured capab
 resource limits; it is not a blanket guarantee for arbitrary native vulnerabilities.
 
 Per-process configuration provides configured filesystem preopens, compile/create/spawn capability flags,
-memory/table/fuel limits, and network-connection quotas. Least-privilege defaults, attenuation, and coverage
-vary by resource type, as detailed in the [implementation status](docs/core_values/status.md).
+memory/table/fuel limits, and network-connection quotas. Untrusted configs deny privileged capabilities by
+default, and child configs cannot exceed their parent's represented authority. Enforcement coverage still
+varies by resource type; see the [capability contract](docs/security/CAPABILITY_ATTENUATION.md) and
+[implementation status](docs/core_values/status.md).
 
 ### Scheduling
 

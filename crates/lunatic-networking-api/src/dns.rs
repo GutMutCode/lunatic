@@ -93,7 +93,7 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
                     (id, 0)
                 }
                 Err(error) => {
-                    let error_id = state.error_resources_mut().add(error.into());
+                    let error_id = state.add_error_resource(error.into());
                     (error_id, 1)
                 }
             }

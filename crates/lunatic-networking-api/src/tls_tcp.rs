@@ -96,7 +96,7 @@ fn tls_local_addr<T: NetworkingCtx + ErrorCtx>(
                 .add(DnsIterator::new(vec![socket_addr].into_iter()));
             (dns_iter_id, 0)
         }
-        Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+        Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
     };
 
     let memory = get_memory(&mut caller)?;
@@ -178,7 +178,7 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
                     0,
                 )
             }
-            Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
         memory
             .write(
@@ -254,11 +254,7 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
                     audit_log("tls_accept", format!("peer={}", socket_addr));
                     (stream_id, dns_iter_id, 0)
                 }
-                Err(error) => (
-                    caller.data_mut().error_resources_mut().add(error.into()),
-                    0,
-                    1,
-                ),
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 0, 1),
             };
 
         let memory = get_memory(&mut caller)?;
@@ -446,7 +442,7 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                     audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));
                     (id, 0)
                 }
-                Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
             };
 
             memory
@@ -557,7 +553,7 @@ fn tls_write_vectored<T: NetworkingCtx + ErrorCtx + Send>(
         } {
             let (opaque, return_) = match write_result {
                 Ok(bytes) => (bytes as u64, 0),
-                Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
             };
 
             let memory = get_memory(&mut caller)?;
@@ -720,7 +716,7 @@ fn tls_read<T: NetworkingCtx + ErrorCtx + Send>(
         } {
             let (opaque, return_) = match read_result {
                 Ok(bytes) => (bytes as u64, 0),
-                Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
             };
 
             let memory = get_memory(&mut caller)?;
@@ -762,7 +758,7 @@ fn tls_flush<T: NetworkingCtx + ErrorCtx + Send>(
 
         let (error_id, result) = match stream.flush().await {
             Ok(()) => (0, 0),
-            Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
 
         let memory = get_memory(&mut caller)?;

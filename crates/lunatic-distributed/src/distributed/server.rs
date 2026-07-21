@@ -3,6 +3,7 @@ use std::{collections::HashSet, net::SocketAddr, sync::Arc};
 use anyhow::{anyhow, Result};
 
 use lunatic_process::{
+    config::ProcessConfig,
     env::{Environment, Environments},
     message::{DataMessage, Message},
     runtimes::{wasmtime::WasmtimeRuntime, Modules, RawWasm},
@@ -260,6 +261,24 @@ where
     Ok(())
 }
 
+fn decode_distributed_config<C: ProcessConfig>(encoded: &[u8], environment_id: u64) -> Result<C> {
+    let config: C = rmp_serde::from_slice(encoded)?;
+    // Portable capability and limit fields currently inherit the authenticated
+    // cluster node's authority. Host filesystem paths are different: their
+    // meaning is receiver-local, so they fail closed without a node policy.
+    if let Err(reason) = config.validate_distributed_config() {
+        log::info!(
+            target: "audit",
+            "capability_delegation environment={} operation=distributed_receive outcome=denied",
+            environment_id
+        );
+        return Err(anyhow!(
+            "distributed spawn config denied by receiver: {reason}"
+        ));
+    }
+    Ok(config)
+}
+
 async fn handle_spawn<T, E>(ctx: ServerCtx<T, E>, spawn: Spawn) -> Result<Result<u64, ClientError>>
 where
     T: ProcessState
@@ -279,7 +298,7 @@ where
         config,
         ..
     } = spawn;
-    let config: T::Config = rmp_serde::from_slice(&config[..])?;
+    let config: T::Config = decode_distributed_config(&config, environment_id)?;
     let config = Arc::new(config);
 
     let module = match ctx.modules.get(module_id) {
@@ -323,6 +342,66 @@ where
     )
     .await?;
     Ok(Ok(proc.id()))
+}
+
+#[cfg(test)]
+mod tests {
+    use lunatic_process::config::ProcessConfig;
+    use serde::{Deserialize, Serialize};
+
+    use super::decode_distributed_config;
+
+    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+    struct ReceiverTestConfig {
+        max_fuel: Option<u64>,
+        max_memory: usize,
+        has_host_local_authority: bool,
+    }
+
+    impl ProcessConfig for ReceiverTestConfig {
+        fn set_max_fuel(&mut self, max_fuel: Option<u64>) {
+            self.max_fuel = max_fuel;
+        }
+
+        fn get_max_fuel(&self) -> Option<u64> {
+            self.max_fuel
+        }
+
+        fn set_max_memory(&mut self, max_memory: usize) {
+            self.max_memory = max_memory;
+        }
+
+        fn get_max_memory(&self) -> usize {
+            self.max_memory
+        }
+
+        fn validate_distributed_config(&self) -> Result<(), String> {
+            if self.has_host_local_authority {
+                Err("test host-local authority".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn receiver_decodes_allowed_config_at_production_boundary() {
+        let encoded = rmp_serde::to_vec(&ReceiverTestConfig::default()).unwrap();
+        let decoded: ReceiverTestConfig = decode_distributed_config(&encoded, 7).unwrap();
+        assert!(!decoded.has_host_local_authority);
+    }
+
+    #[test]
+    fn receiver_rejects_host_local_authority_after_deserialization() {
+        let encoded = rmp_serde::to_vec(&ReceiverTestConfig {
+            has_host_local_authority: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let error = decode_distributed_config::<ReceiverTestConfig>(&encoded, 7).unwrap_err();
+        assert!(error.to_string().contains("denied by receiver"));
+        assert!(error.to_string().contains("host-local"));
+    }
 }
 
 async fn handle_process_message<T, E>(

@@ -9,6 +9,7 @@ license = "Apache-2.0 OR MIT"
 
 [dependencies]
 lunatic-common-api = { workspace = true }
+lunatic-error-api = { workspace = true }
 lunatic-process = { workspace = true }
 lunatic-stdout-capture = { workspace = true }
 

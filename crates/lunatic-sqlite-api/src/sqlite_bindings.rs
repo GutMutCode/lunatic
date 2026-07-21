@@ -79,9 +79,9 @@ where
         .or_trap("lunatic::sqlite::open")?;
     let path = std::str::from_utf8(path).or_trap("lunatic::sqlite::open")?;
     if let Err(error_message) = state.config().can_access_fs_location(Path::new(path)) {
-        let error_id = state
-            .error_resources_mut()
-            .add(anyhow::Error::msg(error_message).context(format!("Failed to access '{path}'")));
+        let error_id = state.add_error_resource(
+            anyhow::Error::msg(error_message).context(format!("Failed to access '{path}'")),
+        );
         memory
             .write(
                 &mut caller,
@@ -101,7 +101,7 @@ where
                 .add(Arc::new(Mutex::new(conn))),
             0,
         ),
-        Err(error) => (caller.data_mut().error_resources_mut().add(error.into()), 1),
+        Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
     };
 
     // write the result into memory and return the return code

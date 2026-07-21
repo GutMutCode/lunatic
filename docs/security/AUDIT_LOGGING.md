@@ -1,20 +1,26 @@
 # Audit Logging
 
-Lunatic emits `target="audit"` formatted text records on selected successful process-spawn and network bind/accept/connect paths.
+Lunatic emits `target="audit"` formatted text records for process-config delegation decisions and selected successful process-spawn and network bind/accept/connect paths.
 
-> **Current boundary (reviewed 2026-07-21):** These records do not form a complete or typed security-event contract. Denial/failure coverage, stable schema and required fields, redaction tests, sink guarantees, and executable log assertions remain unimplemented. This document is an event inventory and routing guide; it is not production-readiness or compliance evidence. See [`docs/core_values/status.md`](../core_values/status.md).
+> **Current boundary (reviewed 2026-07-21):** These records do not form a complete or typed security-event contract. Capability delegation has selected allowed/denied coverage and executable assertions, but other denial/failure paths, stable schema and required fields, redaction tests, and sink guarantees remain unimplemented. This document is an event inventory and routing guide; it is not production-readiness or compliance evidence. See [`docs/core_values/status.md`](../core_values/status.md).
 
 ## Overview
 
-The operations listed below call the `audit` log target after selected successful actions. Coverage is not exhaustive, and routing/persistence depends on application logging configuration.
+The operations listed below call the `audit` log target at selected delegation decisions and after selected successful actions. Coverage is not exhaustive, and routing/persistence depends on application logging configuration.
 
 ## Logged Operations
 
 Lunatic logs the following privileged operations:
 
 ### Process Management
+- **`capability_delegation`** - Child-config creation, mutation, preopen, and final local/distributed config validation
+  - Locations: `crates/lunatic-process-api/src/lib.rs`, `crates/lunatic-wasi-api/src/lib.rs`, `crates/lunatic-distributed-api/src/lib.rs`, `crates/lunatic-distributed/src/distributed/server.rs`
+  - Sender/local details: `parent_process={pid} config_id={id} operation={name} outcome={allowed|denied}`; `config_id` is omitted when creation is denied before an ID exists
+  - Receiver denial details: `environment={id} operation=distributed_receive outcome=denied`; the wire format does not currently carry the sender's guest process or local config ID
+  - Executable assertion: `tests/capability_attenuation.rs`
+
 - **`process_spawn`** - New process creation
-  - Location: `crates/lunatic-process-api/src/lib.rs:677`
+  - Location: `crates/lunatic-process-api/src/lib.rs`
   - Details: `parent={pid} child={pid}`
 
 ### Network Operations
@@ -194,15 +200,16 @@ fn test_tcp_bind_logs_audit() {
 ## Security Considerations
 
 ### What is Logged
--  Process creation (parent/child relationships)
--  Network bindings and connections (addresses and ports)
--  TLS connections (peer addresses)
+- Process creation (parent/child relationships)
+- Capability-delegation decisions (selected allowed and denied paths)
+- Network bindings and connections (addresses and ports)
+- TLS connections (peer addresses)
 
 ### What is NOT Logged
-- L Payload data (message contents)
-- L Authentication credentials
-- L Process-internal state
-- L Memory contents
+- Payload data (message contents)
+- Authentication credentials
+- Process-internal state
+- Memory contents
 
 ### Privacy
 - IP addresses are logged (may be PII under GDPR)
