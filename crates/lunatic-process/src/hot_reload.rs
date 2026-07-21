@@ -547,6 +547,7 @@ fn get_export_signatures<S: ProcessState>(
             },
             wasmtime::ExternType::Memory(_) => ExportSignature::Memory,
             wasmtime::ExternType::Table(_) => ExportSignature::Table,
+            wasmtime::ExternType::Tag(_) => ExportSignature::Tag,
         };
         exports.insert(export.name().to_string(), sig);
     }
@@ -571,6 +572,7 @@ fn get_import_signatures<S: ProcessState>(
             },
             wasmtime::ExternType::Memory(_) => ExportSignature::Memory,
             wasmtime::ExternType::Table(_) => ExportSignature::Table,
+            wasmtime::ExternType::Tag(_) => ExportSignature::Tag,
         };
         imports.push((import.module().to_string(), import.name().to_string(), sig));
     }
@@ -585,6 +587,7 @@ enum ExportSignature {
     Global { mutable: bool },
     Memory,
     Table,
+    Tag,
 }
 
 /// Check if two signatures are compatible

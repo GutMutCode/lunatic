@@ -10,9 +10,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
-use lunatic_common_api::{audit_log, get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 use webpki::TrustAnchor;
 
@@ -31,13 +31,33 @@ pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
     linker.func_wrap(
         "lunatic::networking",
         "drop_tls_listener",
-        drop_tls_listener,
+        |caller: Caller<'_, T>, tls_listener_id: u64| {
+            drop_tls_listener(caller, tls_listener_id).to_wasmtime_result()
+        },
     )?;
-    linker.func_wrap("lunatic::networking", "tls_local_addr", tls_local_addr)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "tls_local_addr",
+        |caller: Caller<'_, T>, tls_listener_id: u64, id_u64_ptr: u32| {
+            tls_local_addr(caller, tls_listener_id, id_u64_ptr).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap3_async("lunatic::networking", "tls_accept", tls_accept)?;
     linker.func_wrap7_async("lunatic::networking", "tls_connect", tls_connect)?;
-    linker.func_wrap("lunatic::networking", "drop_tls_stream", drop_tls_stream)?;
-    linker.func_wrap("lunatic::networking", "clone_tls_stream", clone_tls_stream)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "drop_tls_stream",
+        |caller: Caller<'_, T>, tls_stream_id: u64| {
+            drop_tls_stream(caller, tls_stream_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "clone_tls_stream",
+        |caller: Caller<'_, T>, tls_stream_id: u64| {
+            clone_tls_stream(caller, tls_stream_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap4_async(
         "lunatic::networking",
         "tls_write_vectored",

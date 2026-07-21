@@ -15,4 +15,4 @@ lunatic-stdout-capture = { workspace = true }
 
 anyhow = { workspace = true }
 wasmtime = { workspace = true }
-wasmtime-wasi = { workspace = true }
+wasi-common = { workspace = true }

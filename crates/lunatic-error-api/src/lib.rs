@@ -2,7 +2,7 @@ use anyhow::Result;
 use hash_map_id::HashMapId;
 use lunatic_common_api::{get_memory, IntoTrap};
 use std::{error::Error, fmt};
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 pub type ErrorResource = HashMapId<anyhow::Error>;
 
@@ -72,9 +72,23 @@ pub trait ErrorCtx {
 
 // Register the error APIs to the linker
 pub fn register<T: ErrorCtx + 'static>(linker: &mut Linker<T>) -> Result<()> {
-    linker.func_wrap("lunatic::error", "string_size", string_size)?;
-    linker.func_wrap("lunatic::error", "to_string", to_string)?;
-    linker.func_wrap("lunatic::error", "drop", drop)?;
+    linker.func_wrap(
+        "lunatic::error",
+        "string_size",
+        |caller: Caller<'_, T>, error_id: u64| string_size(caller, error_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::error",
+        "to_string",
+        |caller: Caller<'_, T>, error_id: u64, error_str_ptr: u32| {
+            to_string(caller, error_id, error_str_ptr).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::error",
+        "drop",
+        |caller: Caller<'_, T>, error_id: u64| drop(caller, error_id).to_wasmtime_result(),
+    )?;
     Ok(())
 }
 

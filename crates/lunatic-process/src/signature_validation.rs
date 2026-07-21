@@ -118,7 +118,7 @@ impl SignatureValidator {
         let old_results: Vec<_> = old.results().collect();
         let new_results: Vec<_> = new.results().collect();
 
-        if old_params != new_params {
+        if !same_val_types(&old_params, &new_params) {
             return Err(ValidationError::IncompatibleSignature {
                 function: name.to_string(),
                 details: format!(
@@ -128,7 +128,7 @@ impl SignatureValidator {
             });
         }
 
-        if old_results != new_results {
+        if !same_val_types(&old_results, &new_results) {
             return Err(ValidationError::IncompatibleSignature {
                 function: name.to_string(),
                 details: format!(
@@ -159,6 +159,14 @@ impl SignatureValidator {
     fn validate_global_types(_old: &GlobalType, _new: &GlobalType) -> Result<(), ValidationError> {
         Ok(())
     }
+}
+
+fn same_val_types(old: &[wasmtime::ValType], new: &[wasmtime::ValType]) -> bool {
+    old.len() == new.len()
+        && old
+            .iter()
+            .zip(new)
+            .all(|(old, new)| wasmtime::ValType::eq(old, new))
 }
 
 #[cfg(test)]

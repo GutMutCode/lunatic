@@ -6,11 +6,11 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 use crate::dns::DnsIterator;
 use crate::{socket_address, NetworkingCtx};
-use lunatic_common_api::{audit_log, get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 
 // Register UDP networking APIs to the linker
@@ -18,32 +18,64 @@ pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
     linker: &mut Linker<T>,
 ) -> Result<()> {
     linker.func_wrap6_async("lunatic::networking", "udp_bind", udp_bind)?;
-    linker.func_wrap("lunatic::networking", "udp_local_addr", udp_local_addr)?;
-    linker.func_wrap("lunatic::networking", "udp_peer_addr", udp_peer_addr)?;
-    linker.func_wrap("lunatic::networking", "drop_udp_socket", drop_udp_socket)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "udp_local_addr",
+        |caller: Caller<'_, T>, udp_socket_id: u64, id_u64_ptr: u32| {
+            udp_local_addr(caller, udp_socket_id, id_u64_ptr).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "udp_peer_addr",
+        |caller: Caller<'_, T>, udp_socket_id: u64, id_u64_ptr: u32| {
+            udp_peer_addr(caller, udp_socket_id, id_u64_ptr).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "drop_udp_socket",
+        |caller: Caller<'_, T>, udp_socket_id: u64| {
+            drop_udp_socket(caller, udp_socket_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap4_async("lunatic::networking", "udp_receive", udp_receive)?;
     linker.func_wrap5_async("lunatic::networking", "udp_receive_from", udp_receive_from)?;
     linker.func_wrap8_async("lunatic::networking", "udp_connect", udp_connect)?;
-    linker.func_wrap("lunatic::networking", "clone_udp_socket", clone_udp_socket)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "clone_udp_socket",
+        |caller: Caller<'_, T>, udp_socket_id: u64| {
+            clone_udp_socket(caller, udp_socket_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap(
         "lunatic::networking",
         "set_udp_socket_broadcast",
-        set_udp_socket_broadcast,
+        |caller: Caller<'_, T>, udp_socket_id: u64, broadcast: u32| {
+            set_udp_socket_broadcast(caller, udp_socket_id, broadcast).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap(
         "lunatic::networking",
         "get_udp_socket_broadcast",
-        get_udp_socket_broadcast,
+        |caller: Caller<'_, T>, udp_socket_id: u64| {
+            get_udp_socket_broadcast(caller, udp_socket_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap(
         "lunatic::networking",
         "set_udp_socket_ttl",
-        set_udp_socket_ttl,
+        |caller: Caller<'_, T>, udp_socket_id: u64, ttl: u32| {
+            set_udp_socket_ttl(caller, udp_socket_id, ttl).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap(
         "lunatic::networking",
         "get_udp_socket_ttl",
-        get_udp_socket_ttl,
+        |caller: Caller<'_, T>, udp_socket_id: u64| {
+            get_udp_socket_ttl(caller, udp_socket_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap9_async("lunatic::networking", "udp_send_to", udp_send_to)?;
     linker.func_wrap4_async("lunatic::networking", "udp_send", udp_send)?;

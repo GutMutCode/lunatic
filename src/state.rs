@@ -29,8 +29,8 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::sync::{Mutex, RwLock};
 use tokio_rustls::rustls::{Certificate, PrivateKey};
+use wasi_common::WasiCtx;
 use wasmtime::{Linker, ResourceLimiter};
-use wasmtime_wasi::WasiCtx;
 
 use crate::DefaultProcessConfig;
 use log::warn;
@@ -583,12 +583,22 @@ impl Debug for DefaultProcessState {
 
 // Limit the maximum memory of the process depending on the environment it was spawned in.
 impl ResourceLimiter for DefaultProcessState {
-    fn memory_growing(&mut self, _current: usize, desired: usize, _maximum: Option<usize>) -> bool {
-        desired <= self.config().get_max_memory()
+    fn memory_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.config().get_max_memory())
     }
 
-    fn table_growing(&mut self, _current: u32, desired: u32, _maximum: Option<u32>) -> bool {
-        desired <= self.config().get_max_table_elements()
+    fn table_growing(
+        &mut self,
+        _current: usize,
+        desired: usize,
+        _maximum: Option<usize>,
+    ) -> wasmtime::Result<bool> {
+        Ok(desired <= self.config().get_max_table_elements() as usize)
     }
 
     // Allow one instance per store
@@ -896,7 +906,7 @@ mod tests {
 
         // Create wasmtime runtime
         let mut wasmtime_config = wasmtime::Config::new();
-        wasmtime_config.async_support(true).consume_fuel(true);
+        wasmtime_config.consume_fuel(true);
         let runtime = WasmtimeRuntime::new(&wasmtime_config).unwrap();
 
         let raw_module = wat::parse_file("./wat/all_imports.wat").unwrap();
@@ -991,7 +1001,7 @@ mod tests {
         *connection.write_timeout.lock().await = Some(Duration::from_secs(3));
 
         let mut wasmtime_config = wasmtime::Config::new();
-        wasmtime_config.async_support(true).consume_fuel(true);
+        wasmtime_config.consume_fuel(true);
         let runtime = WasmtimeRuntime::new(&wasmtime_config)?;
         let raw_module = wat::parse_str(r#"(module (memory (export "memory") 1))"#)?;
         let module = Arc::new(runtime.compile_module(raw_module.into())?);
@@ -1060,7 +1070,7 @@ mod tests {
         use tokio::sync::RwLock;
 
         let mut wasmtime_config = wasmtime::Config::new();
-        wasmtime_config.async_support(true).consume_fuel(true);
+        wasmtime_config.consume_fuel(true);
         let runtime = WasmtimeRuntime::new(&wasmtime_config)?;
         let raw_module = wat::parse_str(r#"(module (memory (export "memory") 1))"#)?;
         let module = Arc::new(runtime.compile_module(raw_module.into())?);

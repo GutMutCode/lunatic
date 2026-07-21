@@ -36,7 +36,7 @@ async fn test_table_growing_limit() {
     config.set_max_table_elements(1000);
 
     let mut wasmtime_config = wasmtime::Config::new();
-    wasmtime_config.async_support(true).consume_fuel(true);
+    wasmtime_config.consume_fuel(true);
     let runtime = WasmtimeRuntime::new(&wasmtime_config).unwrap();
 
     let env = Arc::new(lunatic_process::env::LunaticEnvironment::new(0));
@@ -55,15 +55,15 @@ async fn test_table_growing_limit() {
         DefaultProcessState::new(env, None, runtime, module, Arc::new(config), registry).unwrap();
 
     assert!(
-        state.table_growing(0, 999, None),
+        state.table_growing(0, 999, None).unwrap(),
         "Should allow 999 elements"
     );
     assert!(
-        state.table_growing(0, 1000, None),
+        state.table_growing(0, 1000, None).unwrap(),
         "Should allow exactly 1000 elements"
     );
     assert!(
-        !state.table_growing(0, 1001, None),
+        !state.table_growing(0, 1001, None).unwrap(),
         "Should reject 1001 elements"
     );
 }
@@ -79,7 +79,7 @@ async fn test_network_connection_limit() {
     config.set_max_network_connections(3);
 
     let mut wasmtime_config = wasmtime::Config::new();
-    wasmtime_config.async_support(true).consume_fuel(true);
+    wasmtime_config.consume_fuel(true);
     let runtime = WasmtimeRuntime::new(&wasmtime_config).unwrap();
 
     let env = Arc::new(lunatic_process::env::LunaticEnvironment::new(0));

@@ -42,8 +42,7 @@ const COUNTER_V2: &str = r#"
 
 #[tokio::test]
 async fn memory_state_survives_module_replacement() -> Result<()> {
-    let mut config = wasmtime::Config::new();
-    config.async_support(true);
+    let config = wasmtime::Config::new();
 
     let engine = wasmtime::Engine::new(&config)?;
     let module_v1 = wasmtime::Module::new(&engine, COUNTER_V1.as_bytes())?;

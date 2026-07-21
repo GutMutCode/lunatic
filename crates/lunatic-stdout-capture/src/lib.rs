@@ -108,7 +108,7 @@ impl StdoutCapture {
     }
 }
 
-#[wiggle::async_trait]
+#[async_trait::async_trait]
 impl WasiFile for StdoutCapture {
     fn as_any(&self) -> &dyn Any {
         self
@@ -144,9 +144,6 @@ impl WasiFile for StdoutCapture {
         Err(Error::badf())
     }
     async fn advise(&self, _offset: u64, _len: u64, _advice: Advice) -> Result<(), Error> {
-        Err(Error::badf())
-    }
-    async fn allocate(&self, _offset: u64, _len: u64) -> Result<(), Error> {
         Err(Error::badf())
     }
     async fn read_vectored<'a>(&self, _bufs: &mut [IoSliceMut<'a>]) -> Result<u64, Error> {

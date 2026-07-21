@@ -1,6 +1,6 @@
 use anyhow::Result;
 use hash_map_id::HashMapId;
-use lunatic_common_api::{get_memory, write_to_guest_vec, IntoTrap};
+use lunatic_common_api::{get_memory, write_to_guest_vec, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::state::ProcessState;
 use lunatic_process_api::ProcessConfigCtx;
@@ -11,7 +11,7 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
-use wasmtime::{Caller, Linker, ResourceLimiter};
+use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _};
 
 use crate::wire_format::{BindList, SqliteError, SqliteRow, SqliteValue};
 
@@ -42,19 +42,73 @@ pub fn register<T: SQLiteCtx + ProcessState + Send + ErrorCtx + ResourceLimiter 
 where
     T::Config: lunatic_process_api::ProcessConfigCtx,
 {
-    linker.func_wrap("lunatic::sqlite", "open", open)?;
-    linker.func_wrap("lunatic::sqlite", "query_prepare", query_prepare)?;
-    linker.func_wrap("lunatic::sqlite", "execute", execute)?;
-    linker.func_wrap("lunatic::sqlite", "bind_value", bind_value)?;
-    linker.func_wrap("lunatic::sqlite", "sqlite3_changes", sqlite3_changes)?;
-    linker.func_wrap("lunatic::sqlite", "statement_reset", statement_reset)?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "open",
+        |caller: Caller<'_, T>, path_str_ptr: u32, path_str_len: u32, connection_id_ptr: u32| {
+            open(caller, path_str_ptr, path_str_len, connection_id_ptr).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "query_prepare",
+        |caller: Caller<'_, T>, connection_id: u64, query_ptr: u32, query_len: u32| {
+            query_prepare(caller, connection_id, query_ptr, query_len).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "execute",
+        |caller: Caller<'_, T>, connection_id: u64, query_ptr: u32, query_len: u32| {
+            execute(caller, connection_id, query_ptr, query_len).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "bind_value",
+        |caller: Caller<'_, T>, statement_id: u64, bind_ptr: u32, bind_len: u32| {
+            bind_value(caller, statement_id, bind_ptr, bind_len).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "sqlite3_changes",
+        |caller: Caller<'_, T>, connection_id: u64| {
+            sqlite3_changes(caller, connection_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "statement_reset",
+        |caller: Caller<'_, T>, statement_id: u64| {
+            statement_reset(caller, statement_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap2_async("lunatic::sqlite", "last_error", last_error)?;
-    linker.func_wrap("lunatic::sqlite", "sqlite3_finalize", sqlite3_finalize)?;
-    linker.func_wrap("lunatic::sqlite", "sqlite3_step", sqlite3_step)?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "sqlite3_finalize",
+        |caller: Caller<'_, T>, statement_id: u64| {
+            sqlite3_finalize(caller, statement_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "sqlite3_step",
+        |caller: Caller<'_, T>, statement_id: u64| {
+            sqlite3_step(caller, statement_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap3_async("lunatic::sqlite", "read_column", read_column)?;
     linker.func_wrap2_async("lunatic::sqlite", "column_names", column_names)?;
     linker.func_wrap2_async("lunatic::sqlite", "read_row", read_row)?;
-    linker.func_wrap("lunatic::sqlite", "column_count", column_count)?;
+    linker.func_wrap(
+        "lunatic::sqlite",
+        "column_count",
+        |caller: Caller<'_, T>, statement_id: u64| {
+            column_count(caller, statement_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap3_async("lunatic::sqlite", "column_name", column_name)?;
     Ok(())
 }

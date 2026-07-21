@@ -24,7 +24,7 @@ fn test_module_source() -> Vec<u8> {
 #[tokio::test]
 async fn instance_pool_reports_hit_rate() {
     let mut wasmtime_config = default_config();
-    wasmtime_config.async_support(true).consume_fuel(true);
+    wasmtime_config.consume_fuel(true);
     let runtime = WasmtimeRuntime::new(&wasmtime_config).expect("runtime");
 
     let module_source = test_module_source();

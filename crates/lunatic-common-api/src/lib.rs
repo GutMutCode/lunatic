@@ -1,7 +1,168 @@
 use anyhow::{anyhow, Context, Result};
 use log::info;
 use std::{fmt::Display, future::Future, io::Write, pin::Pin};
-use wasmtime::{Caller, Memory, Val};
+use wasmtime::{Caller, Linker, Memory, ToWasmtimeResult as _, Val, WasmRet, WasmTy};
+
+/// Compatibility helpers for Lunatic's legacy numbered async linker calls.
+///
+/// New Wasmtime releases accept all WebAssembly parameters as one tuple via
+/// `Linker::func_wrap_async`. Lunatic's host APIs still use the older,
+/// arity-specific callback shape, so these methods keep the migration local
+/// while delegating directly to the supported tuple-based API.
+macro_rules! declare_linker_async_wrapper {
+    ($name:ident, $($ty:ident),+ $(,)?) => {
+        fn $name<$($ty,)+ R>(
+            &mut self,
+            module: &str,
+            name: &str,
+            func: impl for<'a> Fn(Caller<'a, T>, $($ty),+) -> Box<dyn Future<Output = Result<R>> + Send + 'a>
+            + Send
+            + Sync
+            + 'static,
+        ) -> wasmtime::Result<&mut Self>
+        where
+            $($ty: WasmTy,)+
+            R: WasmRet + 'static;
+    };
+}
+
+pub trait LinkerAsyncExt<T: Send + 'static> {
+    declare_linker_async_wrapper!(func_wrap1_async, A1);
+    declare_linker_async_wrapper!(func_wrap2_async, A1, A2);
+    declare_linker_async_wrapper!(func_wrap3_async, A1, A2, A3);
+    declare_linker_async_wrapper!(func_wrap4_async, A1, A2, A3, A4);
+    declare_linker_async_wrapper!(func_wrap5_async, A1, A2, A3, A4, A5);
+    declare_linker_async_wrapper!(func_wrap6_async, A1, A2, A3, A4, A5, A6);
+    declare_linker_async_wrapper!(func_wrap7_async, A1, A2, A3, A4, A5, A6, A7);
+    declare_linker_async_wrapper!(func_wrap8_async, A1, A2, A3, A4, A5, A6, A7, A8);
+    declare_linker_async_wrapper!(func_wrap9_async, A1, A2, A3, A4, A5, A6, A7, A8, A9);
+    declare_linker_async_wrapper!(func_wrap10_async, A1, A2, A3, A4, A5, A6, A7, A8, A9, A10);
+    declare_linker_async_wrapper!(
+        func_wrap11_async,
+        A1,
+        A2,
+        A3,
+        A4,
+        A5,
+        A6,
+        A7,
+        A8,
+        A9,
+        A10,
+        A11
+    );
+}
+
+macro_rules! implement_linker_async_wrapper {
+    ($name:ident, $(($ty:ident, $arg:ident)),+ $(,)?) => {
+        fn $name<$($ty,)+ R>(
+            &mut self,
+            module: &str,
+            name: &str,
+            func: impl for<'a> Fn(Caller<'a, T>, $($ty),+) -> Box<dyn Future<Output = Result<R>> + Send + 'a>
+            + Send
+            + Sync
+            + 'static,
+        ) -> wasmtime::Result<&mut Self>
+        where
+            $($ty: WasmTy,)+
+            R: WasmRet + 'static,
+        {
+            self.func_wrap_async(
+                module,
+                name,
+                move |caller, ($($arg,)+): ($($ty,)+)| {
+                    let future = Box::into_pin(func(caller, $($arg),+));
+                    Box::new(async move { future.await.to_wasmtime_result() })
+                },
+            )
+        }
+    };
+}
+
+impl<T: Send + 'static> LinkerAsyncExt<T> for Linker<T> {
+    implement_linker_async_wrapper!(func_wrap1_async, (A1, a1));
+    implement_linker_async_wrapper!(func_wrap2_async, (A1, a1), (A2, a2));
+    implement_linker_async_wrapper!(func_wrap3_async, (A1, a1), (A2, a2), (A3, a3));
+    implement_linker_async_wrapper!(func_wrap4_async, (A1, a1), (A2, a2), (A3, a3), (A4, a4));
+    implement_linker_async_wrapper!(
+        func_wrap5_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5)
+    );
+    implement_linker_async_wrapper!(
+        func_wrap6_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5),
+        (A6, a6)
+    );
+    implement_linker_async_wrapper!(
+        func_wrap7_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5),
+        (A6, a6),
+        (A7, a7)
+    );
+    implement_linker_async_wrapper!(
+        func_wrap8_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5),
+        (A6, a6),
+        (A7, a7),
+        (A8, a8)
+    );
+    implement_linker_async_wrapper!(
+        func_wrap9_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5),
+        (A6, a6),
+        (A7, a7),
+        (A8, a8),
+        (A9, a9)
+    );
+    implement_linker_async_wrapper!(
+        func_wrap10_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5),
+        (A6, a6),
+        (A7, a7),
+        (A8, a8),
+        (A9, a9),
+        (A10, a10)
+    );
+    implement_linker_async_wrapper!(
+        func_wrap11_async,
+        (A1, a1),
+        (A2, a2),
+        (A3, a3),
+        (A4, a4),
+        (A5, a5),
+        (A6, a6),
+        (A7, a7),
+        (A8, a8),
+        (A9, a9),
+        (A10, a10),
+        (A11, a11)
+    );
+}
 
 const ALLOCATOR_FUNCTION_NAME: &str = "lunatic_alloc";
 const FREEING_FUNCTION_NAME: &str = "lunatic_free";

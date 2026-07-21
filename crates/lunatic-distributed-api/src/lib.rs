@@ -2,7 +2,7 @@ use std::{future::Future, sync::Arc, time::Duration};
 
 use anyhow::{anyhow, Result};
 use asn1_rs::ToDer;
-use lunatic_common_api::{audit_log, get_memory, write_to_guest_vec, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, write_to_guest_vec, IntoTrap, LinkerAsyncExt};
 use lunatic_distributed::{
     distributed::{
         self,
@@ -20,7 +20,7 @@ use lunatic_process::{
 use lunatic_process_api::ProcessCtx;
 use rcgen::{Certificate, CertificateParams, CertificateSigningRequest, CustomExtension, KeyPair};
 use tokio::time::timeout;
-use wasmtime::{Caller, Linker, ResourceLimiter};
+use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _};
 
 // Register the lunatic distributed APIs to the linker
 pub fn register<T, E>(linker: &mut Linker<T>) -> Result<()>
@@ -30,7 +30,13 @@ where
     for<'a> &'a T: Send,
 {
     linker.func_wrap("lunatic::distributed", "nodes_count", nodes_count)?;
-    linker.func_wrap("lunatic::distributed", "get_nodes", get_nodes)?;
+    linker.func_wrap(
+        "lunatic::distributed",
+        "get_nodes",
+        |caller: Caller<T>, nodes_ptr: u32, nodes_len: u32| {
+            get_nodes::<T, E>(caller, nodes_ptr, nodes_len).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap("lunatic::distributed", "node_id", node_id)?;
     linker.func_wrap("lunatic::distributed", "module_id", module_id)?;
     linker.func_wrap8_async("lunatic::distributed", "spawn", spawn)?;
@@ -48,7 +54,10 @@ where
     linker.func_wrap(
         "lunatic::distributed",
         "copy_lookup_nodes_results",
-        copy_lookup_nodes_results,
+        |caller: Caller<T>, query_id: u64, nodes_ptr: u32, nodes_len: u32, error_ptr: u32| {
+            copy_lookup_nodes_results::<T, E>(caller, query_id, nodes_ptr, nodes_len, error_ptr)
+                .to_wasmtime_result()
+        },
     )?;
     linker.func_wrap1_async("lunatic::distributed", "test_root_cert", test_root_cert)?;
     linker.func_wrap5_async(

@@ -90,9 +90,9 @@ delegation.
 ## Errors and Audit Records
 
 For ABI compatibility, `compile_module` and `create_config` return `-1` when
-the caller lacks the corresponding capability. Valid capability denials do not
-cross a Wasmtime host-trap boundary: Wasmtime 8 can abort the Windows process
-when a host error unwinds through its async fiber.
+the caller lacks the corresponding capability. Valid capability denials remain
+guest-visible status values and do not cross a Wasmtime host-trap boundary, so
+policy failures never depend on host-error unwinding behavior.
 
 New guests should use `lunatic::process::config_set_checked(config_id,
 setting_id, value)`. It returns `-1` on success or a guest-readable

@@ -58,7 +58,7 @@ impl WasmtimeRuntime {
     /// Compiles a wasm module to machine code and performs type-checking on host functions.
     pub fn compile_module<T>(&self, data: RawWasm) -> Result<WasmtimeCompiledModule<T>>
     where
-        T: ProcessState,
+        T: ProcessState + 'static,
     {
         let module = wasmtime::Module::new(&self.engine, data.as_slice())?;
         let mut linker = wasmtime::Linker::new(&self.engine);
@@ -75,22 +75,20 @@ impl WasmtimeRuntime {
         state: T,
     ) -> Result<WasmtimeInstance<T>>
     where
-        T: ProcessState + Send + ResourceLimiter,
+        T: ProcessState + Send + ResourceLimiter + 'static,
     {
         let max_fuel = state.config().get_max_fuel();
         let mut store = wasmtime::Store::new(&self.engine, state);
         // Set limits of the store
         store.limiter(|state| state);
-        // Trap if out of fuel
-        store.out_of_fuel_trap();
-        // Define maximum fuel
-        match max_fuel {
-            Some(max_fuel) => {
-                store.out_of_fuel_async_yield(max_fuel, UNIT_OF_COMPUTE_IN_INSTRUCTIONS)
-            }
-            // If no limit is specified use maximum
-            None => store.out_of_fuel_async_yield(u64::MAX, UNIT_OF_COMPUTE_IN_INSTRUCTIONS),
-        };
+        // Modern Wasmtime stores start with zero fuel and trap when it is
+        // exhausted. Preserve Lunatic's unit-based quota and cooperative yield
+        // interval using the supported fuel APIs.
+        let fuel = max_fuel
+            .map(|max_fuel| max_fuel.saturating_mul(UNIT_OF_COMPUTE_IN_INSTRUCTIONS))
+            .unwrap_or(u64::MAX);
+        store.set_fuel(fuel)?;
+        store.fuel_async_yield_interval(Some(UNIT_OF_COMPUTE_IN_INSTRUCTIONS))?;
         // Set epoch deadline for preemptive hot reload (every 1 epoch tick)
         store.set_epoch_deadline(1);
 
@@ -168,7 +166,7 @@ impl<T> Clone for WasmtimeCompiledModule<T> {
 
 pub struct WasmtimeInstance<T>
 where
-    T: Send,
+    T: Send + 'static,
 {
     store: wasmtime::Store<T>,
     instance: wasmtime::Instance,
@@ -176,7 +174,7 @@ where
 
 impl<T> WasmtimeInstance<T>
 where
-    T: Send,
+    T: Send + 'static,
 {
     /// Get the current process state from the instance
     pub fn state(&self) -> &T {
@@ -209,8 +207,8 @@ where
                 Ok(()) => ResultValue::Ok,
                 Err(err) => {
                     // If the trap is a result of calling `proc_exit(0)`, treat it as an no-error finish.
-                    match err.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                        Some(wasmtime_wasi::I32Exit(0)) => ResultValue::Ok,
+                    match err.downcast_ref::<wasi_common::I32Exit>() {
+                        Some(wasi_common::I32Exit(0)) => ResultValue::Ok,
                         _ => ResultValue::Failed(err.to_string()),
                     }
                 }
@@ -299,8 +297,16 @@ where
 
 pub fn default_config() -> wasmtime::Config {
     let mut config = wasmtime::Config::new();
+    // Preserve the WebAssembly feature surface that Wasmtime 8 exposed by
+    // default instead of implicitly widening guest capabilities on upgrade.
     config
-        .async_support(true)
+        .wasm_threads(false)
+        .wasm_relaxed_simd(false)
+        .wasm_memory64(false)
+        .wasm_extended_const(false)
+        .wasm_tail_call(false)
+        .wasm_component_model(false);
+    config
         .debug_info(false)
         .consume_fuel(true)
         .epoch_interruption(true)
@@ -308,8 +314,9 @@ pub fn default_config() -> wasmtime::Config {
         .wasm_bulk_memory(true)
         .wasm_multi_value(true)
         .wasm_multi_memory(true)
+        .wasm_simd(true)
         .cranelift_opt_level(wasmtime::OptLevel::SpeedAndSize)
         .allocation_strategy(wasmtime::InstanceAllocationStrategy::pooling())
-        .static_memory_forced(true);
+        .memory_may_move(false);
     config
 }

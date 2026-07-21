@@ -10,9 +10,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
-use lunatic_common_api::{audit_log, get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 
 use crate::dns::DnsIterator;
@@ -26,14 +26,34 @@ pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
     linker.func_wrap(
         "lunatic::networking",
         "drop_tcp_listener",
-        drop_tcp_listener,
+        |caller: Caller<'_, T>, tcp_listener_id: u64| {
+            drop_tcp_listener(caller, tcp_listener_id).to_wasmtime_result()
+        },
     )?;
-    linker.func_wrap("lunatic::networking", "tcp_local_addr", tcp_local_addr)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "tcp_local_addr",
+        |caller: Caller<'_, T>, tcp_listener_id: u64, id_u64_ptr: u32| {
+            tcp_local_addr(caller, tcp_listener_id, id_u64_ptr).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap3_async("lunatic::networking", "tcp_accept", tcp_accept)?;
     linker.func_wrap7_async("lunatic::networking", "tcp_connect", tcp_connect)?;
     linker.func_wrap2_async("lunatic::networking", "tcp_peer_addr", tcp_peer_addr)?;
-    linker.func_wrap("lunatic::networking", "drop_tcp_stream", drop_tcp_stream)?;
-    linker.func_wrap("lunatic::networking", "clone_tcp_stream", clone_tcp_stream)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "drop_tcp_stream",
+        |caller: Caller<'_, T>, tcp_stream_id: u64| {
+            drop_tcp_stream(caller, tcp_stream_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "clone_tcp_stream",
+        |caller: Caller<'_, T>, tcp_stream_id: u64| {
+            clone_tcp_stream(caller, tcp_stream_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap4_async(
         "lunatic::networking",
         "tcp_write_vectored",

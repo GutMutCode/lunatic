@@ -5,9 +5,9 @@ use std::vec::IntoIter;
 
 use anyhow::Result;
 use tokio::time::timeout;
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
-use lunatic_common_api::{get_memory, IntoTrap};
+use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 
 use crate::NetworkingCtx;
@@ -38,9 +38,32 @@ pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
     linker.func_wrap(
         "lunatic::networking",
         "drop_dns_iterator",
-        drop_dns_iterator,
+        |caller: Caller<'_, T>, dns_iter_id: u64| {
+            drop_dns_iterator(caller, dns_iter_id).to_wasmtime_result()
+        },
     )?;
-    linker.func_wrap("lunatic::networking", "resolve_next", resolve_next)?;
+    linker.func_wrap(
+        "lunatic::networking",
+        "resolve_next",
+        |caller: Caller<'_, T>,
+         dns_iter_id: u64,
+         addr_type_u32_ptr: u32,
+         addr_u8_ptr: u32,
+         port_u16_ptr: u32,
+         flow_info_u32_ptr: u32,
+         scope_id_u32_ptr: u32| {
+            resolve_next(
+                caller,
+                dns_iter_id,
+                addr_type_u32_ptr,
+                addr_u8_ptr,
+                port_u16_ptr,
+                flow_info_u32_ptr,
+                scope_id_u32_ptr,
+            )
+            .to_wasmtime_result()
+        },
+    )?;
     Ok(())
 }
 

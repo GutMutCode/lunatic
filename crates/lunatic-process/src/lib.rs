@@ -141,13 +141,13 @@ where
 }
 
 /// Context for managing process execution and hot reload state
-pub struct ProcessContext<S: Send> {
+pub struct ProcessContext<S: Send + 'static> {
     pub instance: Arc<RwLock<Option<crate::runtimes::wasmtime::WasmtimeInstance<S>>>>,
     pub reload_in_progress: Arc<AtomicBool>,
     pub pending_reload: Arc<std::sync::Mutex<Option<(u64, u32)>>>,
 }
 
-impl<S: Send> ProcessContext<S> {
+impl<S: Send + 'static> ProcessContext<S> {
     pub fn new(instance: crate::runtimes::wasmtime::WasmtimeInstance<S>) -> Self {
         Self {
             instance: Arc::new(RwLock::new(Some(instance))),

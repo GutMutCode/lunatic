@@ -5,11 +5,11 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use lunatic_common_api::{get_memory, IntoTrap};
+use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_networking_api::NetworkingCtx;
 use lunatic_process_api::ProcessCtx;
 use tokio::time::{timeout, Duration};
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 use lunatic_process::{
     message::{DataMessage, Message},
@@ -22,27 +22,85 @@ pub fn register<T: ProcessState + ProcessCtx<T> + NetworkingCtx + Send + 'static
     linker: &mut Linker<T>,
 ) -> Result<()> {
     linker.func_wrap("lunatic::message", "create_data", create_data)?;
-    linker.func_wrap("lunatic::message", "write_data", write_data)?;
-    linker.func_wrap("lunatic::message", "read_data", read_data)?;
-    linker.func_wrap("lunatic::message", "seek_data", seek_data)?;
-    linker.func_wrap("lunatic::message", "get_tag", get_tag)?;
-    linker.func_wrap("lunatic::message", "get_process_id", get_process_id)?;
-    linker.func_wrap("lunatic::message", "data_size", data_size)?;
-    linker.func_wrap("lunatic::message", "push_module", push_module)?;
-    linker.func_wrap("lunatic::message", "take_module", take_module)?;
-    linker.func_wrap("lunatic::message", "push_tcp_stream", push_tcp_stream)?;
-    linker.func_wrap("lunatic::message", "take_tcp_stream", take_tcp_stream)?;
-    linker.func_wrap("lunatic::message", "push_tls_stream", push_tls_stream)?;
-    linker.func_wrap("lunatic::message", "take_tls_stream", take_tls_stream)?;
-    linker.func_wrap("lunatic::message", "send", send)?;
+    linker.func_wrap(
+        "lunatic::message",
+        "write_data",
+        |caller: Caller<T>, data_ptr: u32, data_len: u32| {
+            write_data(caller, data_ptr, data_len).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "read_data",
+        |caller: Caller<T>, data_ptr: u32, data_len: u32| {
+            read_data(caller, data_ptr, data_len).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "seek_data",
+        |caller: Caller<T>, index: u64| seek_data(caller, index).to_wasmtime_result(),
+    )?;
+    linker.func_wrap("lunatic::message", "get_tag", |caller: Caller<T>| {
+        get_tag(caller).to_wasmtime_result()
+    })?;
+    linker.func_wrap("lunatic::message", "get_process_id", |caller: Caller<T>| {
+        get_process_id(caller).to_wasmtime_result()
+    })?;
+    linker.func_wrap("lunatic::message", "data_size", |caller: Caller<T>| {
+        data_size(caller).to_wasmtime_result()
+    })?;
+    linker.func_wrap(
+        "lunatic::message",
+        "push_module",
+        |caller: Caller<T>, module_id: u64| push_module(caller, module_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "take_module",
+        |caller: Caller<T>, index: u64| take_module(caller, index).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "push_tcp_stream",
+        |caller: Caller<T>, stream_id: u64| push_tcp_stream(caller, stream_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "take_tcp_stream",
+        |caller: Caller<T>, index: u64| take_tcp_stream(caller, index).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "push_tls_stream",
+        |caller: Caller<T>, stream_id: u64| push_tls_stream(caller, stream_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "take_tls_stream",
+        |caller: Caller<T>, index: u64| take_tls_stream(caller, index).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "send",
+        |caller: Caller<T>, process_id: u64| send(caller, process_id).to_wasmtime_result(),
+    )?;
     linker.func_wrap3_async(
         "lunatic::message",
         "send_receive_skip_search",
         send_receive_skip_search,
     )?;
     linker.func_wrap3_async("lunatic::message", "receive", receive)?;
-    linker.func_wrap("lunatic::message", "push_udp_socket", push_udp_socket)?;
-    linker.func_wrap("lunatic::message", "take_udp_socket", take_udp_socket)?;
+    linker.func_wrap(
+        "lunatic::message",
+        "push_udp_socket",
+        |caller: Caller<T>, socket_id: u64| push_udp_socket(caller, socket_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::message",
+        "take_udp_socket",
+        |caller: Caller<T>, index: u64| take_udp_socket(caller, index).to_wasmtime_result(),
+    )?;
 
     Ok(())
 }

@@ -1,16 +1,52 @@
 use anyhow::Result;
 use lunatic_common_api::{get_memory, IntoTrap};
 use metrics::{counter, decrement_gauge, gauge, histogram, increment_counter, increment_gauge};
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 /// Links the [Metrics](https://crates.io/crates/metrics) APIs
 pub fn register<T: 'static>(linker: &mut Linker<T>) -> anyhow::Result<()> {
-    linker.func_wrap("lunatic::metrics", "counter", counter)?;
-    linker.func_wrap("lunatic::metrics", "increment_counter", increment_counter)?;
-    linker.func_wrap("lunatic::metrics", "gauge", gauge)?;
-    linker.func_wrap("lunatic::metrics", "increment_gauge", increment_gauge)?;
-    linker.func_wrap("lunatic::metrics", "decrement_gauge", decrement_gauge)?;
-    linker.func_wrap("lunatic::metrics", "histogram", histogram)?;
+    linker.func_wrap(
+        "lunatic::metrics",
+        "counter",
+        |caller: Caller<'_, T>, name_str_ptr: u32, name_str_len: u32, value: u64| {
+            counter(caller, name_str_ptr, name_str_len, value).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::metrics",
+        "increment_counter",
+        |caller: Caller<'_, T>, name_str_ptr: u32, name_str_len: u32| {
+            increment_counter(caller, name_str_ptr, name_str_len).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::metrics",
+        "gauge",
+        |caller: Caller<'_, T>, name_str_ptr: u32, name_str_len: u32, value: f64| {
+            gauge(caller, name_str_ptr, name_str_len, value).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::metrics",
+        "increment_gauge",
+        |caller: Caller<'_, T>, name_str_ptr: u32, name_str_len: u32, value: f64| {
+            increment_gauge(caller, name_str_ptr, name_str_len, value).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::metrics",
+        "decrement_gauge",
+        |caller: Caller<'_, T>, name_str_ptr: u32, name_str_len: u32, value: f64| {
+            decrement_gauge(caller, name_str_ptr, name_str_len, value).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::metrics",
+        "histogram",
+        |caller: Caller<'_, T>, name_str_ptr: u32, name_str_len: u32, value: f64| {
+            histogram(caller, name_str_ptr, name_str_len, value).to_wasmtime_result()
+        },
+    )?;
     Ok(())
 }
 

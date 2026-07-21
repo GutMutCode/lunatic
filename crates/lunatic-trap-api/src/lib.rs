@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use anyhow::Result;
-use lunatic_common_api::IntoTrap;
+use lunatic_common_api::{IntoTrap, LinkerAsyncExt};
 use wasmtime::{Caller, Linker, Val};
 
 // Register the trap APIs to the linker

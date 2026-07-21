@@ -13,7 +13,7 @@ use crate::state::ProcessState;
 
 struct PooledInstance<S>
 where
-    S: Send,
+    S: Send + 'static,
 {
     instance: WasmtimeInstance<S>,
     last_used: Instant,
@@ -66,7 +66,7 @@ fn record_gauge(_name: &'static str, _value: f64) {}
 
 pub struct InstancePool<S>
 where
-    S: ProcessState + Send,
+    S: ProcessState + Send + 'static,
 {
     pool: Arc<Mutex<VecDeque<PooledInstance<S>>>>,
     module: Arc<WasmtimeCompiledModule<S>>,
@@ -213,7 +213,7 @@ where
 
 impl<S> Clone for InstancePool<S>
 where
-    S: ProcessState + Send,
+    S: ProcessState + Send + 'static,
 {
     fn clone(&self) -> Self {
         Self {

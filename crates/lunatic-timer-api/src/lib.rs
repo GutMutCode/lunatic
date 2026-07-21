@@ -7,11 +7,11 @@ use std::{
 
 use anyhow::Result;
 use hash_map_id::HashMapId;
-use lunatic_common_api::IntoTrap;
+use lunatic_common_api::{IntoTrap, LinkerAsyncExt};
 use lunatic_process::{state::ProcessState, Signal};
 use lunatic_process_api::ProcessCtx;
 use tokio::task::JoinHandle;
-use wasmtime::{Caller, Linker};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 #[derive(Debug)]
 struct HeapValue {
@@ -87,7 +87,13 @@ pub trait TimerCtx {
 pub fn register<T: ProcessState + ProcessCtx<T> + TimerCtx + Send + 'static>(
     linker: &mut Linker<T>,
 ) -> Result<()> {
-    linker.func_wrap("lunatic::timer", "send_after", send_after)?;
+    linker.func_wrap(
+        "lunatic::timer",
+        "send_after",
+        |caller: Caller<'_, T>, process_id: u64, duration: u64| {
+            send_after(caller, process_id, duration).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap1_async("lunatic::timer", "cancel_timer", cancel_timer)?;
 
     #[cfg(feature = "metrics")]

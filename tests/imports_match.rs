@@ -10,7 +10,7 @@ use lunatic_runtime::DefaultProcessConfig;
 use tokio::sync::RwLock;
 use wasmtime::{AsContext, Extern, Linker, Store, ValType};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 struct FuncSig {
     params: Vec<ValType>,
     results: Vec<ValType>,
@@ -26,15 +26,16 @@ fn func_sig_from_extern_type(ext: &wasmtime::ExternType) -> FuncSig {
     }
 }
 
-fn val_type_to_str(value: ValType) -> &'static str {
+fn val_type_to_str(value: &ValType) -> String {
     match value {
-        ValType::I32 => "i32",
-        ValType::I64 => "i64",
-        ValType::F32 => "f32",
-        ValType::F64 => "f64",
-        ValType::V128 => "v128",
-        ValType::ExternRef => "externref",
-        ValType::FuncRef => "funcref",
+        ValType::I32 => "i32".to_string(),
+        ValType::I64 => "i64".to_string(),
+        ValType::F32 => "f32".to_string(),
+        ValType::F64 => "f64".to_string(),
+        ValType::V128 => "v128".to_string(),
+        ValType::Ref(_) if ValType::eq(value, &ValType::EXTERNREF) => "externref".to_string(),
+        ValType::Ref(_) if ValType::eq(value, &ValType::FUNCREF) => "funcref".to_string(),
+        ValType::Ref(_) => value.to_string(),
     }
 }
 
@@ -44,7 +45,7 @@ fn format_func_sig(sig: &FuncSig) -> String {
         let params = sig
             .params
             .iter()
-            .map(|&ty| val_type_to_str(ty))
+            .map(val_type_to_str)
             .collect::<Vec<_>>()
             .join(" ");
         parts.push(format!("(param {})", params));
@@ -53,7 +54,7 @@ fn format_func_sig(sig: &FuncSig) -> String {
         let results = sig
             .results
             .iter()
-            .map(|&ty| val_type_to_str(ty))
+            .map(val_type_to_str)
             .collect::<Vec<_>>()
             .join(" ");
         parts.push(format!("(result {})", results));

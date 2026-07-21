@@ -3,8 +3,11 @@ use lunatic_common_api::{audit_log, get_memory, IntoTrap};
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::{config::ProcessConfig, state::ProcessState};
 use lunatic_stdout_capture::StdoutCapture;
-use wasmtime::{Caller, Linker};
-use wasmtime_wasi::{ambient_authority, Dir, WasiCtx, WasiCtxBuilder};
+use wasi_common::{
+    sync::{ambient_authority, Dir, WasiCtxBuilder},
+    WasiCtx,
+};
+use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 /// Create a `WasiCtx` from configuration settings.
 pub fn build_wasi(
@@ -12,16 +15,17 @@ pub fn build_wasi(
     envs: Option<&Vec<(String, String)>>,
     dirs: &[(String, String)],
 ) -> Result<WasiCtx> {
-    let mut wasi = WasiCtxBuilder::new().inherit_stdio();
+    let mut wasi = WasiCtxBuilder::new();
+    wasi.inherit_stdio();
     if let Some(envs) = envs {
-        wasi = wasi.envs(envs)?;
+        wasi.envs(envs)?;
     }
     if let Some(args) = args {
-        wasi = wasi.args(args)?;
+        wasi.args(args)?;
     }
     for (preopen_dir_path, resolved_path) in dirs {
         let preopen_dir = Dir::open_ambient_dir(resolved_path, ambient_authority())?;
-        wasi = wasi.preopened_dir(preopen_dir, preopen_dir_path)?;
+        wasi.preopened_dir(preopen_dir, preopen_dir_path)?;
     }
     Ok(wasi.build())
 }
@@ -48,21 +52,31 @@ where
     T::Config: LunaticWasiConfigCtx,
 {
     // Register all wasi host functions
-    wasmtime_wasi::sync::snapshots::preview_1::add_wasi_snapshot_preview1_to_linker(
-        linker,
-        |ctx| ctx.wasi_mut(),
-    )?;
+    wasi_common::sync::snapshots::preview_1::add_wasi_snapshot_preview1_to_linker(linker, |ctx| {
+        ctx.wasi_mut()
+    })?;
 
     // Register host functions to configure wasi
     linker.func_wrap(
         "lunatic::wasi",
         "config_add_environment_variable",
-        add_environment_variable,
+        |caller: Caller<'_, T>,
+         config_id: u64,
+         key_ptr: u32,
+         key_len: u32,
+         value_ptr: u32,
+         value_len: u32| {
+            add_environment_variable(caller, config_id, key_ptr, key_len, value_ptr, value_len)
+                .to_wasmtime_result()
+        },
     )?;
     linker.func_wrap(
         "lunatic::wasi",
         "config_add_command_line_argument",
-        add_command_line_argument,
+        |caller: Caller<'_, T>, config_id: u64, argument_ptr: u32, argument_len: u32| {
+            add_command_line_argument(caller, config_id, argument_ptr, argument_len)
+                .to_wasmtime_result()
+        },
     )?;
     linker.func_wrap("lunatic::wasi", "config_preopen_dir", preopen_dir)?;
     Ok(())

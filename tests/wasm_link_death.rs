@@ -336,7 +336,6 @@ async fn run_wasm_case(
     expected_reason: DeathReason,
     link_tag: i64,
 ) -> Result<Option<DefaultProcessState>> {
-    eprintln!("wasm lifecycle case `{function}`: starting");
     let recorder = harness.recorder();
     let observer: Arc<dyn Process> = recorder.clone();
     let mut params = vec![Val::I64(recorder.id() as i64)];
@@ -382,7 +381,6 @@ async fn run_wasm_case(
         harness.environment.get_process(process_id).is_none(),
         "terminated process must be removed from the environment"
     );
-    eprintln!("wasm lifecycle case `{function}`: completed");
     Ok(state)
 }
 

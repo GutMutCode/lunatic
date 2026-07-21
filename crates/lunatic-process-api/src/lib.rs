@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use hash_map_id::HashMapId;
-use lunatic_common_api::{audit_log, get_memory, IntoTrap};
+use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_distributed::DistributedCtx;
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::{
@@ -22,7 +22,7 @@ use lunatic_process::{
     DeathReason, Process, Signal, WasmProcess,
 };
 use lunatic_wasi_api::LunaticWasiCtx;
-use wasmtime::{Caller, Linker, ResourceLimiter, Val};
+use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _, Val};
 
 pub type ProcessResources = HashMapId<Arc<dyn Process>>;
 pub type ModuleResources<S> = HashMapId<Arc<WasmtimeCompiledModule<S>>>;
@@ -104,8 +104,18 @@ where
         "Duration of module compilation"
     );
 
-    linker.func_wrap("lunatic::process", "compile_module", compile_module)?;
-    linker.func_wrap("lunatic::process", "drop_module", drop_module)?;
+    linker.func_wrap(
+        "lunatic::process",
+        "compile_module",
+        |caller: Caller<T>, module_data_ptr: u32, module_data_len: u32, id_ptr: u32| {
+            compile_module(caller, module_data_ptr, module_data_len, id_ptr).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "drop_module",
+        |caller: Caller<T>, module_id: u64| drop_module(caller, module_id).to_wasmtime_result(),
+    )?;
 
     #[cfg(feature = "metrics")]
     metrics::describe_counter!(
@@ -129,7 +139,11 @@ where
     );
 
     linker.func_wrap("lunatic::process", "create_config", create_config)?;
-    linker.func_wrap("lunatic::process", "drop_config", drop_config)?;
+    linker.func_wrap(
+        "lunatic::process",
+        "drop_config",
+        |caller: Caller<T>, config_id: u64| drop_config(caller, config_id).to_wasmtime_result(),
+    )?;
     linker.func_wrap2_async(
         "lunatic::process",
         "config_set_max_memory",
@@ -138,7 +152,9 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_get_max_memory",
-        config_get_max_memory,
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_memory(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -148,7 +164,9 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_get_max_fuel",
-        config_get_max_fuel,
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_fuel(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -158,7 +176,9 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_get_max_table_elements",
-        config_get_max_table_elements,
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_table_elements(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -168,7 +188,9 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_get_max_file_descriptors",
-        config_get_max_file_descriptors,
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_file_descriptors(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -178,13 +200,17 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_get_max_network_connections",
-        config_get_max_network_connections,
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_network_connections(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap("lunatic::process", "config_set_checked", config_set_checked)?;
     linker.func_wrap(
         "lunatic::process",
         "config_can_compile_modules",
-        config_can_compile_modules,
+        |caller: Caller<T>, config_id: u64| {
+            config_can_compile_modules(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -194,7 +220,9 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_can_create_configs",
-        config_can_create_configs,
+        |caller: Caller<T>, config_id: u64| {
+            config_can_create_configs(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -204,7 +232,9 @@ where
     linker.func_wrap(
         "lunatic::process",
         "config_can_spawn_processes",
-        config_can_spawn_processes,
+        |caller: Caller<T>, config_id: u64| {
+            config_can_spawn_processes(caller, config_id).to_wasmtime_result()
+        },
     )?;
     linker.func_wrap2_async(
         "lunatic::process",
@@ -219,11 +249,35 @@ where
 
     linker.func_wrap("lunatic::process", "process_id", process_id)?;
     linker.func_wrap("lunatic::process", "environment_id", environment_id)?;
-    linker.func_wrap("lunatic::process", "link", link)?;
-    linker.func_wrap("lunatic::process", "unlink", unlink)?;
-    linker.func_wrap("lunatic::process", "monitor", monitor)?;
-    linker.func_wrap("lunatic::process", "stop_monitoring", stop_monitoring)?;
-    linker.func_wrap("lunatic::process", "kill", kill)?;
+    linker.func_wrap(
+        "lunatic::process",
+        "link",
+        |caller: Caller<T>, tag: i64, process_id: u64| {
+            link(caller, tag, process_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "unlink",
+        |caller: Caller<T>, process_id: u64| unlink(caller, process_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "monitor",
+        |caller: Caller<T>, process_id: u64| monitor(caller, process_id).to_wasmtime_result(),
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "stop_monitoring",
+        |caller: Caller<T>, monitor_ref: u64| {
+            stop_monitoring(caller, monitor_ref).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "kill",
+        |caller: Caller<T>, process_id: u64| kill(caller, process_id).to_wasmtime_result(),
+    )?;
     linker.func_wrap("lunatic::process", "exists", exists)?;
     Ok(())
 }
@@ -1010,7 +1064,7 @@ where
                 let result = match chunk[0] {
                     0x7F => Val::I32(value as i32),
                     0x7E => Val::I64(value as i64),
-                    0x7B => Val::V128(value),
+                    0x7B => Val::V128(value.into()),
                     _ => return Err(anyhow!("Unsupported type ID")),
                 };
                 Ok(result)
@@ -1243,7 +1297,7 @@ where
                     let result = match chunk[0] {
                         0x7F => Val::I32(value as i32),
                         0x7E => Val::I64(value as i64),
-                        0x7B => Val::V128(value),
+                        0x7B => Val::V128(value.into()),
                         _ => return Err(anyhow!("Unsupported type ID")),
                     };
                     Ok(result)
@@ -1331,9 +1385,10 @@ where
 fn sleep_ms<T: ProcessState + ProcessCtx<T>>(
     _: Caller<T>,
     millis: u64,
-) -> Box<dyn Future<Output = ()> + Send + '_> {
+) -> Box<dyn Future<Output = Result<()>> + Send + '_> {
     Box::new(async move {
         tokio::time::sleep(Duration::from_millis(millis)).await;
+        Ok(())
     })
 }
 
