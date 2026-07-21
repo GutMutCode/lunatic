@@ -10,15 +10,32 @@ use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 
-use crate::NetworkingCtx;
+use crate::{validate_memory_range, DnsIteratorLease, NetworkingCtx};
 
 pub struct DnsIterator {
     iter: IntoIter<SocketAddr>,
+    // Runtime-created iterators keep their quota reservation for as long as
+    // the table entry exists. Legacy callers can still construct an unleased
+    // iterator with `new`, but host functions only use `with_lease`.
+    _lease: Option<DnsIteratorLease>,
 }
 
 impl DnsIterator {
+    /// Creates an iterator without an embedded quota lease.
+    ///
+    /// This preserves the original constructor for non-runtime uses. Values
+    /// inserted into a guest-visible [`crate::DnsResources`] table should use
+    /// [`Self::with_lease`] instead.
     pub fn new(iter: IntoIter<SocketAddr>) -> Self {
-        Self { iter }
+        Self { iter, _lease: None }
+    }
+
+    /// Creates an iterator that owns one previously reserved quota lease.
+    pub fn with_lease(iter: IntoIter<SocketAddr>, lease: DnsIteratorLease) -> Self {
+        Self {
+            iter,
+            _lease: Some(lease),
+        }
     }
 }
 
@@ -90,6 +107,13 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::resolve",
+        )?;
         let (memory_slice, state) = memory.data_and_store_mut(&mut caller);
 
         let buffer = memory_slice
@@ -98,31 +122,35 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
         let name = std::str::from_utf8(buffer)
             .or_trap("lunatic::network::resolve::not_valid_utf8_string")?;
 
-        // Check for timeout during lookup
-        let lookup_host = tokio::net::lookup_host(name);
-        let (iter_or_error_id, result) = if let Ok(result) = match timeout_duration {
-            // Without timeout
-            u64::MAX => Ok(lookup_host.await),
-            // With timeout
-            t => timeout(Duration::from_millis(t), lookup_host).await,
-        } {
-            match result {
-                Ok(sockets) => {
-                    // This is a bug in clippy, this collect is not needless
-                    #[allow(clippy::needless_collect)]
-                    let id = state.dns_resources_mut().add(DnsIterator::new(
-                        sockets.collect::<Vec<SocketAddr>>().into_iter(),
-                    ));
-                    (id, 0)
-                }
-                Err(error) => {
-                    let error_id = state.add_error_resource(error.into());
-                    (error_id, 1)
+        let lease = state.reserve_dns_iterator_lease();
+        let (iter_or_error_id, result) = match lease {
+            Ok(lease) => {
+                // Check for timeout during lookup.
+                let lookup_host = tokio::net::lookup_host(name);
+                if let Ok(result) = match timeout_duration {
+                    // Without timeout
+                    u64::MAX => Ok(lookup_host.await),
+                    // With timeout
+                    t => timeout(Duration::from_millis(t), lookup_host).await,
+                } {
+                    match result {
+                        Ok(sockets) => {
+                            // This is a bug in clippy, this collect is not needless.
+                            #[allow(clippy::needless_collect)]
+                            let iterator = DnsIterator::with_lease(
+                                sockets.collect::<Vec<SocketAddr>>().into_iter(),
+                                lease,
+                            );
+                            (state.dns_resources_mut().add(iterator), 0)
+                        }
+                        Err(error) => (state.add_error_resource(error.into()), 1),
+                    }
+                } else {
+                    // Timeout drops the unused lease.
+                    (0, 9027)
                 }
             }
-        } else {
-            // Call timed out
-            (0, 9027)
+            Err(error) => (state.add_error_resource(error), 1),
         };
         let memory = get_memory(&mut caller)?;
         memory
@@ -141,11 +169,14 @@ fn resolve<T: NetworkingCtx + ErrorCtx + Send>(
 // Traps:
 // * If the DNS iterator ID doesn't exist.
 fn drop_dns_iterator<T: NetworkingCtx>(mut caller: Caller<T>, dns_iter_id: u64) -> Result<()> {
-    caller
+    let iterator = caller
         .data_mut()
         .dns_resources_mut()
         .remove(dns_iter_id)
         .or_trap("lunatic::networking::drop_dns_iterator")?;
+    // Dropping the table value drops its embedded lease and releases exactly
+    // one quota unit. Invalid IDs never reach this path.
+    drop(iterator);
     Ok(())
 }
 
@@ -221,5 +252,143 @@ fn resolve_next<T: NetworkingCtx>(
             Ok(0)
         }
         None => Ok(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use anyhow::anyhow;
+
+    use crate::{DnsIteratorLease, DnsIteratorQuota, DnsResources};
+
+    use super::DnsIterator;
+
+    #[derive(Debug)]
+    struct TestQuota {
+        max: usize,
+        current: AtomicUsize,
+        reserve_attempts: AtomicUsize,
+        releases: AtomicUsize,
+    }
+
+    impl TestQuota {
+        fn new(max: usize) -> Arc<Self> {
+            Arc::new(Self {
+                max,
+                current: AtomicUsize::new(0),
+                reserve_attempts: AtomicUsize::new(0),
+                releases: AtomicUsize::new(0),
+            })
+        }
+
+        fn current(&self) -> usize {
+            self.current.load(Ordering::SeqCst)
+        }
+    }
+
+    impl DnsIteratorQuota for TestQuota {
+        fn reserve(&self) -> anyhow::Result<()> {
+            self.reserve_attempts.fetch_add(1, Ordering::SeqCst);
+            self.current
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    (current < self.max).then_some(current + 1)
+                })
+                .map(|_| ())
+                .map_err(|_| anyhow!("DNS iterator quota reached"))
+        }
+
+        fn release(&self) -> anyhow::Result<()> {
+            self.current
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_sub(1)
+                })
+                .map(|_| {
+                    self.releases.fetch_add(1, Ordering::SeqCst);
+                })
+                .map_err(|_| anyhow!("DNS iterator quota underflow"))
+        }
+    }
+
+    fn reserve(quota: &Arc<TestQuota>) -> anyhow::Result<DnsIteratorLease> {
+        let owner: Arc<dyn DnsIteratorQuota> = quota.clone();
+        DnsIteratorLease::reserve_new(owner)
+    }
+
+    #[test]
+    fn cloned_quota_owners_share_one_finite_ceiling() {
+        let quota = TestQuota::new(1);
+        let owner: Arc<dyn DnsIteratorQuota> = quota.clone();
+        let cloned_owner = owner.clone();
+
+        let lease = DnsIteratorLease::reserve_new(owner).unwrap();
+        for _ in 0..64 {
+            assert!(DnsIteratorLease::reserve_new(cloned_owner.clone()).is_err());
+        }
+        assert_eq!(quota.current(), 1);
+        assert_eq!(quota.reserve_attempts.load(Ordering::SeqCst), 65);
+        assert_eq!(quota.releases.load(Ordering::SeqCst), 0);
+
+        drop(lease);
+        assert_eq!(quota.current(), 0);
+        assert_eq!(quota.releases.load(Ordering::SeqCst), 1);
+
+        drop(DnsIteratorLease::reserve_new(cloned_owner).unwrap());
+        assert_eq!(quota.current(), 0);
+        assert_eq!(quota.releases.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn table_removal_releases_each_iterator_exactly_once() {
+        let quota = TestQuota::new(1);
+        let mut resources = DnsResources::default();
+
+        for _ in 0..64 {
+            let iterator =
+                DnsIterator::with_lease(Vec::new().into_iter(), reserve(&quota).unwrap());
+            let id = resources.add(iterator);
+            assert_eq!(quota.current(), 1);
+
+            drop(resources.remove(id).unwrap());
+            assert_eq!(quota.current(), 0);
+        }
+
+        assert_eq!(quota.releases.load(Ordering::SeqCst), 64);
+    }
+
+    #[test]
+    fn dropping_the_whole_table_releases_all_iterators() {
+        let quota = TestQuota::new(4);
+        let mut resources = DnsResources::default();
+
+        for _ in 0..4 {
+            let iterator =
+                DnsIterator::with_lease(Vec::new().into_iter(), reserve(&quota).unwrap());
+            resources.add(iterator);
+        }
+        assert_eq!(quota.current(), 4);
+
+        drop(resources);
+        assert_eq!(quota.current(), 0);
+        assert_eq!(quota.releases.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn repeated_pre_reservation_failures_roll_back_without_leaking() {
+        let quota = TestQuota::new(1);
+
+        for _ in 0..64 {
+            // Simulate an I/O failure or cancellation after admission but
+            // before the iterator is inserted into the table.
+            drop(reserve(&quota).unwrap());
+            assert_eq!(quota.current(), 0);
+        }
+
+        assert_eq!(quota.reserve_attempts.load(Ordering::SeqCst), 64);
+        assert_eq!(quota.releases.load(Ordering::SeqCst), 64);
     }
 }

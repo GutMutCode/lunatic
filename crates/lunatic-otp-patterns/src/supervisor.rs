@@ -298,7 +298,7 @@ impl Supervisor {
         let process_id = process.id();
 
         if self.environment.get_process(process_id).is_none() {
-            process.send(Signal::Kill);
+            let _ = process.send(Signal::Kill);
             return Err(format!(
                 "Child '{}' start function returned unregistered process {}",
                 child_id, process_id
@@ -433,7 +433,9 @@ impl Supervisor {
             return Ok(());
         }
 
-        process.send(Signal::Kill);
+        process
+            .send(Signal::Kill)
+            .map_err(|error| format!("Failed to stop child '{}': {error}", child_id))?;
         let timeout = match shutdown {
             ShutdownPolicy::Brutal => Some(BRUTAL_SHUTDOWN_TIMEOUT),
             ShutdownPolicy::Timeout(milliseconds) => Some(Duration::from_millis(milliseconds)),

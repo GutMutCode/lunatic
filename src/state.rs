@@ -2,18 +2,19 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use hash_map_id::HashMapId;
 use lunatic_distributed::{DistributedCtx, DistributedProcessState};
 use lunatic_error_api::{ErrorCtx, ErrorResource};
 use lunatic_networking_api::{
-    DnsIterator, NetworkingCtx, TcpConnection, TlsConnection, TlsListener,
+    DnsIterator, DnsIteratorQuota, NetworkHandleQuota, NetworkingCtx, TcpConnection, TlsConnection,
+    TlsListener,
 };
 use lunatic_process::env::{Environment, LunaticEnvironment};
 use lunatic_process::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
-use lunatic_process::state::{ConfigResources, ProcessState};
+use lunatic_process::state::{mailboxes_with_limits, ConfigResources, ProcessState};
 use lunatic_process::{
     config::ProcessConfig,
     resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot, ResourceTransferReport},
@@ -27,8 +28,7 @@ use lunatic_timer_api::{TimerCtx, TimerResources};
 use lunatic_wasi_api::{build_wasi, LunaticWasiCtx};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use wasi_common::WasiCtx;
 use wasmtime::{Linker, ResourceLimiter};
@@ -44,10 +44,212 @@ pub struct DbResources {
     sqlite_guest_allocator: SQLiteGuestAllocators,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
+struct ResourceCounts {
+    open_file_descriptors: u32,
+    open_network_connections: u32,
+    open_dns_iterators: u32,
+    max_file_descriptors: u32,
+    max_network_connections: u32,
+    max_dns_iterators: u32,
+}
+
+#[derive(Debug)]
 pub struct ResourceStats {
-    pub open_file_descriptors: u32,
-    pub open_network_connections: u32,
+    counts: Mutex<ResourceCounts>,
+}
+
+impl ResourceStats {
+    fn new(max_file_descriptors: u32, max_network_connections: u32) -> Self {
+        Self {
+            counts: Mutex::new(ResourceCounts {
+                open_file_descriptors: 0,
+                open_network_connections: 0,
+                open_dns_iterators: 0,
+                max_file_descriptors,
+                max_network_connections,
+                max_dns_iterators: max_network_connections,
+            }),
+        }
+    }
+
+    fn reserve_file_descriptor(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_file_descriptors >= counts.max_file_descriptors {
+            anyhow::bail!(
+                "Max file descriptors ({}) reached",
+                counts.max_file_descriptors
+            );
+        }
+        counts.open_file_descriptors += 1;
+        Ok(())
+    }
+
+    fn release_file_descriptor(&self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_file_descriptors > 0 {
+            counts.open_file_descriptors -= 1;
+        }
+    }
+
+    fn reserve_network_connection(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_network_connections >= counts.max_network_connections {
+            anyhow::bail!(
+                "Max network connections ({}) reached",
+                counts.max_network_connections
+            );
+        }
+        counts.open_network_connections += 1;
+        Ok(())
+    }
+
+    fn release_network_connection(&self) {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_network_connections > 0 {
+            counts.open_network_connections -= 1;
+        }
+    }
+
+    fn counts(&self) -> (u32, u32) {
+        let counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        (
+            counts.open_file_descriptors,
+            counts.open_network_connections,
+        )
+    }
+
+    fn dns_iterator_count(&self) -> u32 {
+        self.counts
+            .lock()
+            .expect("resource accounting mutex poisoned")
+            .open_dns_iterators
+    }
+
+    fn validate_limits(
+        &self,
+        max_file_descriptors: u32,
+        max_network_connections: u32,
+    ) -> Result<()> {
+        let counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        anyhow::ensure!(
+            counts.open_file_descriptors <= max_file_descriptors,
+            "{} open file descriptors exceed replacement limit {}",
+            counts.open_file_descriptors,
+            max_file_descriptors
+        );
+        anyhow::ensure!(
+            counts.open_network_connections <= max_network_connections,
+            "{} open network handles exceed replacement limit {}",
+            counts.open_network_connections,
+            max_network_connections
+        );
+        anyhow::ensure!(
+            counts.open_dns_iterators <= max_network_connections,
+            "{} open DNS iterators exceed replacement limit {}",
+            counts.open_dns_iterators,
+            max_network_connections
+        );
+        Ok(())
+    }
+
+    fn set_limits(&self, max_file_descriptors: u32, max_network_connections: u32) {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        debug_assert!(counts.open_file_descriptors <= max_file_descriptors);
+        debug_assert!(counts.open_network_connections <= max_network_connections);
+        debug_assert!(counts.open_dns_iterators <= max_network_connections);
+        counts.max_file_descriptors = max_file_descriptors;
+        counts.max_network_connections = max_network_connections;
+        counts.max_dns_iterators = max_network_connections;
+    }
+}
+
+impl DnsIteratorQuota for ResourceStats {
+    fn reserve(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_dns_iterators >= counts.max_dns_iterators {
+            anyhow::bail!("Max DNS iterators ({}) reached", counts.max_dns_iterators);
+        }
+        counts.open_dns_iterators += 1;
+        Ok(())
+    }
+
+    fn release(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_dns_iterators == 0 {
+            anyhow::bail!("DNS iterator resource accounting underflow");
+        }
+        counts.open_dns_iterators -= 1;
+        Ok(())
+    }
+}
+
+impl NetworkHandleQuota for ResourceStats {
+    fn reserve(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_file_descriptors >= counts.max_file_descriptors {
+            anyhow::bail!(
+                "Max file descriptors ({}) reached",
+                counts.max_file_descriptors
+            );
+        }
+        if counts.open_network_connections >= counts.max_network_connections {
+            anyhow::bail!(
+                "Max network connections ({}) reached",
+                counts.max_network_connections
+            );
+        }
+        counts.open_file_descriptors += 1;
+        counts.open_network_connections += 1;
+        Ok(())
+    }
+
+    fn release(&self) -> Result<()> {
+        let mut counts = self
+            .counts
+            .lock()
+            .expect("resource accounting mutex poisoned");
+        if counts.open_file_descriptors == 0 || counts.open_network_connections == 0 {
+            anyhow::bail!(
+                "Network resource accounting underflow (file descriptors={}, network handles={})",
+                counts.open_file_descriptors,
+                counts.open_network_connections
+            );
+        }
+        counts.open_file_descriptors -= 1;
+        counts.open_network_connections -= 1;
+        Ok(())
+    }
 }
 
 pub struct DefaultProcessState {
@@ -85,43 +287,51 @@ pub struct DefaultProcessState {
     db_resources: DbResources,
     registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
     // Resource usage stats (Phase 3)
-    resource_stats: ResourceStats,
+    resource_stats: Arc<ResourceStats>,
 }
 
 impl DefaultProcessState {
     pub fn can_open_file_descriptor(&mut self) -> anyhow::Result<()> {
-        if self.resource_stats.open_file_descriptors >= self.config.get_max_file_descriptors() {
-            anyhow::bail!(
-                "Max file descriptors ({}) reached",
-                self.config.get_max_file_descriptors()
-            );
-        }
-        self.resource_stats.open_file_descriptors += 1;
-        Ok(())
+        self.resource_stats.reserve_file_descriptor()
     }
 
     pub fn close_file_descriptor(&mut self) {
-        if self.resource_stats.open_file_descriptors > 0 {
-            self.resource_stats.open_file_descriptors -= 1;
-        }
+        self.resource_stats.release_file_descriptor();
     }
 
     pub fn can_open_network_connection(&mut self) -> anyhow::Result<()> {
-        if self.resource_stats.open_network_connections >= self.config.get_max_network_connections()
-        {
-            anyhow::bail!(
-                "Max network connections ({}) reached",
-                self.config.get_max_network_connections()
-            );
-        }
-        self.resource_stats.open_network_connections += 1;
-        Ok(())
+        self.resource_stats.reserve_network_connection()
     }
 
     pub fn close_network_connection(&mut self) {
-        if self.resource_stats.open_network_connections > 0 {
-            self.resource_stats.open_network_connections -= 1;
-        }
+        self.resource_stats.release_network_connection();
+    }
+
+    /// Atomically reserves one guest-visible network resource handle against
+    /// both descriptor and network ceilings.
+    pub fn reserve_network_handle(&mut self) -> anyhow::Result<()> {
+        NetworkHandleQuota::reserve(self.resource_stats.as_ref())
+    }
+
+    /// Releases exactly one guest-visible network resource handle.
+    pub fn release_network_handle(&mut self) -> anyhow::Result<()> {
+        NetworkHandleQuota::release(self.resource_stats.as_ref())
+    }
+
+    pub fn network_resource_counts(&self) -> (u32, u32) {
+        self.resource_stats.counts()
+    }
+
+    pub fn dns_iterator_count(&self) -> u32 {
+        self.resource_stats.dns_iterator_count()
+    }
+
+    fn live_network_handle_count(&self) -> usize {
+        self.resources.tcp_listeners.len()
+            + self.resources.tcp_streams.len()
+            + self.resources.tls_listeners.len()
+            + self.resources.tls_streams.len()
+            + self.resources.udp_sockets.len()
     }
 
     pub fn new(
@@ -132,9 +342,15 @@ impl DefaultProcessState {
         config: Arc<DefaultProcessConfig>,
         registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
     ) -> Result<Self> {
-        let signal_mailbox = unbounded_channel();
-        let signal_mailbox = (signal_mailbox.0, Arc::new(Mutex::new(signal_mailbox.1)));
-        let message_mailbox = MessageMailbox::default();
+        config
+            .validate_runtime_limits()
+            .map_err(anyhow::Error::msg)?;
+        let (signal_mailbox, message_mailbox) = mailboxes_with_limits(
+            config.get_max_signal_queue() as usize,
+            config.get_max_mailbox_messages() as usize,
+            config.get_max_message_size(),
+            config.get_max_message_resources(),
+        );
         let state = Self {
             id: environment.get_next_process_id(),
             environment,
@@ -156,7 +372,10 @@ impl DefaultProcessState {
             initialized: false,
             registry,
             db_resources: DbResources::default(),
-            resource_stats: ResourceStats::default(),
+            resource_stats: Arc::new(ResourceStats::new(
+                config.get_max_file_descriptors(),
+                config.get_max_network_connections(),
+            )),
         };
         Ok(state)
     }
@@ -173,9 +392,12 @@ impl ProcessState for DefaultProcessState {
         self.config
             .validate_child_config(config.as_ref())
             .map_err(anyhow::Error::msg)?;
-        let signal_mailbox = unbounded_channel();
-        let signal_mailbox = (signal_mailbox.0, Arc::new(Mutex::new(signal_mailbox.1)));
-        let message_mailbox = MessageMailbox::default();
+        let (signal_mailbox, message_mailbox) = mailboxes_with_limits(
+            config.get_max_signal_queue() as usize,
+            config.get_max_mailbox_messages() as usize,
+            config.get_max_message_size(),
+            config.get_max_message_resources(),
+        );
         let state = Self {
             id: self.environment.get_next_process_id(),
             environment: self.environment.clone(),
@@ -197,7 +419,10 @@ impl ProcessState for DefaultProcessState {
             initialized: false,
             registry: self.registry.clone(),
             db_resources: DbResources::default(),
-            resource_stats: ResourceStats::default(),
+            resource_stats: Arc::new(ResourceStats::new(
+                config.get_max_file_descriptors(),
+                config.get_max_network_connections(),
+            )),
         };
         Ok(state)
     }
@@ -232,7 +457,10 @@ impl ProcessState for DefaultProcessState {
             initialized: false,
             registry: self.registry.clone(),
             db_resources: DbResources::default(),
-            resource_stats: ResourceStats::default(),
+            resource_stats: Arc::new(ResourceStats::new(
+                config.get_max_file_descriptors(),
+                config.get_max_network_connections(),
+            )),
         })
     }
 
@@ -304,6 +532,25 @@ impl ProcessState for DefaultProcessState {
         &mut self,
         target: &mut Self,
     ) -> Result<ResourceTransferReport> {
+        let source_network_handles = self.live_network_handle_count();
+        let (source_file_descriptors, source_network_connections) = self.resource_stats.counts();
+        let source_dns_iterators = self.resource_stats.dns_iterator_count();
+        anyhow::ensure!(
+            source_file_descriptors as usize >= source_network_handles
+                && source_network_connections as usize >= source_network_handles,
+            "source network accounting drifted (resources={}, file descriptors={}, network handles={})",
+            source_network_handles,
+            source_file_descriptors,
+            source_network_connections,
+        );
+        anyhow::ensure!(
+            source_dns_iterators as usize == self.resources.dns_iterators.len(),
+            "source DNS iterator accounting drifted (resources={}, reservations={})",
+            self.resources.dns_iterators.len(),
+            source_dns_iterators,
+        );
+        let target_counts = target.resource_stats.counts();
+        let target_dns_iterators = target.resource_stats.dns_iterator_count();
         anyhow::ensure!(
             target.resources.tcp_listeners.is_empty()
                 && target.resources.tcp_streams.is_empty()
@@ -311,9 +558,14 @@ impl ProcessState for DefaultProcessState {
                 && target.resources.tls_streams.is_empty()
                 && target.resources.udp_sockets.is_empty()
                 && target.resources.dns_iterators.is_empty()
-                && target.resource_stats.open_network_connections == 0,
+                && target_counts == (0, 0)
+                && target_dns_iterators == 0,
             "replacement process state already owns network resources"
         );
+        self.resource_stats.validate_limits(
+            target.config.get_max_file_descriptors(),
+            target.config.get_max_network_connections(),
+        )?;
 
         let report = ResourceTransferReport {
             tcp_listeners: self.resources.tcp_listeners.len(),
@@ -330,6 +582,10 @@ impl ProcessState for DefaultProcessState {
         // descriptors and message scratch state as one commit operation. The
         // old instance receives the replacement's fresh state and can then be
         // dropped without closing resources now owned by the new instance.
+        self.resource_stats.set_limits(
+            target.config.get_max_file_descriptors(),
+            target.config.get_max_network_connections(),
+        );
         std::mem::swap(&mut self.resources, &mut target.resources);
         std::mem::swap(&mut self.db_resources, &mut target.db_resources);
         std::mem::swap(&mut self.wasi, &mut target.wasi);
@@ -505,13 +761,20 @@ impl ProcessState for DefaultProcessState {
             match entry {
                 ResourceSnapshot::TcpListener { local_addr } => {
                     match local_addr.parse::<SocketAddr>() {
-                        Ok(addr) => match handle.block_on(TcpListener::bind(addr)) {
-                            Ok(listener) => {
-                                self.resources.tcp_listeners.add(listener);
-                                restored += 1;
-                            }
+                        Ok(addr) => match self.reserve_network_handle_lease() {
+                            Ok(lease) => match handle.block_on(TcpListener::bind(addr)) {
+                                Ok(listener) => {
+                                    self.resources.tcp_listeners.add(listener);
+                                    lease.into_table_reservation();
+                                    restored += 1;
+                                }
+                                Err(err) => warn!(
+                                    "Failed to rebind TCP listener at {} during hot reload: {}",
+                                    local_addr, err
+                                ),
+                            },
                             Err(err) => warn!(
-                                "Failed to rebind TCP listener at {} during hot reload: {}",
+                                "TCP listener at {} exceeds restored network limits: {}",
                                 local_addr, err
                             ),
                         },
@@ -532,13 +795,20 @@ impl ProcessState for DefaultProcessState {
             match entry {
                 ResourceSnapshot::UdpSocket { local_addr } => {
                     match local_addr.parse::<SocketAddr>() {
-                        Ok(addr) => match handle.block_on(UdpSocket::bind(addr)) {
-                            Ok(socket) => {
-                                self.resources.udp_sockets.add(Arc::new(socket));
-                                restored += 1;
-                            }
+                        Ok(addr) => match self.reserve_network_handle_lease() {
+                            Ok(lease) => match handle.block_on(UdpSocket::bind(addr)) {
+                                Ok(socket) => {
+                                    self.resources.udp_sockets.add(Arc::new(socket));
+                                    lease.into_table_reservation();
+                                    restored += 1;
+                                }
+                                Err(err) => warn!(
+                                    "Failed to rebind UDP socket at {} during hot reload: {}",
+                                    local_addr, err
+                                ),
+                            },
                             Err(err) => warn!(
-                                "Failed to rebind UDP socket at {} during hot reload: {}",
+                                "UDP socket at {} exceeds restored network limits: {}",
                                 local_addr, err
                             ),
                         },
@@ -574,17 +844,24 @@ impl ProcessState for DefaultProcessState {
                     };
 
                     match local_addr.parse::<SocketAddr>() {
-                        Ok(addr) => match handle.block_on(TcpListener::bind(addr)) {
-                            Ok(listener) => {
-                                self.resources.tls_listeners.add(TlsListener {
-                                    listener,
-                                    certs: CertificateDer::from(cert_pem),
-                                    keys: key,
-                                });
-                                restored += 1;
-                            }
+                        Ok(addr) => match self.reserve_network_handle_lease() {
+                            Ok(lease) => match handle.block_on(TcpListener::bind(addr)) {
+                                Ok(listener) => {
+                                    self.resources.tls_listeners.add(TlsListener {
+                                        listener,
+                                        certs: CertificateDer::from(cert_pem),
+                                        keys: key,
+                                    });
+                                    lease.into_table_reservation();
+                                    restored += 1;
+                                }
+                                Err(err) => warn!(
+                                    "Failed to rebind TLS listener at {} during hot reload: {}",
+                                    local_addr, err
+                                ),
+                            },
                             Err(err) => warn!(
-                                "Failed to rebind TLS listener at {} during hot reload: {}",
+                                "TLS listener at {} exceeds restored network limits: {}",
                                 local_addr, err
                             ),
                         },
@@ -748,12 +1025,28 @@ impl NetworkingCtx for DefaultProcessState {
         &mut self.resources.dns_iterators
     }
 
+    fn network_handle_quota(&self) -> Option<Arc<dyn NetworkHandleQuota>> {
+        Some(self.resource_stats.clone())
+    }
+
+    fn dns_iterator_quota(&self) -> Option<Arc<dyn DnsIteratorQuota>> {
+        Some(self.resource_stats.clone())
+    }
+
     fn can_open_network_connection(&mut self) -> anyhow::Result<()> {
         Self::can_open_network_connection(self)
     }
 
     fn close_network_connection(&mut self) {
         Self::close_network_connection(self)
+    }
+
+    fn reserve_network_handle(&mut self) -> anyhow::Result<()> {
+        Self::reserve_network_handle(self)
+    }
+
+    fn release_network_handle(&mut self) -> anyhow::Result<()> {
+        Self::release_network_handle(self)
     }
 }
 
@@ -876,9 +1169,12 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
         config
             .validate_distributed_config()
             .map_err(anyhow::Error::msg)?;
-        let signal_mailbox = unbounded_channel();
-        let signal_mailbox = (signal_mailbox.0, Arc::new(Mutex::new(signal_mailbox.1)));
-        let message_mailbox = MessageMailbox::default();
+        let (signal_mailbox, message_mailbox) = mailboxes_with_limits(
+            config.get_max_signal_queue() as usize,
+            config.get_max_mailbox_messages() as usize,
+            config.get_max_message_size(),
+            config.get_max_message_resources(),
+        );
         let state = Self {
             id: environment.get_next_process_id(),
             environment,
@@ -900,7 +1196,10 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             initialized: false,
             registry: Default::default(), // TODO move registry into env?
             db_resources: DbResources::default(),
-            resource_stats: ResourceStats::default(),
+            resource_stats: Arc::new(ResourceStats::new(
+                config.get_max_file_descriptors(),
+                config.get_max_network_connections(),
+            )),
         };
         Ok(state)
     }
@@ -908,8 +1207,7 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
 
 impl lunatic_process::reloadable_state::ReloadableState for DefaultProcessState {
     fn serialize_state(&self) -> anyhow::Result<Vec<u8>> {
-        let snapshot = self.message_mailbox.snapshot();
-        let message_count = snapshot.len() as u64;
+        let message_count = self.message_mailbox.len() as u64;
 
         let mut result = Vec::new();
         result.extend_from_slice(&self.id.to_le_bytes());
@@ -979,11 +1277,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hot_reload_transfers_live_tls_stream_with_id_and_timeouts() -> anyhow::Result<()> {
-        use lunatic_distributed::{control::cert, distributed::server::gen_node_cert};
-        use lunatic_networking_api::{TlsClientConnectionMetadata, TlsConnection};
+    async fn initial_state_rejects_zero_signal_capacity_without_panicking() {
+        use tokio::sync::RwLock;
+
+        use crate::{state::DefaultProcessState, DefaultProcessConfig};
+        use lunatic_process::{env::LunaticEnvironment, runtimes::wasmtime::WasmtimeRuntime};
+
+        let runtime =
+            WasmtimeRuntime::new(&lunatic_process::runtimes::wasmtime::default_config()).unwrap();
+        let module = Arc::new(
+            runtime
+                .compile_module(
+                    wat::parse_str(r#"(module (memory (export "memory") 1))"#)
+                        .unwrap()
+                        .into(),
+                )
+                .unwrap(),
+        );
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_signal_queue(0);
+        let result = DefaultProcessState::new(
+            Arc::new(LunaticEnvironment::new(0)),
+            None,
+            runtime,
+            module,
+            Arc::new(config),
+            Arc::new(RwLock::new(HashMap::new())),
+        );
+
+        let error = match result {
+            Ok(_) => panic!("zero signal capacity unexpectedly created a process state"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("max_signal_queue"));
+    }
+
+    #[tokio::test]
+    async fn wasm_process_quota_is_checked_before_store_instantiation() {
+        use tokio::sync::RwLock;
+
+        use crate::state::DefaultProcessState;
+        use crate::DefaultProcessConfig;
+        use lunatic_process::env::{Environment, LunaticEnvironment};
+        use lunatic_process::runtimes::wasmtime::WasmtimeRuntime;
+        use lunatic_process::wasm::spawn_wasm;
+
+        let runtime =
+            WasmtimeRuntime::new(&lunatic_process::runtimes::wasmtime::default_config()).unwrap();
+        // Instantiation would trap if quota admission happened too late.
+        let raw_module = wat::parse_str(
+            r#"(module
+                (func $start unreachable)
+                (start $start)
+                (func (export "run")))"#,
+        )
+        .unwrap();
+        let module = Arc::new(runtime.compile_module(raw_module.into()).unwrap());
+        let environment = Arc::new(LunaticEnvironment::with_max_processes(0, 0));
+        let state = DefaultProcessState::new(
+            environment.clone(),
+            None,
+            runtime.clone(),
+            module.clone(),
+            Arc::new(DefaultProcessConfig::default()),
+            Arc::new(RwLock::new(HashMap::new())),
+        )
+        .unwrap();
+
+        let error = match spawn_wasm(
+            environment.clone(),
+            runtime,
+            &module,
+            state,
+            "run",
+            Vec::new(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("quota-zero environment unexpectedly instantiated a Wasm process"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("process limit 0 reached"));
+        assert_eq!(environment.process_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn hot_reload_preserves_dns_iterator_quota_and_releases_on_drop() -> anyhow::Result<()> {
+        use tokio::sync::RwLock;
+
+        use lunatic_networking_api::{DnsIterator, DnsIteratorLease, NetworkingCtx};
         use lunatic_process::{
             env::LunaticEnvironment, runtimes::wasmtime::WasmtimeRuntime, state::ProcessState,
+        };
+
+        let runtime = WasmtimeRuntime::new(&lunatic_process::runtimes::wasmtime::default_config())?;
+        let module =
+            Arc::new(runtime.compile_module(
+                wat::parse_str(r#"(module (memory (export "memory") 1))"#)?.into(),
+            )?);
+        let mut config = crate::DefaultProcessConfig::default();
+        config.set_max_network_connections(1);
+        let config = Arc::new(config);
+        let mut old_state = super::DefaultProcessState::new(
+            Arc::new(LunaticEnvironment::new(0)),
+            None,
+            runtime,
+            module.clone(),
+            config.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+        )?;
+        let source_quota = old_state
+            .dns_iterator_quota()
+            .expect("runtime state exposes a stable DNS iterator quota");
+        let lease = DnsIteratorLease::reserve_new(source_quota.clone())?;
+        let iterator_id = old_state
+            .resources
+            .dns_iterators
+            .add(DnsIterator::with_lease(Vec::new().into_iter(), lease));
+        assert_eq!(old_state.dns_iterator_count(), 1);
+        assert!(DnsIteratorLease::reserve_new(source_quota.clone()).is_err());
+
+        let mut replacement = old_state.new_state_for_reload(module, config)?;
+        let report = old_state.transfer_runtime_resources_to(&mut replacement)?;
+        assert_eq!(report.dns_iterators, 1);
+        assert_eq!(old_state.dns_iterator_count(), 0);
+        assert_eq!(replacement.dns_iterator_count(), 1);
+        let replacement_quota = replacement
+            .dns_iterator_quota()
+            .expect("replacement keeps the transferred DNS quota owner");
+        assert!(Arc::ptr_eq(&source_quota, &replacement_quota));
+
+        drop(
+            replacement
+                .resources
+                .dns_iterators
+                .remove(iterator_id)
+                .expect("transferred DNS iterator ID is preserved"),
+        );
+        assert_eq!(replacement.dns_iterator_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_reload_transfers_live_tls_stream_with_id_and_timeouts() -> anyhow::Result<()> {
+        use lunatic_distributed::{control::cert, distributed::server::gen_node_cert};
+        use lunatic_networking_api::{
+            NetworkHandleLease, NetworkingCtx, TlsClientConnectionMetadata, TlsConnection,
+        };
+        use lunatic_process::{
+            env::LunaticEnvironment,
+            message::{DataMessage, Message, MessageNetworkResource},
+            runtimes::wasmtime::WasmtimeRuntime,
+            state::ProcessState,
         };
         use tokio::{
             io::{AsyncReadExt, AsyncWriteExt},
@@ -1054,7 +1500,10 @@ mod tests {
         let raw_module = wat::parse_str(r#"(module (memory (export "memory") 1))"#)?;
         let module = Arc::new(runtime.compile_module(raw_module.into())?);
         let environment = Arc::new(LunaticEnvironment::new(0));
-        let config = Arc::new(crate::DefaultProcessConfig::default());
+        let mut config = crate::DefaultProcessConfig::default();
+        config.set_max_file_descriptors(2);
+        config.set_max_network_connections(2);
+        let config = Arc::new(config);
         let registry = Arc::new(RwLock::new(HashMap::new()));
         let mut old_state = super::DefaultProcessState::new(
             environment,
@@ -1065,7 +1514,17 @@ mod tests {
             registry,
         )?;
         let stream_id = old_state.resources.tls_streams.add(connection.clone());
-        old_state.resource_stats.open_network_connections = 1;
+        old_state.reserve_network_handle()?;
+        old_state.reserve_network_handle()?;
+        let source_quota = old_state
+            .network_handle_quota()
+            .expect("runtime state exposes a stable quota owner");
+        let mut scratch = DataMessage::new(None, 0);
+        scratch.add_network_resource(MessageNetworkResource::new(
+            connection.clone(),
+            NetworkHandleLease::from_existing(source_quota.clone()),
+        ));
+        old_state.message = Some(Message::Data(scratch));
         let mut replacement_state = old_state.new_state(module, config)?;
 
         let report = old_state.transfer_runtime_resources_to(&mut replacement_state)?;
@@ -1073,8 +1532,28 @@ mod tests {
         assert_eq!(report.tls_streams, 1);
         assert_eq!(report.total(), 1);
         assert!(old_state.resources.tls_streams.is_empty());
-        assert_eq!(old_state.resource_stats.open_network_connections, 0);
-        assert_eq!(replacement_state.resource_stats.open_network_connections, 1);
+        assert_eq!(old_state.network_resource_counts(), (0, 0));
+        assert_eq!(replacement_state.network_resource_counts(), (2, 2));
+        let replacement_quota = replacement_state
+            .network_handle_quota()
+            .expect("replacement state exposes the transferred quota owner");
+        assert!(Arc::ptr_eq(&source_quota, &replacement_quota));
+
+        let Message::Data(mut scratch) = replacement_state
+            .message
+            .take()
+            .expect("scratch message is transferred atomically")
+        else {
+            panic!("transferred the wrong scratch message kind")
+        };
+        let mut leased_stream = scratch
+            .take_leased_tls_stream(0)
+            .expect("scratch TLS stream keeps its quota lease");
+        leased_stream.transfer_to(replacement_quota)?;
+        let scratch_stream = leased_stream.into_table_resource();
+        assert!(Arc::ptr_eq(&connection, &scratch_stream));
+        replacement_state.resources.tls_streams.add(scratch_stream);
+        assert_eq!(replacement_state.network_resource_counts(), (2, 2));
 
         let transferred = replacement_state
             .resources

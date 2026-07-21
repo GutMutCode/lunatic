@@ -50,7 +50,8 @@ fn spawn_worker(
             let _stop_event = stop_event;
             future::pending().await
         }
-    });
+    })
+    .map_err(|error| error.to_string())?;
     Ok(Arc::new(process))
 }
 

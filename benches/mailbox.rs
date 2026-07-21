@@ -17,7 +17,7 @@ fn bench_selective_receive(c: &mut Criterion) {
                         let mailbox = MessageMailbox::default();
 
                         for i in 0..n_msg {
-                            mailbox.push(Message::LinkDied(Some(i)));
+                            mailbox.push(Message::LinkDied(Some(i))).unwrap();
                         }
 
                         let tags: Vec<i64> = (n_msg - n_tags..n_msg).collect();
@@ -47,7 +47,7 @@ fn bench_fifo_receive(c: &mut Criterion) {
                     let mailbox = MessageMailbox::default();
 
                     for i in 0..n_msg {
-                        mailbox.push(Message::LinkDied(Some(i)));
+                        mailbox.push(Message::LinkDied(Some(i))).unwrap();
                     }
 
                     let _message = mailbox.pop(None).await;
@@ -74,7 +74,7 @@ fn bench_worst_case_selective(c: &mut Criterion) {
                     let mailbox = MessageMailbox::default();
 
                     for i in 0..n_msg {
-                        mailbox.push(Message::LinkDied(Some(i)));
+                        mailbox.push(Message::LinkDied(Some(i))).unwrap();
                     }
 
                     // Match the final queued message so `pop` scans the whole

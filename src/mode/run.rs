@@ -51,14 +51,14 @@ pub(crate) async fn start(mut args: Args) -> Result<()> {
     let runtime = runtimes::wasmtime::WasmtimeRuntime::new(&wasmtime_config)?;
     let envs = Arc::new(LunaticEnvironments::default());
 
-    let env = envs.create(1).await?;
     if args.bench {
         args.wasm_args.push("--bench".to_owned());
     }
 
     if args.watch {
-        run_with_watch(args, runtime, envs, env).await
+        run_with_watch(args, runtime, envs).await
     } else {
+        let env = envs.create(1).await?;
         run_wasm(RunWasm {
             path: args.path,
             wasm_args: args.wasm_args,
@@ -135,7 +135,6 @@ async fn run_with_watch(
     args: Args,
     runtime: runtimes::wasmtime::WasmtimeRuntime,
     envs: Arc<LunaticEnvironments>,
-    env: Arc<impl lunatic_process::env::Environment + 'static>,
 ) -> Result<()> {
     use crate::hot_reload::{register_module_update, FileChangeEvent, FileWatcher};
     use log::{error, info};
@@ -154,7 +153,6 @@ async fn run_with_watch(
 
     info!("Module registry initialized with version 0");
 
-    drop(env);
     let env = envs
         .create_with_registry(
             1,

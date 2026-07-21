@@ -196,7 +196,7 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
     ) -> oneshot::Receiver<ReloadAcknowledgement> {
         let (acknowledgement, receiver) = oneshot::channel();
         if let Some(process) = env.get_process(process_id) {
-            process.send(Signal::HotReload {
+            let _ = process.send(Signal::HotReload {
                 module_id,
                 expected_version: Some(old_version),
                 new_version,
@@ -217,7 +217,7 @@ impl<S: Send + Sync> ReloadCoordinator<S> {
     ) -> oneshot::Receiver<ReloadAcknowledgement> {
         let (acknowledgement, receiver) = oneshot::channel();
         if let Some(process) = env.get_process(process_id) {
-            process.send(Signal::Rollback {
+            let _ = process.send(Signal::Rollback {
                 module_id,
                 expected_version: Some(new_version),
                 target_version: old_version,
@@ -822,12 +822,14 @@ pub fn send_hot_reload_signal(
     env: &dyn crate::env::Environment,
 ) -> Result<()> {
     if let Some(process) = env.get_process(process_id) {
-        process.send(Signal::HotReload {
-            module_id,
-            expected_version: None,
-            new_version,
-            acknowledgement: None,
-        });
+        process
+            .send(Signal::HotReload {
+                module_id,
+                expected_version: None,
+                new_version,
+                acknowledgement: None,
+            })
+            .map_err(|error| anyhow!("Failed to send hot reload signal: {error}"))?;
         info!(
             "Sent hot reload signal to process {} for module {} version {}",
             process_id, module_id, new_version
@@ -849,12 +851,14 @@ pub fn send_rollback_signal(
     env: &dyn crate::env::Environment,
 ) -> Result<()> {
     if let Some(process) = env.get_process(process_id) {
-        process.send(Signal::Rollback {
-            module_id,
-            expected_version: None,
-            target_version,
-            acknowledgement: None,
-        });
+        process
+            .send(Signal::Rollback {
+                module_id,
+                expected_version: None,
+                target_version,
+                acknowledgement: None,
+            })
+            .map_err(|error| anyhow!("Failed to send rollback signal: {error}"))?;
         info!(
             "Sent rollback signal to process {} for module {} version {}",
             process_id, module_id, target_version
@@ -934,7 +938,7 @@ mod tests {
             self.id
         }
 
-        fn send(&self, signal: Signal) {
+        fn send(&self, signal: Signal) -> std::result::Result<(), crate::state::SignalSendError> {
             match signal {
                 Signal::HotReload {
                     module_id,
@@ -1007,6 +1011,7 @@ mod tests {
                 }
                 _ => {}
             }
+            Ok(())
         }
     }
 
@@ -1016,7 +1021,7 @@ mod tests {
         behavior: AckBehavior,
     ) -> Arc<AckProcess> {
         let process = Arc::new(AckProcess::new(id, behavior));
-        environment.add_process(id, process.clone());
+        environment.add_process(id, process.clone()).unwrap();
         process
     }
 

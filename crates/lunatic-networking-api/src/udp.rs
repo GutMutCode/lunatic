@@ -9,7 +9,7 @@ use tokio::time::timeout;
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 use crate::dns::DnsIterator;
-use crate::{socket_address, NetworkingCtx};
+use crate::{socket_address, validate_memory_range, NetworkingCtx};
 use lunatic_common_api::{audit_log, get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_error_api::ErrorCtx;
 
@@ -115,18 +115,21 @@ fn udp_bind<T: NetworkingCtx + ErrorCtx + Send>(
             flow_info,
             scope_id,
         )?;
-        let (udp_listener_or_error_id, result) = match UdpSocket::bind(socket_addr).await {
-            Ok(listener) => {
-                audit_log("udp_bind", format!("address={}", socket_addr));
-                (
-                    caller
+        let lease = caller.data().reserve_network_handle_lease();
+        let (udp_listener_or_error_id, result) = match lease {
+            Ok(lease) => match UdpSocket::bind(socket_addr).await {
+                Ok(listener) => {
+                    audit_log("udp_bind", format!("address={}", socket_addr));
+                    let id = caller
                         .data_mut()
                         .udp_resources_mut()
-                        .add(Arc::new(listener)),
-                    0,
-                )
-            }
-            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+                        .add(Arc::new(listener));
+                    lease.into_table_reservation();
+                    (id, 0)
+                }
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+            },
+            Err(error) => (caller.data_mut().add_error_resource(error), 1),
         };
         memory
             .write(
@@ -150,6 +153,7 @@ fn drop_udp_socket<T: NetworkingCtx>(mut caller: Caller<T>, udp_socket_id: u64) 
         .udp_resources_mut()
         .remove(udp_socket_id)
         .or_trap("lunatic::networking::drop_udp_socket")?;
+    caller.data_mut().release_network_handle()?;
     Ok(())
 }
 
@@ -172,6 +176,13 @@ fn udp_receive<T: NetworkingCtx + ErrorCtx + Send>(
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            opaque_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::udp_receive",
+        )?;
         let (memory_slice, state) = memory.data_and_store_mut(&mut caller);
 
         let buffer = memory_slice
@@ -188,7 +199,6 @@ fn udp_receive<T: NetworkingCtx + ErrorCtx + Send>(
             Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
         };
 
-        let memory = get_memory(&mut caller)?;
         memory
             .write(&mut caller, opaque_ptr as usize, &opaque.to_le_bytes())
             .or_trap("lunatic::networking::udp_receive")?;
@@ -217,20 +227,46 @@ fn udp_receive_from<T: NetworkingCtx + ErrorCtx + Send>(
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            opaque_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::udp_receive_from",
+        )?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            dns_iter_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::udp_receive_from",
+        )?;
         let (memory_slice, state) = memory.data_and_store_mut(&mut caller);
 
         let buffer = memory_slice
             .get_mut(buffer_ptr as usize..(buffer_ptr + buffer_len) as usize)
             .or_trap("lunatic::networking::udp_receive_from")?;
 
-        let socket = state
-            .udp_resources_mut()
+        state
+            .udp_resources()
             .get(socket_id)
             .or_trap("lunatic::network::udp_receive_from")?;
 
-        let (opaque, socket_result, return_) = match socket.recv_from(buffer).await {
-            Ok((bytes, socket)) => (bytes as u64, Some(socket), 0),
-            Err(error) => (caller.data_mut().add_error_resource(error.into()), None, 1),
+        let lease = state.reserve_dns_iterator_lease();
+        let (opaque, socket_result, return_) = match lease {
+            Ok(lease) => {
+                let receive = state
+                    .udp_resources()
+                    .get(socket_id)
+                    .expect("validated UDP socket must remain in the resource table")
+                    .recv_from(buffer)
+                    .await;
+                match receive {
+                    Ok((bytes, socket)) => (bytes as u64, Some((socket, lease)), 0),
+                    Err(error) => (state.add_error_resource(error.into()), None, 1),
+                }
+            }
+            Err(error) => (state.add_error_resource(error), None, 1),
         };
 
         let memory = get_memory(&mut caller)?;
@@ -238,11 +274,9 @@ fn udp_receive_from<T: NetworkingCtx + ErrorCtx + Send>(
             .write(&mut caller, opaque_ptr as usize, &opaque.to_le_bytes())
             .or_trap("lunatic::networking::udp_receive_from")?;
 
-        if let Some(socket_addr) = socket_result {
-            let dns_iter_id = caller
-                .data_mut()
-                .dns_resources_mut()
-                .add(DnsIterator::new(vec![socket_addr].into_iter()));
+        if let Some((socket_addr, lease)) = socket_result {
+            let iterator = DnsIterator::with_lease(vec![socket_addr].into_iter(), lease);
+            let dns_iter_id = caller.data_mut().dns_resources_mut().add(iterator);
             memory
                 .write(
                     &mut caller,
@@ -335,7 +369,9 @@ fn clone_udp_socket<T: NetworkingCtx>(mut caller: Caller<T>, udp_socket_id: u64)
         .get(udp_socket_id)
         .or_trap("lunatic::networking::clone_udp_socket")?
         .clone();
+    let lease = caller.data().reserve_network_handle_lease()?;
     let id = caller.data_mut().udp_resources_mut().add(stream);
+    lease.into_table_reservation();
     Ok(id)
 }
 
@@ -539,23 +575,39 @@ fn udp_local_addr<T: NetworkingCtx + ErrorCtx + Send>(
     udp_socket_id: u64,
     id_u64_ptr: u32,
 ) -> Result<u32> {
-    let udp_socket = caller
+    caller
         .data()
         .udp_resources()
         .get(udp_socket_id)
         .or_trap("lunatic::network::udp_local_addr: listener ID doesn't exist")?;
-    let (dns_iter_or_error_id, result) = match udp_socket.local_addr() {
-        Ok(socket_addr) => {
-            let dns_iter_id = caller
-                .data_mut()
-                .dns_resources_mut()
-                .add(DnsIterator::new(vec![socket_addr].into_iter()));
-            (dns_iter_id, 0)
+    let memory = get_memory(&mut caller)?;
+    validate_memory_range(
+        &caller,
+        &memory,
+        id_u64_ptr,
+        std::mem::size_of::<u64>(),
+        "lunatic::network::udp_local_addr",
+    )?;
+    let lease = caller.data().reserve_dns_iterator_lease();
+    let (dns_iter_or_error_id, result) = match lease {
+        Ok(lease) => {
+            let local_addr = caller
+                .data()
+                .udp_resources()
+                .get(udp_socket_id)
+                .expect("validated UDP socket must remain in the resource table")
+                .local_addr();
+            match local_addr {
+                Ok(socket_addr) => {
+                    let iterator = DnsIterator::with_lease(vec![socket_addr].into_iter(), lease);
+                    (caller.data_mut().dns_resources_mut().add(iterator), 0)
+                }
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+            }
         }
-        Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+        Err(error) => (caller.data_mut().add_error_resource(error), 1),
     };
 
-    let memory = get_memory(&mut caller)?;
     memory
         .write(
             &mut caller,
@@ -583,29 +635,42 @@ fn udp_peer_addr<T: NetworkingCtx + ErrorCtx + Send>(
     udp_socket_id: u64,
     id_u64_ptr: u32,
 ) -> Result<u32> {
-    let udp_socket = caller
+    caller
         .data()
         .udp_resources()
         .get(udp_socket_id)
         .or_trap("lunatic::network::udp_peer_addr: listener ID doesn't exist")?;
-    let (dns_iter_or_error_id, result) = match udp_socket.peer_addr() {
-        Ok(socket_addr) => {
-            let dns_iter_id = caller
-                .data_mut()
-                .dns_resources_mut()
-                .add(DnsIterator::new(vec![socket_addr].into_iter()));
-            (dns_iter_id, 0)
-        }
-        Err(error) => {
-            if error.kind() == ErrorKind::NotConnected {
-                (caller.data_mut().add_error_resource(error.into()), 1)
-            } else {
-                (caller.data_mut().add_error_resource(error.into()), 2)
+    let memory = get_memory(&mut caller)?;
+    validate_memory_range(
+        &caller,
+        &memory,
+        id_u64_ptr,
+        std::mem::size_of::<u64>(),
+        "lunatic::network::udp_peer_addr",
+    )?;
+    let lease = caller.data().reserve_dns_iterator_lease();
+    let (dns_iter_or_error_id, result) = match lease {
+        Ok(lease) => {
+            let peer_addr = caller
+                .data()
+                .udp_resources()
+                .get(udp_socket_id)
+                .expect("validated UDP socket must remain in the resource table")
+                .peer_addr();
+            match peer_addr {
+                Ok(socket_addr) => {
+                    let iterator = DnsIterator::with_lease(vec![socket_addr].into_iter(), lease);
+                    (caller.data_mut().dns_resources_mut().add(iterator), 0)
+                }
+                Err(error) if error.kind() == ErrorKind::NotConnected => {
+                    (caller.data_mut().add_error_resource(error.into()), 1)
+                }
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 2),
             }
         }
+        Err(error) => (caller.data_mut().add_error_resource(error), 2),
     };
 
-    let memory = get_memory(&mut caller)?;
     memory
         .write(
             &mut caller,

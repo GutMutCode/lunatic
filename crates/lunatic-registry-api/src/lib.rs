@@ -2,7 +2,7 @@ use std::future::Future;
 
 use anyhow::Result;
 use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
-use lunatic_process::state::ProcessState;
+use lunatic_process::state::{ensure_registry_insert_capacity, ProcessState};
 use lunatic_process_api::ProcessCtx;
 use wasmtime::{Caller, Linker};
 
@@ -62,11 +62,9 @@ fn put<T: ProcessState + ProcessCtx<T> + Send + Sync>(
             .or_trap("lunatic::registry::put")?;
         let name = std::str::from_utf8(name).or_trap("lunatic::registry::put")?;
 
-        state
-            .registry()
-            .write()
-            .await
-            .insert(name.to_owned(), (node_id, process_id));
+        let mut registry = state.registry().write().await;
+        ensure_registry_insert_capacity(&registry, name)?;
+        registry.insert(name.to_owned(), (node_id, process_id));
 
         #[cfg(feature = "metrics")]
         metrics::increment_counter!("lunatic.registry.write");

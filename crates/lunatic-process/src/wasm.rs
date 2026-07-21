@@ -2,11 +2,11 @@ use std::sync::{atomic::Ordering, Arc};
 
 use anyhow::{anyhow, Result};
 use log::trace;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use wasmtime::{ResourceLimiter, Val};
 
-use crate::env::Environment;
+use crate::env::{register_process, Environment};
 use crate::module_registry::{ModuleRegistry, ProcessKey};
 use crate::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use crate::state::ProcessState;
@@ -37,7 +37,7 @@ pub struct WasmSpawnOptions {
 async fn run_wasm_execution<S>(
     context: ProcessContext<S>,
     env: Arc<dyn Environment>,
-    mut reload_receiver: UnboundedReceiver<ReloadCommand>,
+    mut reload_receiver: Receiver<ReloadCommand>,
     function: String,
     params: Vec<Val>,
 ) -> ExecutionResult<S>
@@ -312,6 +312,11 @@ where
     trace!("Spawning process: {}", id);
     let signal_mailbox = state.signal_mailbox().clone();
     let message_mailbox = state.message_mailbox().clone();
+    // Claim and publish the bounded process slot before allocating a Wasm
+    // Store or running module initialization. If any subsequent setup fails,
+    // the registration guard removes the provisional process automatically.
+    let child_process_handle = Arc::new(WasmProcess::new(id, signal_mailbox.0.clone()));
+    let registration = register_process(env.clone(), id, child_process_handle.clone())?;
 
     let instance = runtime.instantiate(module, state).await?;
     let function = function.to_string();
@@ -344,18 +349,6 @@ where
         function,
         params,
     );
-    let child_process = crate::new(
-        fut,
-        id,
-        env.clone(),
-        signal_mailbox.1,
-        message_mailbox,
-        Some(context),
-    );
-    let child_process_handle = Arc::new(WasmProcess::new(id, signal_mailbox.0.clone()));
-
-    env.add_process(id, child_process_handle.clone());
-
     // **Child link guarantees**:
     // The link signal is going to be put inside of the child's mailbox and is going to be
     // processed before any child code can run. This means that any failure inside the child
@@ -381,15 +374,26 @@ where
     //       running somewhere else.
     if let Some((tag, process)) = link {
         // Send signal to itself to perform the linking
-        process.send(Signal::Link(None, child_process_handle.clone()));
+        process
+            .send(Signal::Link(None, child_process_handle.clone()))
+            .map_err(|error| anyhow!("failed to link spawning process to child {id}: {error}"))?;
         // Suspend itself to process all new signals
         tokio::task::yield_now().await;
         // Send signal to child to link it
         signal_mailbox
             .0
             .send(Signal::Link(tag, process))
-            .expect("receiver must exist at this point");
+            .map_err(|error| anyhow!("failed to link child {id} to spawning process: {error}"))?;
     }
+
+    let child_process = crate::new(
+        fut,
+        id,
+        signal_mailbox.1,
+        message_mailbox,
+        Some(context),
+        registration,
+    );
 
     // Spawn a background process
     trace!("Process size: {}", std::mem::size_of_val(&child_process));

@@ -17,6 +17,7 @@ lunatic-process = { workspace = true }
 lunatic-process-api = { workspace = true }
 
 anyhow = { workspace = true }
+log = { workspace = true }
 metrics = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["time", "rt"] }
 wasmtime = { workspace = true }

@@ -4,7 +4,10 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use lunatic_process::config::ProcessConfig;
+use lunatic_process::config::{
+    ProcessConfig, DEFAULT_MAX_MAILBOX_MESSAGES, DEFAULT_MAX_MESSAGE_RESOURCES,
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_SIGNAL_QUEUE,
+};
 use lunatic_process_api::ProcessConfigCtx;
 use lunatic_wasi_api::LunaticWasiConfigCtx;
 use serde::{Deserialize, Serialize};
@@ -29,6 +32,30 @@ pub struct DefaultProcessConfig {
     max_table_elements: u32,
     max_file_descriptors: u32,
     max_network_connections: u32,
+    #[serde(default = "default_max_mailbox_messages")]
+    max_mailbox_messages: u32,
+    #[serde(default = "default_max_signal_queue")]
+    max_signal_queue: u32,
+    #[serde(default = "default_max_message_size")]
+    max_message_size: u64,
+    #[serde(default = "default_max_message_resources")]
+    max_message_resources: u32,
+}
+
+const fn default_max_mailbox_messages() -> u32 {
+    DEFAULT_MAX_MAILBOX_MESSAGES
+}
+
+const fn default_max_signal_queue() -> u32 {
+    DEFAULT_MAX_SIGNAL_QUEUE
+}
+
+const fn default_max_message_size() -> u64 {
+    DEFAULT_MAX_MESSAGE_SIZE
+}
+
+const fn default_max_message_resources() -> u32 {
+    DEFAULT_MAX_MESSAGE_RESOURCES
 }
 
 impl Default for DefaultProcessConfig {
@@ -45,6 +72,10 @@ impl Default for DefaultProcessConfig {
             max_table_elements: 100_000,
             max_file_descriptors: 1024,
             max_network_connections: 1024,
+            max_mailbox_messages: DEFAULT_MAX_MAILBOX_MESSAGES,
+            max_signal_queue: DEFAULT_MAX_SIGNAL_QUEUE,
+            max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
+            max_message_resources: DEFAULT_MAX_MESSAGE_RESOURCES,
         }
     }
 }
@@ -57,6 +88,10 @@ impl Debug for DefaultProcessConfig {
             .field("preopened_dirs", &self.preopened_dirs)
             .field("args", &self.command_line_arguments)
             .field("envs", &self.environment_variables)
+            .field("max_mailbox_messages", &self.max_mailbox_messages)
+            .field("max_signal_queue", &self.max_signal_queue)
+            .field("max_message_size", &self.max_message_size)
+            .field("max_message_resources", &self.max_message_resources)
             .finish()
     }
 }
@@ -78,6 +113,38 @@ impl ProcessConfig for DefaultProcessConfig {
         self.max_memory
     }
 
+    fn set_max_mailbox_messages(&mut self, max: u32) {
+        self.max_mailbox_messages = max;
+    }
+
+    fn get_max_mailbox_messages(&self) -> u32 {
+        self.max_mailbox_messages
+    }
+
+    fn set_max_signal_queue(&mut self, max: u32) {
+        self.max_signal_queue = max;
+    }
+
+    fn get_max_signal_queue(&self) -> u32 {
+        self.max_signal_queue
+    }
+
+    fn set_max_message_size(&mut self, max: u64) {
+        self.max_message_size = max;
+    }
+
+    fn get_max_message_size(&self) -> u64 {
+        self.max_message_size
+    }
+
+    fn set_max_message_resources(&mut self, max: u32) {
+        self.max_message_resources = max;
+    }
+
+    fn get_max_message_resources(&self) -> u32 {
+        self.max_message_resources
+    }
+
     fn new_child_config(&self) -> Result<Self, String> {
         Ok(Self {
             max_memory: self.max_memory,
@@ -91,10 +158,15 @@ impl ProcessConfig for DefaultProcessConfig {
             max_table_elements: self.max_table_elements,
             max_file_descriptors: self.max_file_descriptors,
             max_network_connections: self.max_network_connections,
+            max_mailbox_messages: self.max_mailbox_messages,
+            max_signal_queue: self.max_signal_queue,
+            max_message_size: self.max_message_size,
+            max_message_resources: self.max_message_resources,
         })
     }
 
     fn validate_child_config(&self, child: &Self) -> Result<(), String> {
+        child.validate_runtime_limits()?;
         if child.can_compile_modules && !self.can_compile_modules {
             return Err("compile-module capability exceeds parent authority".into());
         }
@@ -140,6 +212,30 @@ impl ProcessConfig for DefaultProcessConfig {
                 child.max_network_connections, self.max_network_connections
             ));
         }
+        if child.max_mailbox_messages > self.max_mailbox_messages {
+            return Err(format!(
+                "max_mailbox_messages {} exceeds parent ceiling {}",
+                child.max_mailbox_messages, self.max_mailbox_messages
+            ));
+        }
+        if child.max_signal_queue > self.max_signal_queue {
+            return Err(format!(
+                "max_signal_queue {} exceeds parent ceiling {}",
+                child.max_signal_queue, self.max_signal_queue
+            ));
+        }
+        if child.max_message_size > self.max_message_size {
+            return Err(format!(
+                "max_message_size {} exceeds parent ceiling {}",
+                child.max_message_size, self.max_message_size
+            ));
+        }
+        if child.max_message_resources > self.max_message_resources {
+            return Err(format!(
+                "max_message_resources {} exceeds parent ceiling {}",
+                child.max_message_resources, self.max_message_resources
+            ));
+        }
         for (_, dir) in &child.preopened_dirs {
             self.can_delegate_preopen_dir(Path::new(dir))?;
         }
@@ -147,14 +243,72 @@ impl ProcessConfig for DefaultProcessConfig {
     }
 
     fn validate_distributed_config(&self) -> Result<(), String> {
-        if self.preopened_dirs.is_empty() {
-            Ok(())
-        } else {
-            Err(
+        self.validate_runtime_limits()?;
+        let receiver_ceiling = Self::default();
+        if self.can_compile_modules && !receiver_ceiling.can_compile_modules {
+            return Err("compile-module capability exceeds receiver authority".into());
+        }
+        if self.can_create_configs && !receiver_ceiling.can_create_configs {
+            return Err("create-config capability exceeds receiver authority".into());
+        }
+        if self.can_spawn_processes && !receiver_ceiling.can_spawn_processes {
+            return Err("spawn capability exceeds receiver authority".into());
+        }
+        if self.max_memory > receiver_ceiling.max_memory {
+            return Err(format!(
+                "max_memory {} exceeds receiver ceiling {}",
+                self.max_memory, receiver_ceiling.max_memory
+            ));
+        }
+        if self.max_table_elements > receiver_ceiling.max_table_elements {
+            return Err(format!(
+                "max_table_elements {} exceeds receiver ceiling {}",
+                self.max_table_elements, receiver_ceiling.max_table_elements
+            ));
+        }
+        if self.max_file_descriptors > receiver_ceiling.max_file_descriptors {
+            return Err(format!(
+                "max_file_descriptors {} exceeds receiver ceiling {}",
+                self.max_file_descriptors, receiver_ceiling.max_file_descriptors
+            ));
+        }
+        if self.max_network_connections > receiver_ceiling.max_network_connections {
+            return Err(format!(
+                "max_network_connections {} exceeds receiver ceiling {}",
+                self.max_network_connections, receiver_ceiling.max_network_connections
+            ));
+        }
+        if self.max_mailbox_messages > receiver_ceiling.max_mailbox_messages {
+            return Err(format!(
+                "max_mailbox_messages {} exceeds receiver ceiling {}",
+                self.max_mailbox_messages, receiver_ceiling.max_mailbox_messages
+            ));
+        }
+        if self.max_signal_queue > receiver_ceiling.max_signal_queue {
+            return Err(format!(
+                "max_signal_queue {} exceeds receiver ceiling {}",
+                self.max_signal_queue, receiver_ceiling.max_signal_queue
+            ));
+        }
+        if self.max_message_size > receiver_ceiling.max_message_size {
+            return Err(format!(
+                "max_message_size {} exceeds receiver ceiling {}",
+                self.max_message_size, receiver_ceiling.max_message_size
+            ));
+        }
+        if self.max_message_resources > receiver_ceiling.max_message_resources {
+            return Err(format!(
+                "max_message_resources {} exceeds receiver ceiling {}",
+                self.max_message_resources, receiver_ceiling.max_message_resources
+            ));
+        }
+        if !self.preopened_dirs.is_empty() {
+            return Err(
                 "filesystem preopens are host-local and cannot be delegated to a remote node without an explicit receiver policy"
                     .into(),
-            )
+            );
         }
+        Ok(())
     }
 }
 
@@ -173,6 +327,19 @@ impl LunaticWasiConfigCtx for DefaultProcessConfig {
 }
 
 impl DefaultProcessConfig {
+    pub(crate) fn validate_runtime_limits(&self) -> Result<(), String> {
+        if self.max_mailbox_messages == 0 {
+            return Err("max_mailbox_messages must be greater than zero".into());
+        }
+        if self.max_signal_queue == 0 {
+            return Err("max_signal_queue must be greater than zero".into());
+        }
+        if self.max_message_size == 0 {
+            return Err("max_message_size must be greater than zero".into());
+        }
+        Ok(())
+    }
+
     pub fn preopened_dirs(&self) -> &[(String, String)] {
         &self.preopened_dirs
     }
@@ -199,6 +366,38 @@ impl DefaultProcessConfig {
 
     pub fn set_max_network_connections(&mut self, max: u32) {
         self.max_network_connections = max;
+    }
+
+    pub fn get_max_mailbox_messages(&self) -> u32 {
+        self.max_mailbox_messages
+    }
+
+    pub fn set_max_mailbox_messages(&mut self, max: u32) {
+        self.max_mailbox_messages = max;
+    }
+
+    pub fn get_max_signal_queue(&self) -> u32 {
+        self.max_signal_queue
+    }
+
+    pub fn set_max_signal_queue(&mut self, max: u32) {
+        self.max_signal_queue = max;
+    }
+
+    pub fn get_max_message_size(&self) -> u64 {
+        self.max_message_size
+    }
+
+    pub fn set_max_message_size(&mut self, max: u64) {
+        self.max_message_size = max;
+    }
+
+    pub fn get_max_message_resources(&self) -> u32 {
+        self.max_message_resources
+    }
+
+    pub fn set_max_message_resources(&mut self, max: u32) {
+        self.max_message_resources = max;
     }
 
     /// Grant access to the given directory with this config.
@@ -311,6 +510,38 @@ impl ProcessConfigCtx for DefaultProcessConfig {
 
     fn set_max_network_connections(&mut self, max: u32) {
         self.max_network_connections = max;
+    }
+
+    fn get_max_mailbox_messages(&self) -> u32 {
+        self.max_mailbox_messages
+    }
+
+    fn set_max_mailbox_messages(&mut self, max: u32) {
+        self.max_mailbox_messages = max;
+    }
+
+    fn get_max_signal_queue(&self) -> u32 {
+        self.max_signal_queue
+    }
+
+    fn set_max_signal_queue(&mut self, max: u32) {
+        self.max_signal_queue = max;
+    }
+
+    fn get_max_message_size(&self) -> u64 {
+        self.max_message_size
+    }
+
+    fn set_max_message_size(&mut self, max: u64) {
+        self.max_message_size = max;
+    }
+
+    fn get_max_message_resources(&self) -> u32 {
+        self.max_message_resources
+    }
+
+    fn set_max_message_resources(&mut self, max: u32) {
+        self.max_message_resources = max;
     }
 
     fn can_access_fs_location(&self, path: &std::path::Path) -> Result<(), String> {
@@ -572,6 +803,78 @@ mod tests {
             .validate_distributed_config()
             .unwrap_err()
             .contains("host-local"));
+    }
+
+    #[test]
+    fn distributed_validator_rejects_zero_queue_and_message_limits() {
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_mailbox_messages(0);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("max_mailbox_messages"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_signal_queue(0);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("max_signal_queue"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_message_size(0);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("max_message_size"));
+    }
+
+    #[test]
+    fn distributed_validator_applies_receiver_resource_ceilings() {
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_memory(config.get_max_memory() + 1);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("receiver ceiling"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_signal_queue(config.get_max_signal_queue() + 1);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("receiver ceiling"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_network_connections(config.get_max_network_connections() + 1);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("receiver ceiling"));
+    }
+
+    #[test]
+    fn distributed_validator_rejects_receiver_local_capability_escalation() {
+        let mut config = DefaultProcessConfig::default();
+        config.set_can_compile_modules(true);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("compile-module capability"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_can_create_configs(true);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("create-config capability"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_can_spawn_processes(true);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("spawn capability"));
     }
 
     #[cfg(unix)]

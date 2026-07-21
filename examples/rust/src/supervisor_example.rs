@@ -9,7 +9,8 @@ use std::{future, sync::Arc};
 fn start_worker(environment: Arc<dyn Environment>) -> Result<Arc<dyn Process>, String> {
     let (_join, process) = spawn_native(environment, |_process, _mailbox| async move {
         future::pending::<anyhow::Result<()>>().await
-    });
+    })
+    .map_err(|error| error.to_string())?;
     Ok(Arc::new(process))
 }
 

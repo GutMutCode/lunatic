@@ -17,16 +17,19 @@ use std::{
 };
 
 use anyhow::{anyhow, ensure, Result};
-use env::Environment;
+use env::{register_process, Environment, ProcessRegistration};
 use futures_util::FutureExt;
 use log::{debug, log_enabled, trace, warn, Level};
 
 use smallvec::SmallVec;
-use state::ProcessState;
+use state::{
+    default_mailboxes, MonitorNotification, MonitorNotificationError, ProcessState, SignalReceiver,
+    SignalSendError, SignalSender,
+};
 use tokio::{
     sync::{
-        mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-        oneshot, Mutex,
+        mpsc::{channel, error::TrySendError, Receiver, Sender},
+        oneshot,
     },
     task::JoinHandle,
 };
@@ -324,8 +327,8 @@ impl<S: ProcessState> Drop for ProcessVersionTracking<S> {
 pub struct ProcessContext<S: ProcessState + Send + 'static> {
     pub instance: Arc<RwLock<Option<crate::runtimes::wasmtime::WasmtimeInstance<S>>>>,
     pub reload_in_progress: Arc<AtomicBool>,
-    reload_sender: UnboundedSender<ReloadCommand>,
-    reload_receiver: Arc<std::sync::Mutex<Option<UnboundedReceiver<ReloadCommand>>>>,
+    reload_sender: Sender<ReloadCommand>,
+    reload_receiver: Arc<std::sync::Mutex<Option<Receiver<ReloadCommand>>>>,
     version_tracking: Arc<ProcessVersionTracking<S>>,
 }
 
@@ -343,7 +346,8 @@ impl<S: ProcessState + Send + 'static> Clone for ProcessContext<S> {
 
 impl<S: ProcessState + Send + 'static> ProcessContext<S> {
     pub fn new(instance: crate::runtimes::wasmtime::WasmtimeInstance<S>) -> Self {
-        let (reload_sender, reload_receiver) = unbounded_channel();
+        const RELOAD_QUEUE_CAPACITY: usize = 16;
+        let (reload_sender, reload_receiver) = channel(RELOAD_QUEUE_CAPACITY);
         Self {
             instance: Arc::new(RwLock::new(Some(instance))),
             reload_in_progress: Arc::new(AtomicBool::new(false)),
@@ -362,7 +366,7 @@ impl<S: ProcessState + Send + 'static> ProcessContext<S> {
         instance.replace(new_instance)
     }
 
-    pub(crate) fn take_reload_receiver(&self) -> UnboundedReceiver<ReloadCommand> {
+    pub(crate) fn take_reload_receiver(&self) -> Receiver<ReloadCommand> {
         self.reload_receiver
             .lock()
             .unwrap()
@@ -373,8 +377,8 @@ impl<S: ProcessState + Send + 'static> ProcessContext<S> {
     pub(crate) fn request_reload(
         &self,
         command: ReloadCommand,
-    ) -> std::result::Result<(), tokio::sync::mpsc::error::SendError<ReloadCommand>> {
-        self.reload_sender.send(command)
+    ) -> std::result::Result<(), TrySendError<ReloadCommand>> {
+        self.reload_sender.try_send(command)
     }
 
     pub(crate) fn track_initial_version(
@@ -511,18 +515,54 @@ pub trait Process: Send + Sync {
     /// Get the process ID
     fn id(&self) -> u64;
     /// Send a signal to the process
-    fn send(&self, signal: Signal);
+    fn send(&self, signal: Signal) -> std::result::Result<(), SignalSendError>;
+
+    /// Reserves durable mailbox admission for a future monitor notification.
+    ///
+    /// Built-in processes return a direct-delivery reservation. The default
+    /// keeps custom process implementations source-compatible and uses the
+    /// signal-based notification path instead.
+    #[doc(hidden)]
+    fn reserve_monitor_notification(
+        &self,
+    ) -> std::result::Result<Option<MonitorNotification>, MonitorNotificationError> {
+        Ok(None)
+    }
+}
+
+fn notify_linked_process(
+    linked_process: &Arc<dyn Process>,
+    process_id: u64,
+    tag: Option<i64>,
+    death_reason: DeathReason,
+) {
+    if let Err(error) = linked_process.send(Signal::LinkDied(process_id, tag, death_reason)) {
+        warn!("Failed to notify linked process that process {process_id} died: {error}");
+        // Failure/NoProcess links are fatal by default. If mailbox or signal
+        // admission prevents delivery, fail closed through the out-of-band
+        // idempotent Kill latch instead of silently losing the lifecycle
+        // event. Processes opting to trap exits still receive LinkDied under
+        // normal capacity; overload deliberately favors termination safety.
+        if matches!(death_reason, DeathReason::Failure | DeathReason::NoProcess) {
+            if let Err(kill_error) = linked_process.send(Signal::Kill) {
+                warn!(
+                    "Failed to apply fallback kill after link-death backpressure for process \
+                     {process_id}: {kill_error}"
+                );
+            }
+        }
+    }
 }
 
 /// Handle to a WASM process
 #[derive(Clone, Debug)]
 pub struct WasmProcess {
     id: u64,
-    signal_sender: tokio::sync::mpsc::UnboundedSender<Signal>,
+    signal_sender: SignalSender,
 }
 
 impl WasmProcess {
-    pub fn new(id: u64, signal_sender: tokio::sync::mpsc::UnboundedSender<Signal>) -> Self {
+    pub fn new(id: u64, signal_sender: SignalSender) -> Self {
         Self { id, signal_sender }
     }
 }
@@ -532,9 +572,14 @@ impl Process for WasmProcess {
         self.id
     }
 
-    fn send(&self, signal: Signal) {
-        // If the receiver doesn't exist or is closed, just ignore it
-        let _ = self.signal_sender.send(signal);
+    fn send(&self, signal: Signal) -> std::result::Result<(), SignalSendError> {
+        self.signal_sender.send(signal)
+    }
+
+    fn reserve_monitor_notification(
+        &self,
+    ) -> std::result::Result<Option<MonitorNotification>, MonitorNotificationError> {
+        self.signal_sender.reserve_monitor_notification().map(Some)
     }
 }
 
@@ -612,14 +657,14 @@ pub fn describe_metrics() {
 #[derive(Clone, Debug)]
 pub struct NativeProcess {
     id: u64,
-    signal_mailbox: UnboundedSender<Signal>,
+    signal_mailbox: SignalSender,
 }
 
 /// Spawns a process from a closure.
 pub fn spawn<T, F, K, R>(
     env: Arc<dyn Environment>,
     func: F,
-) -> (JoinHandle<Result<T>>, NativeProcess)
+) -> Result<(JoinHandle<Result<T>>, NativeProcess)>
 where
     T: ProcessState
         + Send
@@ -632,23 +677,22 @@ where
     F: FnOnce(NativeProcess, MessageMailbox) -> K,
 {
     let id = env.get_next_process_id();
-    let (signal_sender, signal_mailbox) = unbounded_channel::<Signal>();
-    let message_mailbox = MessageMailbox::default();
+    let ((signal_sender, signal_mailbox), message_mailbox) = default_mailboxes();
     let process = NativeProcess {
         id,
         signal_mailbox: signal_sender,
     };
+    let registration = register_process(env.clone(), id, Arc::new(process.clone()))?;
     let fut = func(process.clone(), message_mailbox.clone());
-    let signal_mailbox = Arc::new(Mutex::new(signal_mailbox));
     let join = tokio::task::spawn(new(
         fut,
         id,
-        env.clone(),
         signal_mailbox,
         message_mailbox,
         None,
+        registration,
     ));
-    (join, process)
+    Ok((join, process))
 }
 
 /// Spawns a native Lunatic process whose future returns no Wasm process state.
@@ -660,30 +704,28 @@ where
 pub fn spawn_native<F, K>(
     env: Arc<dyn Environment>,
     func: F,
-) -> (JoinHandle<Result<()>>, NativeProcess)
+) -> Result<(JoinHandle<Result<()>>, NativeProcess)>
 where
     K: Future<Output = Result<()>> + Send + 'static,
     F: FnOnce(NativeProcess, MessageMailbox) -> K,
 {
     let id = env.get_next_process_id();
-    let (signal_sender, signal_mailbox) = unbounded_channel::<Signal>();
-    let message_mailbox = MessageMailbox::default();
+    let ((signal_sender, signal_mailbox), message_mailbox) = default_mailboxes();
     let process = NativeProcess {
         id,
         signal_mailbox: signal_sender,
     };
+    let registration = register_process(env.clone(), id, Arc::new(process.clone()))?;
     let fut = func(process.clone(), message_mailbox.clone());
-    let signal_mailbox = Arc::new(Mutex::new(signal_mailbox));
 
-    env.add_process(id, Arc::new(process.clone()));
     let join = tokio::task::spawn(run_native_process(
         fut,
         id,
-        env,
         signal_mailbox,
         message_mailbox,
+        registration,
     ));
-    (join, process)
+    Ok((join, process))
 }
 
 impl Process for NativeProcess {
@@ -691,7 +733,7 @@ impl Process for NativeProcess {
         self.id
     }
 
-    fn send(&self, signal: Signal) {
+    fn send(&self, signal: Signal) -> std::result::Result<(), SignalSendError> {
         #[cfg(all(feature = "metrics", not(feature = "detailed_metrics")))]
         let labels = [("process_kind", "native")];
         #[cfg(all(feature = "metrics", feature = "detailed_metrics"))]
@@ -702,11 +744,13 @@ impl Process for NativeProcess {
         #[cfg(feature = "metrics")]
         metrics::increment_counter!("lunatic.process.signals.send", &labels);
 
-        // If the receiver doesn't exist or is closed, just ignore it and drop the `signal`.
-        // lunatic can't guarantee that a message was successfully seen by the receiving side even
-        // if this call succeeds. We deliberately don't expose this API, as it would not make sense
-        // to relay on it and could signal wrong guarantees to users.
-        let _ = self.signal_mailbox.send(signal);
+        self.signal_mailbox.send(signal)
+    }
+
+    fn reserve_monitor_notification(
+        &self,
+    ) -> std::result::Result<Option<MonitorNotification>, MonitorNotificationError> {
+        self.signal_mailbox.reserve_monitor_notification().map(Some)
     }
 }
 
@@ -773,9 +817,9 @@ pub enum Finished<R> {
 async fn run_native_process<F>(
     fut: F,
     id: u64,
-    env: Arc<dyn Environment>,
-    signal_mailbox: Arc<Mutex<UnboundedReceiver<Signal>>>,
+    signal_mailbox: SignalReceiver,
     message_mailbox: MessageMailbox,
+    registration: ProcessRegistration,
 ) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
@@ -795,42 +839,92 @@ where
             tokio::select! {
                 biased;
                 signal = signal_mailbox.recv(), if has_sender => {
+                    let Some(envelope) = signal else {
+                        has_sender = false;
+                        continue;
+                    };
+                    let (
+                        signal,
+                        mailbox_permit,
+                        link_permit,
+                        monitor_permit,
+                        monitor_notification,
+                    ) =
+                        envelope.into_process_parts();
                     match signal {
-                        Some(Signal::Message(message)) => message_mailbox.push(message),
-                        Some(Signal::DieWhenLinkDies(value)) => die_when_link_dies = value,
-                        Some(Signal::Link(tag, process)) => {
-                            links.insert(process.id(), (process, tag));
+                        Signal::Message(message) => message_mailbox
+                            .push_with_permit(
+                                message,
+                                mailbox_permit.expect("message signal must reserve mailbox capacity"),
+                            )
+                            .expect("signal sender must reserve from the destination mailbox"),
+                        Signal::DieWhenLinkDies(value) => die_when_link_dies = value,
+                        Signal::Link(tag, process) => {
+                            links.insert(
+                                process.id(),
+                                (
+                                    process,
+                                    tag,
+                                    link_permit.expect("link signal must reserve link capacity"),
+                                ),
+                            );
                         }
-                        Some(Signal::UnLink { process_id }) => {
+                        Signal::UnLink { process_id } => {
                             links.remove(&process_id);
                         }
-                        Some(Signal::LinkDied(process_id, tag, reason)) => {
+                        Signal::LinkDied(process_id, tag, reason) => {
                             links.remove(&process_id);
                             match reason {
                                 DeathReason::Failure | DeathReason::NoProcess if die_when_link_dies => {
                                     break Finished::KillSignal;
                                 }
                                 DeathReason::Failure | DeathReason::NoProcess => {
-                                    message_mailbox.push(Message::LinkDied(tag));
+                                    message_mailbox
+                                        .push_with_permit(
+                                            Message::LinkDied(tag),
+                                            mailbox_permit.expect(
+                                                "link-death signal must reserve mailbox capacity",
+                                            ),
+                                        )
+                                        .expect(
+                                            "signal sender must reserve from the destination mailbox",
+                                        );
                                 }
                                 DeathReason::Normal => {}
                             }
                         }
-                        Some(Signal::Monitor(process)) => {
-                            monitors.insert(process.id(), process);
+                        Signal::Monitor(process) => {
+                            monitors.insert(
+                                process.id(),
+                                (
+                                    process,
+                                    monitor_permit
+                                        .expect("monitor signal must reserve monitor capacity"),
+                                    monitor_notification,
+                                ),
+                            );
                         }
-                        Some(Signal::StopMonitoring { process_id }) => {
+                        Signal::StopMonitoring { process_id } => {
                             monitors.remove(&process_id);
                         }
-                        Some(Signal::ProcessDied(process_id)) => {
-                            message_mailbox.push(Message::ProcessDied(process_id));
+                        Signal::ProcessDied(process_id) => {
+                            message_mailbox
+                                .push_with_permit(
+                                    Message::ProcessDied(process_id),
+                                    mailbox_permit.expect(
+                                        "process-death signal must reserve mailbox capacity",
+                                    ),
+                                )
+                                .expect(
+                                    "signal sender must reserve from the destination mailbox",
+                                );
                         }
-                        Some(Signal::Kill) => break Finished::KillSignal,
-                        Some(Signal::HotReload {
+                        Signal::Kill => break Finished::KillSignal,
+                        Signal::HotReload {
                             module_id,
                             acknowledgement,
                             ..
-                        }) => {
+                        } => {
                             warn!("Hot reload is not supported for native process {}", id);
                             acknowledge_reload(
                                 acknowledgement,
@@ -843,11 +937,11 @@ where
                                 ),
                             );
                         }
-                        Some(Signal::Rollback {
+                        Signal::Rollback {
                             module_id,
                             acknowledgement,
                             ..
-                        }) => {
+                        } => {
                             warn!("Rollback is not supported for native process {}", id);
                             acknowledge_reload(
                                 acknowledgement,
@@ -860,7 +954,6 @@ where
                                 ),
                             );
                         }
-                        None => has_sender = false,
                     }
                 }
                 output = &mut fut => {
@@ -873,7 +966,7 @@ where
         }
     };
 
-    env.remove_process(id);
+    registration.unregister();
 
     let (result, death_reason) = match result {
         Finished::Normal(Ok(())) => (Ok(()), DeathReason::Normal),
@@ -885,11 +978,17 @@ where
         ),
     };
 
-    for monitor in monitors.values() {
-        monitor.send(Signal::ProcessDied(id));
+    for (_, (monitor, _, notification)) in monitors {
+        if let Some(notification) = notification {
+            if let Err(error) = notification.deliver(id) {
+                warn!("Failed to deliver reserved monitor notification for process {id}: {error}");
+            }
+        } else if let Err(error) = monitor.send(Signal::ProcessDied(id)) {
+            warn!("Failed to notify custom monitor that process {id} died: {error}");
+        }
     }
-    for (linked_process, tag) in links.values() {
-        linked_process.send(Signal::LinkDied(id, *tag, death_reason));
+    for (linked_process, tag, _) in links.values() {
+        notify_linked_process(linked_process, id, *tag, death_reason);
     }
 
     result
@@ -954,10 +1053,10 @@ impl<'a> FromIterator<&'a str> for NameOrID<'a> {
 pub(crate) async fn new<F, S, R>(
     fut: F,
     id: u64,
-    env: Arc<dyn Environment>,
-    signal_mailbox: Arc<Mutex<UnboundedReceiver<Signal>>>,
+    signal_mailbox: SignalReceiver,
     message_mailbox: MessageMailbox,
     context: Option<ProcessContext<S>>,
+    registration: ProcessRegistration,
 ) -> Result<S>
 where
     S: ProcessState
@@ -997,13 +1096,33 @@ where
                 #[cfg(feature = "metrics")]
                 metrics::increment_counter!("lunatic.process.signals.received", &labels);
 
-                match signal.ok_or(()) {
-                    Ok(Signal::Message(message)) => {
+                let Some(envelope) = signal else {
+                    debug_assert!(has_sender);
+                    has_sender = false;
+                    continue;
+                };
+                let (
+                    signal,
+                    mailbox_permit,
+                    link_permit,
+                    monitor_permit,
+                    monitor_notification,
+                ) =
+                    envelope.into_process_parts();
+                match signal {
+                    Signal::Message(message) => {
 
                         #[cfg(feature = "metrics")]
                         message.write_metrics();
 
-                        message_mailbox.push(message);
+                        message_mailbox
+                            .push_with_permit(
+                                message,
+                                mailbox_permit.expect(
+                                    "message signal must reserve mailbox capacity",
+                                ),
+                            )
+                            .expect("signal sender must reserve from the destination mailbox");
 
                         // process metrics
                         #[cfg(feature = "metrics")]
@@ -1012,16 +1131,23 @@ where
                         #[cfg(feature = "metrics")]
                         metrics::gauge!("lunatic.process.messages.outstanding", message_mailbox.len() as f64, &labels);
                     },
-                    Ok(Signal::DieWhenLinkDies(value)) => die_when_link_dies = value,
+                    Signal::DieWhenLinkDies(value) => die_when_link_dies = value,
                     // Put process into list of linked processes
-                    Ok(Signal::Link(tag, proc)) => {
-                        links.insert(proc.id(), (proc, tag));
+                    Signal::Link(tag, proc) => {
+                        links.insert(
+                            proc.id(),
+                            (
+                                proc,
+                                tag,
+                                link_permit.expect("link signal must reserve link capacity"),
+                            ),
+                        );
 
                         #[cfg(feature = "metrics")]
                         metrics::gauge!("lunatic.process.links.alive", links.len() as f64, &labels);
                     },
                     // Remove process from list
-                    Ok(Signal::UnLink { process_id }) => {
+                    Signal::UnLink { process_id } => {
                         links.remove(&process_id);
 
                         #[cfg(feature = "metrics")]
@@ -1029,7 +1155,7 @@ where
                     }
                     // Depending if `die_when_link_dies` is set, process will die or turn the
                     // signal into a message
-                    Ok(Signal::LinkDied(id, tag, reason)) => {
+                    Signal::LinkDied(id, tag, reason) => {
                         links.remove(&id);
 
                         #[cfg(feature = "metrics")]
@@ -1048,7 +1174,16 @@ where
 
                                     #[cfg(feature = "metrics")]
                                     metrics::gauge!("lunatic.process.messages.outstanding", message_mailbox.len() as f64, &labels);
-                                    message_mailbox.push(message);
+                                    message_mailbox
+                                        .push_with_permit(
+                                            message,
+                                            mailbox_permit.expect(
+                                                "link-death signal must reserve mailbox capacity",
+                                            ),
+                                        )
+                                        .expect(
+                                            "signal sender must reserve from the destination mailbox",
+                                        );
                                 }
                             },
                             // In case a linked process finishes normally, don't do anything.
@@ -1056,26 +1191,40 @@ where
                         }
                     },
                     // Put process into list of monitor processes
-                    Ok(Signal::Monitor(proc)) => {
-                        monitors.insert(proc.id(), proc);
+                    Signal::Monitor(proc) => {
+                        monitors.insert(
+                            proc.id(),
+                            (
+                                proc,
+                                monitor_permit.expect("monitor signal must reserve monitor capacity"),
+                                monitor_notification,
+                            ),
+                        );
                     }
                     // Remove process from monitor list
-                    Ok(Signal::StopMonitoring { process_id }) => {
+                    Signal::StopMonitoring { process_id } => {
                         monitors.remove(&process_id);
                     }
                     // Notify process that a monitored process died
-                    Ok(Signal::ProcessDied(id)) => {
-                        message_mailbox.push(Message::ProcessDied(id));
+                    Signal::ProcessDied(id) => {
+                        message_mailbox
+                            .push_with_permit(
+                                Message::ProcessDied(id),
+                                mailbox_permit.expect(
+                                    "process-death signal must reserve mailbox capacity",
+                                ),
+                            )
+                            .expect("signal sender must reserve from the destination mailbox");
                     }
                     // Kill the process
-                    Ok(Signal::Kill) => break Finished::KillSignal,
+                    Signal::Kill => break Finished::KillSignal,
                     // Hot reload signal - perform true hot reload
-                    Ok(Signal::HotReload {
+                    Signal::HotReload {
                         module_id,
                         expected_version,
                         new_version,
                         acknowledgement,
-                    }) => {
+                    } => {
                         if let Some(context) = &context {
                             log::info!("Processing HotReload signal for module {} version {}", module_id, new_version);
                             let Some(old_version) = context.current_version(module_id) else {
@@ -1106,8 +1255,9 @@ where
                                 acknowledgement,
                             };
                             if let Err(error) = context.request_reload(command) {
-                                log::error!("Failed to queue hot reload: {}", error);
-                                let (_, _, _, _, acknowledgement) = error.0.into_parts();
+                                let failure = error.to_string();
+                                log::error!("Failed to queue hot reload: {failure}");
+                                let (_, _, _, _, acknowledgement) = error.into_inner().into_parts();
                                 acknowledge_reload(
                                     acknowledgement,
                                     id,
@@ -1115,8 +1265,7 @@ where
                                     old_version,
                                     old_version,
                                     ProcessReloadStatus::Failed(
-                                        "Wasm reload execution driver is no longer running"
-                                            .to_string(),
+                                        format!("Failed to queue Wasm reload command: {failure}"),
                                     ),
                                 );
                             }
@@ -1135,12 +1284,12 @@ where
                         }
                     }
                     // Rollback signal - restore previous version
-                    Ok(Signal::Rollback {
+                    Signal::Rollback {
                         module_id,
                         expected_version,
                         target_version,
                         acknowledgement,
-                    }) => {
+                    } => {
                         if let Some(context) = &context {
                             log::info!("Processing Rollback signal for module {} to version {}", module_id, target_version);
                             let Some(current_version) = context.current_version(module_id) else {
@@ -1170,8 +1319,9 @@ where
                                 acknowledgement,
                             };
                             if let Err(error) = context.request_reload(command) {
-                                log::error!("Failed to queue rollback: {}", error);
-                                let (_, _, _, _, acknowledgement) = error.0.into_parts();
+                                let failure = error.to_string();
+                                log::error!("Failed to queue rollback: {failure}");
+                                let (_, _, _, _, acknowledgement) = error.into_inner().into_parts();
                                 acknowledge_reload(
                                     acknowledgement,
                                     id,
@@ -1179,8 +1329,7 @@ where
                                     current_version,
                                     current_version,
                                     ProcessReloadStatus::Failed(
-                                        "Wasm reload execution driver is no longer running"
-                                            .to_string(),
+                                        format!("Failed to queue Wasm rollback command: {failure}"),
                                     ),
                                 );
                             }
@@ -1197,10 +1346,6 @@ where
                                 ),
                             );
                         }
-                    }
-                    Err(_) => {
-                        debug_assert!(has_sender);
-                        has_sender = false;
                     }
                 }
             }
@@ -1221,7 +1366,7 @@ where
     if let Some(context) = &context {
         context.unregister_all_versions();
     }
-    env.remove_process(id);
+    registration.unregister();
 
     let (final_result, death_reason) = match result {
         Finished::Normal(result) => {
@@ -1269,13 +1414,19 @@ where
     };
 
     // Notify all monitors that this process died
-    for monitor in monitors.values() {
-        monitor.send(Signal::ProcessDied(id));
+    for (_, (monitor, _, notification)) in monitors {
+        if let Some(notification) = notification {
+            if let Err(error) = notification.deliver(id) {
+                warn!("Failed to deliver reserved monitor notification for process {id}: {error}");
+            }
+        } else if let Err(error) = monitor.send(Signal::ProcessDied(id)) {
+            warn!("Failed to notify custom monitor that process {id} died: {error}");
+        }
     }
 
     // Notify all links that this process died
-    for (linked_process, tag) in links.values() {
-        linked_process.send(Signal::LinkDied(id, *tag, death_reason));
+    for (linked_process, tag, _) in links.values() {
+        notify_linked_process(linked_process, id, *tag, death_reason);
     }
 
     final_result
@@ -1288,5 +1439,143 @@ fn format_panic_payload(payload: Box<dyn Any + Send>) -> String {
             Ok(message) => (*message).to_string(),
             Err(_) => "process panicked with non-string payload".to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod process_backpressure_tests {
+    use std::{future::pending, sync::Arc};
+
+    use crate::{
+        env::{register_process, Environment, LunaticEnvironment},
+        mailbox::DEFAULT_MESSAGE_MAILBOX_CAPACITY,
+        message::Message,
+        run_native_process, spawn_native,
+        state::{mailboxes_with_capacity, SignalSendErrorKind},
+        NativeProcess, Process, Signal,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_spawn_rejects_at_quota_and_abort_restores_capacity() {
+        let environment: Arc<dyn Environment> =
+            Arc::new(LunaticEnvironment::with_max_processes(91, 1));
+
+        let (join, _) = spawn_native(environment.clone(), |_, _| async move {
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        assert_eq!(environment.process_count(), 1);
+
+        let rejected = spawn_native(environment.clone(), |_, _| async move { Ok(()) });
+        assert!(rejected.is_err());
+        assert_eq!(environment.process_count(), 1);
+
+        join.abort();
+        assert!(join.await.is_err());
+        assert_eq!(environment.process_count(), 0);
+
+        let (reused_join, reused_process) = spawn_native(environment.clone(), |_, _| async move {
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        assert_eq!(environment.process_count(), 1);
+        reused_process.send(Signal::Kill).unwrap();
+        assert!(reused_join.await.unwrap().is_err());
+        assert_eq!(environment.process_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_receiver_is_bounded_and_recovered_payload_can_be_retried() {
+        let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(92));
+        let (mailbox_sender, mailbox_receiver) = tokio::sync::oneshot::channel();
+        let (join, process) = spawn_native(environment, move |_, mailbox| async move {
+            let _ = mailbox_sender.send(mailbox);
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        let mailbox = mailbox_receiver.await.unwrap();
+
+        for process_id in 0..DEFAULT_MESSAGE_MAILBOX_CAPACITY as u64 {
+            process
+                .send(Signal::Message(Message::ProcessDied(process_id)))
+                .unwrap();
+        }
+
+        let error = process
+            .send(Signal::Message(Message::ProcessDied(u64::MAX)))
+            .unwrap_err();
+        assert_eq!(error.kind(), SignalSendErrorKind::MailboxFull);
+        assert_eq!(mailbox.available_capacity(), 0);
+
+        let recovered = error.into_signal();
+        assert!(matches!(mailbox.pop(None).await, Message::ProcessDied(0)));
+        process.send(recovered).unwrap();
+        assert_eq!(mailbox.available_capacity(), 0);
+
+        join.abort();
+        let _ = join.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_death_delivery_survives_saturated_observer_ingress() {
+        let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(93));
+
+        let ((observer_sender, _observer_receiver), observer_mailbox) =
+            mailboxes_with_capacity(1, 1);
+        let observer = Arc::new(NativeProcess {
+            id: environment.get_next_process_id(),
+            signal_mailbox: observer_sender.clone(),
+        });
+
+        let ((target_sender, target_receiver), target_mailbox) = mailboxes_with_capacity(2, 1);
+        let target_id = environment.get_next_process_id();
+        let target = Arc::new(NativeProcess {
+            id: target_id,
+            signal_mailbox: target_sender.clone(),
+        });
+        let registration =
+            register_process(environment, target_id, target.clone()).expect("target admission");
+        let (release_sender, release_receiver) = tokio::sync::oneshot::channel::<()>();
+        let join = tokio::spawn(run_native_process(
+            async move {
+                release_receiver
+                    .await
+                    .map_err(|_| anyhow::anyhow!("test release channel closed"))?;
+                Ok(())
+            },
+            target_id,
+            target_receiver,
+            target_mailbox,
+            registration,
+        ));
+
+        target.send(Signal::Monitor(observer)).unwrap();
+
+        // A native hot-reload acknowledgement is a FIFO processing barrier:
+        // it is emitted only after the preceding Monitor has entered the
+        // relation map.
+        let (barrier_sender, barrier_receiver) = tokio::sync::oneshot::channel();
+        target
+            .send(Signal::HotReload {
+                module_id: 0,
+                expected_version: None,
+                new_version: 0,
+                acknowledgement: Some(barrier_sender),
+            })
+            .unwrap();
+        barrier_receiver.await.unwrap();
+
+        assert_eq!(observer_mailbox.available_capacity(), 0);
+        observer_sender
+            .send(Signal::DieWhenLinkDies(false))
+            .unwrap();
+        assert_eq!(observer_sender.available_capacity(), 0);
+
+        release_sender.send(()).unwrap();
+        assert!(join.await.unwrap().is_ok());
+        assert!(matches!(
+            observer_mailbox.pop(None).await,
+            Message::ProcessDied(id) if id == target_id
+        ));
     }
 }

@@ -150,12 +150,16 @@ impl Process for RecordingProcess {
         self.id
     }
 
-    fn send(&self, signal: Signal) {
+    fn send(
+        &self,
+        signal: Signal,
+    ) -> std::result::Result<(), lunatic_process::state::SignalSendError> {
         if let Signal::Message(Message::Data(message)) = signal {
             if let Some(tag) = message.tag {
                 let _ = self.tags.send(tag);
             }
         }
+        Ok(())
     }
 }
 
@@ -354,7 +358,9 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
         id: environment.get_next_process_id(),
         tags: tag_sender,
     });
-    environment.add_process(observer.id(), observer.clone());
+    environment
+        .add_process(observer.id(), observer.clone())
+        .unwrap();
 
     let first = spawn_live_process(
         environment.clone(),
@@ -438,11 +444,11 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
     assert_eq!(acknowledgement_ids(&committed_status), process_ids);
 
     // Preserve the original live-state/FIFO assertion on each actual process.
-    first.process.send(tagged_message(7));
-    first.process.send(tagged_message(9));
+    first.process.send(tagged_message(7)).unwrap();
+    first.process.send(tagged_message(9)).unwrap();
     expect_tags(&mut tag_receiver, &[20_007, 30_043, 20_009, 30_045]).await?;
-    second.process.send(tagged_message(8));
-    second.process.send(tagged_message(10));
+    second.process.send(tagged_message(8)).unwrap();
+    second.process.send(tagged_message(10)).unwrap();
     expect_tags(&mut tag_receiver, &[20_008, 30_043, 20_010, 30_045]).await?;
 
     // One candidate traps in its real Wasm start function while the peer can
@@ -478,9 +484,9 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
     }
     assert_eq!(acknowledgement_ids(&partial_status), process_ids);
 
-    first.process.send(tagged_message(11));
+    first.process.send(tagged_message(11)).unwrap();
     expect_tags_unordered(&mut tag_receiver, &[20_011, 30_047], &[30_011]).await?;
-    second.process.send(tagged_message(12));
+    second.process.send(tagged_message(12)).unwrap();
     expect_tags_unordered(&mut tag_receiver, &[20_012, 30_047], &[30_012]).await?;
 
     // The slow process finishes applying after the coordinator's apply
@@ -521,9 +527,9 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
     }
     assert_eq!(acknowledgement_ids(&delayed_status), process_ids);
 
-    first.process.send(tagged_message(13));
+    first.process.send(tagged_message(13)).unwrap();
     expect_tags_unordered(&mut tag_receiver, &[20_013, 30_049], &[40_013]).await?;
-    second.process.send(tagged_message(14));
+    second.process.send(tagged_message(14)).unwrap();
     expect_tags_unordered(&mut tag_receiver, &[20_014, 30_049], &[40_014]).await?;
 
     // Force a real rollback timeout. The first candidate traps, while the
@@ -611,13 +617,13 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
     .await
     .context("late rollback did not restore registry process counts")?;
 
-    first.process.send(tagged_message(15));
+    first.process.send(tagged_message(15)).unwrap();
     expect_tags_unordered(&mut tag_receiver, &[20_015, 30_051], &[50_015]).await?;
-    second.process.send(tagged_message(16));
+    second.process.send(tagged_message(16)).unwrap();
     expect_tags_unordered(&mut tag_receiver, &[20_016, 30_051], &[50_016]).await?;
 
     let first_id = first.process.id();
-    first.process.send(Signal::Kill);
+    first.process.send(Signal::Kill).unwrap();
     let first_result = timeout(TEST_TIMEOUT, first.join)
         .await
         .context("first live guest did not stop")?
@@ -627,7 +633,7 @@ async fn production_atomic_reload_waits_for_acks_and_restores_every_process() ->
     assert_eq!(module_registry.process_count(MODULE_ID, 1), Some(1));
 
     let second_id = second.process.id();
-    second.process.send(Signal::Kill);
+    second.process.send(Signal::Kill).unwrap();
     let second_result = timeout(TEST_TIMEOUT, second.join)
         .await
         .context("second live guest did not stop")?

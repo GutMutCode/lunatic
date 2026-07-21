@@ -6,14 +6,15 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
-use lunatic_networking_api::NetworkingCtx;
+use lunatic_networking_api::{NetworkHandleLease, NetworkingCtx};
 use lunatic_process_api::ProcessCtx;
 use tokio::time::{timeout, Duration};
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 use lunatic_process::{
-    message::{DataMessage, Message},
-    state::ProcessState,
+    config::ProcessConfig,
+    message::{DataMessage, Message, MessageNetworkResource},
+    state::{ProcessState, SignalSendError, SignalSendErrorKind},
     Signal,
 };
 
@@ -21,7 +22,13 @@ use lunatic_process::{
 pub fn register<T: ProcessState + ProcessCtx<T> + NetworkingCtx + Send + 'static>(
     linker: &mut Linker<T>,
 ) -> Result<()> {
-    linker.func_wrap("lunatic::message", "create_data", create_data)?;
+    linker.func_wrap(
+        "lunatic::message",
+        "create_data",
+        |caller: Caller<T>, tag: i64, buffer_capacity: u64| {
+            create_data(caller, tag, buffer_capacity).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap(
         "lunatic::message",
         "write_data",
@@ -181,20 +188,37 @@ pub fn register<T: ProcessState + ProcessCtx<T> + NetworkingCtx + Send + 'static
 // Arguments:
 // * tag - An identifier that can be used for selective receives. If value is 0, no tag is used.
 // * buffer_capacity - A hint to the message to pre-allocate a large enough buffer for writes.
+//
+// Traps:
+// * If `buffer_capacity` exceeds the process's configured message-size limit.
+// * If the requested host-side buffer reservation fails.
 fn create_data<T: ProcessState + ProcessCtx<T>>(
     mut caller: Caller<T>,
     tag: i64,
     buffer_capacity: u64,
-) {
+) -> Result<()> {
+    let max_message_size = caller.data().config().get_max_message_size();
+    if buffer_capacity > max_message_size {
+        return Err(anyhow!(
+            "Message capacity {buffer_capacity} exceeds configured maximum {max_message_size}"
+        ));
+    }
+    let buffer_capacity = usize::try_from(buffer_capacity)
+        .map_err(|_| anyhow!("Message capacity exceeds platform maximum"))?;
     let tag = match tag {
         0 => None,
         tag => Some(tag),
     };
-    let message = DataMessage::new(tag, buffer_capacity as usize);
+    let mut message = DataMessage::new(tag, 0);
+    message
+        .buffer
+        .try_reserve_exact(buffer_capacity)
+        .map_err(|error| anyhow!("Could not reserve message capacity: {error}"))?;
     caller
         .data_mut()
         .message_scratch_area()
         .replace(Message::Data(message));
+    Ok(())
 }
 
 // Writes some data into the message buffer and returns how much data is written in bytes.
@@ -202,34 +226,64 @@ fn create_data<T: ProcessState + ProcessCtx<T>>(
 // Traps:
 // * If any memory outside the guest heap space is referenced.
 // * If it's called without a data message being inside of the scratch area.
+// * If the resulting message exceeds the configured message-size limit.
 fn write_data<T: ProcessState + ProcessCtx<T>>(
     mut caller: Caller<T>,
     data_ptr: u32,
     data_len: u32,
 ) -> Result<u32> {
+    let max_message_size = caller.data().config().get_max_message_size();
+    let start = data_ptr as usize;
+    let end = start
+        .checked_add(data_len as usize)
+        .ok_or_else(|| anyhow!("Message source range overflow"))?;
     let memory = get_memory(&mut caller)?;
+    // Validate guest memory before taking ownership from the scratch area, so
+    // an invalid range cannot accidentally discard the in-progress message.
+    memory
+        .data(&caller)
+        .get(start..end)
+        .or_trap("lunatic::message::write_data")?;
+
     let mut message = caller
         .data_mut()
         .message_scratch_area()
         .take()
         .or_trap("lunatic::message::write_data")?;
-    let buffer = memory
-        .data(&caller)
-        .get(data_ptr as usize..(data_ptr as usize + data_len as usize))
-        .or_trap("lunatic::message::write_data")?;
-    let bytes = match &mut message {
-        Message::Data(data) => data.write(buffer).or_trap("lunatic::message::write_data")?,
-        Message::LinkDied(_) => {
-            return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
-        }
+    let validation = match &mut message {
+        Message::Data(data) => match (data.size() as u64).checked_add(data_len as u64) {
+            Some(requested_size) if requested_size > max_message_size => Err(anyhow!(
+                "Message size {requested_size} exceeds configured maximum {max_message_size}"
+            )),
+            Some(_) => data
+                .buffer
+                // Avoid geometric over-allocation: the destination admission
+                // limit accounts for retained host allocation, not only the
+                // logical payload length.
+                .try_reserve_exact(data_len as usize)
+                .map_err(|error| anyhow!("Could not grow message buffer: {error}")),
+            None => Err(anyhow!("Message size overflow")),
+        },
+        Message::LinkDied(_) => Err(anyhow!("Unexpected `Message::LinkDied` in scratch area")),
         Message::ProcessDied(_) => {
-            return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
+            Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
-    // Put message back after writing to it.
-    caller.data_mut().message_scratch_area().replace(message);
+    if let Err(error) = validation {
+        caller.data_mut().message_scratch_area().replace(message);
+        return Err(error);
+    }
 
-    Ok(bytes as u32)
+    let buffer = memory
+        .data(&caller)
+        .get(start..end)
+        .expect("guest memory range was validated before taking the message");
+    let write_result = match &mut message {
+        Message::Data(data) => data.write(buffer),
+        _ => unreachable!("message kind was validated before writing"),
+    };
+    caller.data_mut().message_scratch_area().replace(message);
+    Ok(write_result.or_trap("lunatic::message::write_data")? as u32)
 }
 
 // Reads some data from the message buffer and returns how much data is read in bytes.
@@ -346,10 +400,54 @@ fn data_size<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>) -> Result<u
 // Traps:
 // * If module ID doesn't exist
 // * If no data message is in the scratch area.
+// * If the configured per-message resource limit has been reached.
+fn ensure_message_resource_capacity<T: ProcessState + ProcessCtx<T>>(
+    caller: &mut Caller<T>,
+) -> Result<()> {
+    let max_resources = caller.data().config().get_max_message_resources() as usize;
+    let message = caller
+        .data_mut()
+        .message_scratch_area()
+        .as_mut()
+        .or_trap("lunatic::message::push_resource")?;
+    match message {
+        Message::Data(data) => reserve_message_resource_slot(data, max_resources),
+        Message::LinkDied(_) => Err(anyhow!("Unexpected `Message::LinkDied` in scratch area")),
+        Message::ProcessDied(_) => {
+            Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
+        }
+    }
+}
+
+fn reserve_message_resource_slot(data: &mut DataMessage, max_resources: usize) -> Result<()> {
+    if data.resources.len() >= max_resources {
+        return Err(anyhow!("Message resource limit ({max_resources}) reached"));
+    }
+    data.resources
+        .try_reserve_exact(1)
+        .map_err(|error| anyhow!("Could not grow message resource table: {error}"))
+}
+
+fn ensure_data_message<T: ProcessState + ProcessCtx<T>>(caller: &mut Caller<T>) -> Result<()> {
+    match caller
+        .data_mut()
+        .message_scratch_area()
+        .as_ref()
+        .or_trap("lunatic::message::resource")?
+    {
+        Message::Data(_) => Ok(()),
+        Message::LinkDied(_) => Err(anyhow!("Unexpected `Message::LinkDied` in scratch area")),
+        Message::ProcessDied(_) => {
+            Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
+        }
+    }
+}
+
 fn push_module<T: ProcessState + ProcessCtx<T> + NetworkingCtx + 'static>(
     mut caller: Caller<T>,
     module_id: u64,
 ) -> Result<u64> {
+    ensure_message_resource_capacity(&mut caller)?;
     let module = caller
         .data()
         .module_resources()
@@ -408,22 +506,33 @@ fn take_module<T: ProcessState + ProcessCtx<T> + NetworkingCtx + 'static>(
 // Traps:
 // * If TCP stream ID doesn't exist
 // * If no data message is in the scratch area.
+// * If the configured per-message resource limit has been reached.
 fn push_tcp_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
     mut caller: Caller<T>,
     stream_id: u64,
 ) -> Result<u64> {
+    ensure_message_resource_capacity(&mut caller)?;
+    caller
+        .data()
+        .tcp_stream_resources()
+        .get(stream_id)
+        .or_trap("lunatic::message::push_tcp_stream")?;
+    let quota = caller.data().network_handle_quota().ok_or_else(|| {
+        anyhow!("lunatic::message::push_tcp_stream: transferable network quota unavailable")
+    })?;
     let stream = caller
         .data_mut()
         .tcp_stream_resources_mut()
         .remove(stream_id)
-        .or_trap("lunatic::message::push_tcp_stream")?;
+        .expect("validated TCP stream must remain in the resource table");
+    let stream = MessageNetworkResource::new(stream, NetworkHandleLease::from_existing(quota));
     let message = caller
         .data_mut()
         .message_scratch_area()
         .as_mut()
         .or_trap("lunatic::message::push_tcp_stream")?;
     let index = match message {
-        Message::Data(data) => data.add_resource(stream) as u64,
+        Message::Data(data) => data.add_network_resource(stream) as u64,
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
@@ -444,23 +553,43 @@ fn take_tcp_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
     mut caller: Caller<T>,
     index: u64,
 ) -> Result<u64> {
-    let message = caller
+    ensure_data_message(&mut caller)?;
+    let quota = caller.data().network_handle_quota().ok_or_else(|| {
+        anyhow!("lunatic::message::take_tcp_stream: transferable network quota unavailable")
+    })?;
+    let mut tcp_stream =
+        match caller
+            .data_mut()
+            .message_scratch_area()
+            .as_mut()
+            .and_then(|message| match message {
+                Message::Data(data) => data.take_leased_tcp_stream(index as usize),
+                _ => None,
+            }) {
+            Some(stream) => stream,
+            None => {
+                return Err(anyhow!(
+                "lunatic::message::take_tcp_stream: resource doesn't exist or has the wrong type"
+            ));
+            }
+        };
+    if let Err(error) = tcp_stream.transfer_to(quota) {
+        let message = caller
+            .data_mut()
+            .message_scratch_area()
+            .as_mut()
+            .expect("data message was validated before taking a TCP stream");
+        let Message::Data(data) = message else {
+            unreachable!("data message was validated before taking a TCP stream")
+        };
+        data.restore_network_resource(index as usize, tcp_stream)
+            .expect("a failed TCP transfer must restore its vacated message slot");
+        return Err(error);
+    }
+    Ok(caller
         .data_mut()
-        .message_scratch_area()
-        .as_mut()
-        .or_trap("lunatic::message::take_tcp_stream")?;
-    let tcp_stream = match message {
-        Message::Data(data) => data
-            .take_tcp_stream(index as usize)
-            .or_trap("lunatic::message::take_tcp_stream")?,
-        Message::LinkDied(_) => {
-            return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
-        }
-        Message::ProcessDied(_) => {
-            return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
-        }
-    };
-    Ok(caller.data_mut().tcp_stream_resources_mut().add(tcp_stream))
+        .tcp_stream_resources_mut()
+        .add(tcp_stream.into_table_resource()))
 }
 
 // move tls stream
@@ -471,21 +600,32 @@ fn take_tcp_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
 // Traps:
 // * If TLS stream ID doesn't exist
 // * If no data message is in the scratch area.
+// * If the configured per-message resource limit has been reached.
 fn push_tls_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
     mut caller: Caller<T>,
     stream_id: u64,
 ) -> Result<u64> {
+    ensure_message_resource_capacity(&mut caller)?;
+    caller
+        .data()
+        .tls_stream_resources()
+        .get(stream_id)
+        .or_trap("lunatic::message::push_tls_stream")?;
+    let quota = caller.data().network_handle_quota().ok_or_else(|| {
+        anyhow!("lunatic::message::push_tls_stream: transferable network quota unavailable")
+    })?;
     let resources = caller.data_mut().tls_stream_resources_mut();
     let stream = resources
         .remove(stream_id)
-        .or_trap("lunatic::message::push_tls_stream")?;
+        .expect("validated TLS stream must remain in the resource table");
+    let stream = MessageNetworkResource::new(stream, NetworkHandleLease::from_existing(quota));
     let message = caller
         .data_mut()
         .message_scratch_area()
         .as_mut()
         .or_trap("lunatic::message::push_tls_stream")?;
     let index = match message {
-        Message::Data(data) => data.add_resource(stream) as u64,
+        Message::Data(data) => data.add_network_resource(stream) as u64,
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
@@ -506,31 +646,95 @@ fn take_tls_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
     mut caller: Caller<T>,
     index: u64,
 ) -> Result<u64> {
-    let message = caller
+    ensure_data_message(&mut caller)?;
+    let quota = caller.data().network_handle_quota().ok_or_else(|| {
+        anyhow!("lunatic::message::take_tls_stream: transferable network quota unavailable")
+    })?;
+    let mut tls_stream =
+        match caller
+            .data_mut()
+            .message_scratch_area()
+            .as_mut()
+            .and_then(|message| match message {
+                Message::Data(data) => data.take_leased_tls_stream(index as usize),
+                _ => None,
+            }) {
+            Some(stream) => stream,
+            None => {
+                return Err(anyhow!(
+                "lunatic::message::take_tls_stream: resource doesn't exist or has the wrong type"
+            ));
+            }
+        };
+    if let Err(error) = tls_stream.transfer_to(quota) {
+        let message = caller
+            .data_mut()
+            .message_scratch_area()
+            .as_mut()
+            .expect("data message was validated before taking a TLS stream");
+        let Message::Data(data) = message else {
+            unreachable!("data message was validated before taking a TLS stream")
+        };
+        data.restore_network_resource(index as usize, tls_stream)
+            .expect("a failed TLS transfer must restore its vacated message slot");
+        return Err(error);
+    }
+    Ok(caller
         .data_mut()
-        .message_scratch_area()
-        .as_mut()
-        .or_trap("lunatic::message::take_tls_stream")?;
-    let tls_stream = match message {
-        Message::Data(data) => data
-            .take_tls_stream(index as usize)
-            .or_trap("lunatic::message::take_tls_stream")?,
-        Message::LinkDied(_) => {
-            return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
-        }
-        Message::ProcessDied(_) => {
-            return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
-        }
-    };
-    Ok(caller.data_mut().tls_stream_resources_mut().add(tls_stream))
+        .tls_stream_resources_mut()
+        .add(tls_stream.into_table_resource()))
 }
 
-// Sends the message to a process.
+const SEND_QUEUED: u32 = 0;
+const SEND_CLOSED_OR_MISSING: u32 = 1;
+const SEND_BACKPRESSURE: u32 = 2;
+
+fn restore_failed_message<T: ProcessState + ProcessCtx<T>>(
+    caller: &mut Caller<T>,
+    error: SignalSendError,
+) -> u32 {
+    let status = match error.kind() {
+        SignalSendErrorKind::Closed => SEND_CLOSED_OR_MISSING,
+        SignalSendErrorKind::MailboxFull
+        | SignalSendErrorKind::QueueFull
+        | SignalSendErrorKind::MessageTooLarge
+        | SignalSendErrorKind::TooManyMessageResources => SEND_BACKPRESSURE,
+    };
+    let Signal::Message(message) = error.into_signal() else {
+        unreachable!("sending a message must return the original message on failure")
+    };
+    caller.data_mut().message_scratch_area().replace(message);
+    status
+}
+
+fn try_send_message<T: ProcessState + ProcessCtx<T>>(
+    caller: &mut Caller<T>,
+    process_id: u64,
+    message: Message,
+) -> u32 {
+    let Some(process) = caller.data().environment().get_process(process_id) else {
+        caller.data_mut().message_scratch_area().replace(message);
+        return SEND_CLOSED_OR_MISSING;
+    };
+
+    match process.send(Signal::Message(message)) {
+        Ok(()) => SEND_QUEUED,
+        Err(error) => restore_failed_message(caller, error),
+    }
+}
+
+// Sends the message to a process using bounded, non-blocking admission.
 //
-// There are no guarantees that the message will be received.
+// Returns:
+// * 0 if the message was queued.
+// * 1 if the process doesn't exist or its signal receiver is closed.
+// * 2 if the destination mailbox/signal queue is full or the destination rejects
+//     the message's byte/resource size.
+//
+// On every non-zero result, the original message is restored to the sender's
+// scratch area so the guest can retry, redirect, or discard it explicitly.
 //
 // Traps:
-// * If the process ID doesn't exist.
 // * If it's called before creating the next message.
 fn send<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u64) -> Result<u32> {
     let message = caller
@@ -539,11 +743,7 @@ fn send<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u64)
         .take()
         .or_trap("lunatic::message::send::no_message")?;
 
-    if let Some(process) = caller.data_mut().environment().get_process(process_id) {
-        process.send(Signal::Message(message));
-    }
-
-    Ok(0)
+    Ok(try_send_message(&mut caller, process_id, message))
 }
 
 // Sends the message to a process and waits for a reply, but doesn't look through existing
@@ -559,10 +759,15 @@ fn send<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u64)
 //
 // Returns:
 // * 0    if message arrived.
+// * 1    if the destination process doesn't exist or is closed.
+// * 2    if the destination mailbox/signal queue is full or the destination rejects
+//        the message's byte/resource size.
 // * 9027 if call timed out.
 //
+// A send failure returns immediately without waiting and restores the original
+// request message to the scratch area.
+//
 // Traps:
-// * If the process ID doesn't exist.
 // * If it's called with wrong data in the scratch area.
 fn send_receive_skip_search<T: ProcessState + ProcessCtx<T> + Send>(
     mut caller: Caller<T>,
@@ -577,8 +782,9 @@ fn send_receive_skip_search<T: ProcessState + ProcessCtx<T> + Send>(
             .take()
             .or_trap("lunatic::message::send_receive_skip_search")?;
 
-        if let Some(process) = caller.data_mut().environment().get_process(process_id) {
-            process.send(Signal::Message(message));
+        let send_status = try_send_message(&mut caller, process_id, message);
+        if send_status != SEND_QUEUED {
+            return Ok(send_status);
         }
 
         let tags = [wait_on_tag];
@@ -670,21 +876,32 @@ fn receive<T: ProcessState + ProcessCtx<T> + Send>(
 // Traps:
 // * If UDP socket ID doesn't exist
 // * If no data message is in the scratch area.
+// * If the configured per-message resource limit has been reached.
 fn push_udp_socket<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
     mut caller: Caller<T>,
     socket_id: u64,
 ) -> Result<u64> {
+    ensure_message_resource_capacity(&mut caller)?;
+    caller
+        .data()
+        .udp_resources()
+        .get(socket_id)
+        .or_trap("lunatic::message::push_udp_socket")?;
+    let quota = caller.data().network_handle_quota().ok_or_else(|| {
+        anyhow!("lunatic::message::push_udp_socket: transferable network quota unavailable")
+    })?;
     let data = caller.data_mut();
     let socket = data
         .udp_resources_mut()
         .remove(socket_id)
-        .or_trap("lunatic::message::push_udp_socket")?;
+        .expect("validated UDP socket must remain in the resource table");
+    let socket = MessageNetworkResource::new(socket, NetworkHandleLease::from_existing(quota));
     let message = data
         .message_scratch_area()
         .as_mut()
         .or_trap("lunatic::message::push_udp_socket")?;
     let index = match message {
-        Message::Data(data) => data.add_resource(socket) as u64,
+        Message::Data(data) => data.add_network_resource(socket) as u64,
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
@@ -705,21 +922,66 @@ fn take_udp_socket<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
     mut caller: Caller<T>,
     index: u64,
 ) -> Result<u64> {
-    let message = caller
+    ensure_data_message(&mut caller)?;
+    let quota = caller.data().network_handle_quota().ok_or_else(|| {
+        anyhow!("lunatic::message::take_udp_socket: transferable network quota unavailable")
+    })?;
+    let mut udp_socket =
+        match caller
+            .data_mut()
+            .message_scratch_area()
+            .as_mut()
+            .and_then(|message| match message {
+                Message::Data(data) => data.take_leased_udp_socket(index as usize),
+                _ => None,
+            }) {
+            Some(socket) => socket,
+            None => {
+                return Err(anyhow!(
+                "lunatic::message::take_udp_socket: resource doesn't exist or has the wrong type"
+            ));
+            }
+        };
+    if let Err(error) = udp_socket.transfer_to(quota) {
+        let message = caller
+            .data_mut()
+            .message_scratch_area()
+            .as_mut()
+            .expect("data message was validated before taking a UDP socket");
+        let Message::Data(data) = message else {
+            unreachable!("data message was validated before taking a UDP socket")
+        };
+        data.restore_network_resource(index as usize, udp_socket)
+            .expect("a failed UDP transfer must restore its vacated message slot");
+        return Err(error);
+    }
+    Ok(caller
         .data_mut()
-        .message_scratch_area()
-        .as_mut()
-        .or_trap("lunatic::message::take_udp_socket")?;
-    let udp_socket = match message {
-        Message::Data(data) => data
-            .take_udp_socket(index as usize)
-            .or_trap("lunatic::message::take_udp_socket")?,
-        Message::LinkDied(_) => {
-            return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
+        .udp_resources_mut()
+        .add(udp_socket.into_table_resource()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use lunatic_process::message::{DataMessage, Resource};
+
+    use super::reserve_message_resource_slot;
+
+    #[test]
+    fn non_power_of_two_resource_limit_does_not_overallocate_slots() {
+        let mut message = DataMessage::new(None, 0);
+
+        for value in 0_u8..5 {
+            reserve_message_resource_slot(&mut message, 5).unwrap();
+            let resource: Arc<Resource> = Arc::new(value);
+            message.add_resource(resource);
         }
-        Message::ProcessDied(_) => {
-            return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
-        }
-    };
-    Ok(caller.data_mut().udp_resources_mut().add(udp_socket))
+
+        assert_eq!(message.resources.len(), 5);
+        assert_eq!(message.resources.capacity(), 5);
+        assert!(reserve_message_resource_slot(&mut message, 5).is_err());
+        assert_eq!(message.resources.capacity(), 5);
+    }
 }

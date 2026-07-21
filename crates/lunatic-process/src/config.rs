@@ -2,6 +2,10 @@ use serde::{de::DeserializeOwned, Serialize};
 
 // One unit of fuel represents around 100k instructions.
 pub const UNIT_OF_COMPUTE_IN_INSTRUCTIONS: u64 = 100_000;
+pub const DEFAULT_MAX_MAILBOX_MESSAGES: u32 = 1_024;
+pub const DEFAULT_MAX_SIGNAL_QUEUE: u32 = 1_088;
+pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 1_048_576;
+pub const DEFAULT_MAX_MESSAGE_RESOURCES: u32 = 64;
 
 /// Common process configuration.
 ///
@@ -21,6 +25,31 @@ pub trait ProcessConfig: Clone + Serialize + DeserializeOwned {
     fn get_max_fuel(&self) -> Option<u64>;
     fn set_max_memory(&mut self, max_memory: usize);
     fn get_max_memory(&self) -> usize;
+
+    /// Maximum number of admitted messages across signal staging and the
+    /// process mailbox.
+    fn set_max_mailbox_messages(&mut self, _max: u32) {}
+    fn get_max_mailbox_messages(&self) -> u32 {
+        DEFAULT_MAX_MAILBOX_MESSAGES
+    }
+
+    /// Maximum number of signals waiting for the process signal loop.
+    fn set_max_signal_queue(&mut self, _max: u32) {}
+    fn get_max_signal_queue(&self) -> u32 {
+        DEFAULT_MAX_SIGNAL_QUEUE
+    }
+
+    /// Maximum payload bytes that one host-side data message may allocate.
+    fn set_max_message_size(&mut self, _max: u64) {}
+    fn get_max_message_size(&self) -> u64 {
+        DEFAULT_MAX_MESSAGE_SIZE
+    }
+
+    /// Maximum number of host resources attached to one data message.
+    fn set_max_message_resources(&mut self, _max: u32) {}
+    fn get_max_message_resources(&self) -> u32 {
+        DEFAULT_MAX_MESSAGE_RESOURCES
+    }
 
     /// Creates a deny-by-default child configuration whose resource ceilings
     /// do not exceed this configuration.

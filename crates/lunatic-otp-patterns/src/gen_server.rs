@@ -195,7 +195,7 @@ pub trait GenServer: Sized {
                     }
                 }
             }
-        });
+        })?;
 
         let join_shared = shared.clone();
         tokio::spawn(async move {
@@ -575,7 +575,9 @@ where
     /// Kills the underlying Lunatic process and waits until it exits.
     pub fn kill(&self) -> Result<()> {
         self.ensure_running()?;
-        self.process.send(Signal::Kill);
+        self.process
+            .send(Signal::Kill)
+            .map_err(|error| anyhow!("Failed to kill GenServer: {error}"))?;
         self.shared.wait_for_exit(self.config.timeout()).map(|_| ())
     }
 
@@ -617,8 +619,9 @@ where
         let payload =
             bincode::serialize(&message).context("failed to serialize GenServer message")?;
         let message = DataMessage::new_from_vec(None, payload);
-        self.process.send(Signal::Message(Message::Data(message)));
-        Ok(())
+        self.process
+            .send(Signal::Message(Message::Data(message)))
+            .map_err(|error| anyhow!("Failed to send GenServer message: {error}"))
     }
 }
 

@@ -45,11 +45,11 @@ fn bench_memory_mailbox_growth(c: &mut Criterion) {
             count,
             |b, &n| {
                 b.to_async(&rt).iter(|| async {
-                    let mailbox = MessageMailbox::default();
+                    let mailbox = MessageMailbox::new(n as usize);
 
                     // Fill mailbox
                     for i in 0..n {
-                        mailbox.push(Message::LinkDied(Some(i)));
+                        mailbox.push(Message::LinkDied(Some(i))).unwrap();
                     }
 
                     // Measure mailbox state

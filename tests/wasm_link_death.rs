@@ -223,7 +223,10 @@ impl Process for RecordingProcess {
         self.id
     }
 
-    fn send(&self, signal: Signal) {
+    fn send(
+        &self,
+        signal: Signal,
+    ) -> std::result::Result<(), lunatic_process::state::SignalSendError> {
         let event = match signal {
             Signal::Message(Message::Data(_)) => Some(Observed::Ready),
             Signal::LinkDied(process_id, tag, reason) => Some(Observed::LinkDied {
@@ -243,7 +246,59 @@ impl Process for RecordingProcess {
             self.events.lock().unwrap().push(event);
             self.notify.notify_one();
         }
+        Ok(())
     }
+}
+
+struct MonitorRegistrationProbe {
+    observer: Arc<dyn Process>,
+    processed: Arc<Notify>,
+}
+
+impl Drop for MonitorRegistrationProbe {
+    fn drop(&mut self) {
+        self.processed.notify_one();
+    }
+}
+
+impl Process for MonitorRegistrationProbe {
+    fn id(&self) -> u64 {
+        self.observer.id()
+    }
+
+    fn send(
+        &self,
+        signal: Signal,
+    ) -> std::result::Result<(), lunatic_process::state::SignalSendError> {
+        self.observer.send(signal)
+    }
+}
+
+/// Registers the same monitor twice and waits until the second registration
+/// replaces the first in the target's relation map. This is an actual signal
+/// processing barrier, which is required before requesting an out-of-band
+/// Kill that intentionally preempts queued signals.
+async fn register_monitor_and_wait(
+    process: &dyn Process,
+    observer: Arc<dyn Process>,
+) -> Result<()> {
+    let processed = Arc::new(Notify::new());
+    let notified = processed.notified();
+    let probe: Arc<dyn Process> = Arc::new(MonitorRegistrationProbe {
+        observer: observer.clone(),
+        processed: processed.clone(),
+    });
+
+    process
+        .send(Signal::Monitor(probe))
+        .map_err(|error| anyhow!(error.to_string()))?;
+    process
+        .send(Signal::Monitor(observer))
+        .map_err(|error| anyhow!(error.to_string()))?;
+    timeout(TEST_TIMEOUT, notified)
+        .await
+        .context("target did not process the monitor registration barrier")?;
+    Ok(())
 }
 
 struct WasmHarness {
@@ -277,7 +332,7 @@ impl WasmHarness {
     fn recorder(&self) -> Arc<RecordingProcess> {
         let id = self.environment.get_next_process_id();
         let recorder = Arc::new(RecordingProcess::new(id, &self.environment));
-        self.environment.add_process(id, recorder.clone());
+        self.environment.add_process(id, recorder.clone()).unwrap();
         recorder
     }
 
@@ -346,13 +401,13 @@ async fn run_wasm_case(
     let process_id = process.id();
 
     recorder.wait_until_ready().await?;
-    process.send(Signal::Monitor(observer.clone()));
-    process.send(Signal::Monitor(observer));
+    register_monitor_and_wait(process.as_ref(), observer).await?;
 
     match trigger {
         Trigger::Release => process.send(Signal::Message(Message::Data(DataMessage::default()))),
         Trigger::Kill => process.send(Signal::Kill),
     }
+    .map_err(|error| anyhow!(error.to_string()))?;
 
     let outcome = wait_for_join(join).await?;
     let state = match (expected_outcome, outcome) {
@@ -499,8 +554,7 @@ async fn actual_wasm_peer_honors_default_and_trap_exit_link_modes() -> Result<()
         .await?;
     let default_peer_id = default_peer.id();
     default_observer.wait_until_ready().await?;
-    default_peer.send(Signal::Monitor(default_observer_process.clone()));
-    default_peer.send(Signal::Monitor(default_observer_process));
+    register_monitor_and_wait(default_peer.as_ref(), default_observer_process).await?;
 
     let (failing_join, _) = harness
         .spawn(
@@ -529,8 +583,7 @@ async fn actual_wasm_peer_honors_default_and_trap_exit_link_modes() -> Result<()
         .await?;
     let trap_peer_id = trap_peer.id();
     trap_observer.wait_until_ready().await?;
-    trap_peer.send(Signal::Monitor(trap_observer_process.clone()));
-    trap_peer.send(Signal::Monitor(trap_observer_process));
+    register_monitor_and_wait(trap_peer.as_ref(), trap_observer_process).await?;
 
     let (failing_join, _) = harness
         .spawn(
@@ -563,7 +616,9 @@ async fn run_native_case(outcome: NativeOutcome, link_tag: i64) -> Result<()> {
     let environment = Arc::new(LunaticEnvironment::new(8));
     let observer_id = environment.get_next_process_id();
     let recorder = Arc::new(RecordingProcess::new(observer_id, &environment));
-    environment.add_process(observer_id, recorder.clone());
+    environment
+        .add_process(observer_id, recorder.clone())
+        .unwrap();
     let observer: Arc<dyn Process> = recorder.clone();
     let (release_sender, release_receiver) = oneshot::channel::<()>();
 
@@ -588,22 +643,27 @@ async fn run_native_case(outcome: NativeOutcome, link_tag: i64) -> Result<()> {
                 }
                 NativeOutcome::Kill | NativeOutcome::NoProcess => pending::<Result<()>>().await,
             }
-        });
+        })?;
     let process_id = process.id();
-    process.send(Signal::Link(Some(link_tag), observer.clone()));
-    process.send(Signal::Monitor(observer.clone()));
-    process.send(Signal::Monitor(observer));
+    process
+        .send(Signal::Link(Some(link_tag), observer.clone()))
+        .map_err(|error| anyhow!(error.to_string()))?;
+    register_monitor_and_wait(&process, observer).await?;
 
     match outcome {
         NativeOutcome::Normal | NativeOutcome::Error | NativeOutcome::Panic => release_sender
             .send(())
             .map_err(|_| anyhow!("native process exited before release"))?,
-        NativeOutcome::Kill => process.send(Signal::Kill),
-        NativeOutcome::NoProcess => process.send(Signal::LinkDied(
-            MISSING_PROCESS_ID,
-            Some(404),
-            DeathReason::NoProcess,
-        )),
+        NativeOutcome::Kill => process
+            .send(Signal::Kill)
+            .map_err(|error| anyhow!(error.to_string()))?,
+        NativeOutcome::NoProcess => process
+            .send(Signal::LinkDied(
+                MISSING_PROCESS_ID,
+                Some(404),
+                DeathReason::NoProcess,
+            ))
+            .map_err(|error| anyhow!(error.to_string()))?,
     }
 
     let result = wait_for_join(join).await?;

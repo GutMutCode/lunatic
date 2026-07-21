@@ -18,7 +18,7 @@ use lunatic_process::{
     mailbox::MessageMailbox,
     message::Message,
     runtimes::{wasmtime::WasmtimeCompiledModule, RawWasm},
-    state::ProcessState,
+    state::{ensure_registry_insert_capacity, ProcessState, MAX_REGISTRY_NAME_BYTES},
     DeathReason, Process, Signal, WasmProcess,
 };
 use lunatic_wasi_api::LunaticWasiCtx;
@@ -46,6 +46,22 @@ pub trait ProcessConfigCtx {
         0
     }
     fn set_max_network_connections(&mut self, _max: u32) {}
+    fn get_max_mailbox_messages(&self) -> u32 {
+        lunatic_process::config::DEFAULT_MAX_MAILBOX_MESSAGES
+    }
+    fn set_max_mailbox_messages(&mut self, _max: u32) {}
+    fn get_max_signal_queue(&self) -> u32 {
+        lunatic_process::config::DEFAULT_MAX_SIGNAL_QUEUE
+    }
+    fn set_max_signal_queue(&mut self, _max: u32) {}
+    fn get_max_message_size(&self) -> u64 {
+        lunatic_process::config::DEFAULT_MAX_MESSAGE_SIZE
+    }
+    fn set_max_message_size(&mut self, _max: u64) {}
+    fn get_max_message_resources(&self) -> u32 {
+        lunatic_process::config::DEFAULT_MAX_MESSAGE_RESOURCES
+    }
+    fn set_max_message_resources(&mut self, _max: u32) {}
     fn can_access_fs_location(&self, path: &Path) -> Result<(), String>;
 }
 
@@ -204,6 +220,54 @@ where
             config_get_max_network_connections(caller, config_id).to_wasmtime_result()
         },
     )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_mailbox_messages",
+        config_set_max_mailbox_messages,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_mailbox_messages",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_mailbox_messages(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_signal_queue",
+        config_set_max_signal_queue,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_signal_queue",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_signal_queue(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_message_size",
+        config_set_max_message_size,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_message_size",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_message_size(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_message_resources",
+        config_set_max_message_resources,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_message_resources",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_message_resources(caller, config_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap("lunatic::process", "config_set_checked", config_set_checked)?;
     linker.func_wrap(
         "lunatic::process",
@@ -245,7 +309,11 @@ where
     linker.func_wrap8_async("lunatic::process", "spawn", spawn)?;
     linker.func_wrap11_async("lunatic::process", "get_or_spawn", get_or_spawn)?;
     linker.func_wrap1_async("lunatic::process", "sleep_ms", sleep_ms)?;
-    linker.func_wrap("lunatic::process", "die_when_link_dies", die_when_link_dies)?;
+    linker.func_wrap(
+        "lunatic::process",
+        "die_when_link_dies",
+        |caller: Caller<T>, trap: u32| die_when_link_dies(caller, trap).to_wasmtime_result(),
+    )?;
 
     linker.func_wrap("lunatic::process", "process_id", process_id)?;
     linker.func_wrap("lunatic::process", "environment_id", environment_id)?;
@@ -546,7 +614,9 @@ fn return_process_error_in_state<T: ErrorCtx>(
 // failure. Returns -1 on success or an error-resource ID on failure.
 //
 // Setting IDs: 0=memory, 1=fuel, 2=table elements, 3=file descriptors,
-// 4=network connections, 5=compile, 6=create-config, 7=spawn.
+// 4=network connections, 5=compile, 6=create-config, 7=spawn,
+// 8=mailbox messages, 9=signal queue, 10=message bytes,
+// 11=message resources.
 fn config_set_checked<T>(mut caller: Caller<T>, config_id: u64, setting: u32, value: u64) -> i64
 where
     T: ProcessState + ProcessCtx<T> + ErrorCtx,
@@ -611,6 +681,42 @@ where
             "config_set_can_spawn_processes",
             |config| config.set_can_spawn_processes(value != 0),
         ),
+        8 => u32::try_from(value)
+            .map_err(|_| anyhow!("max_mailbox_messages exceeds u32"))
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_mailbox_messages",
+                    |config| ProcessConfigCtx::set_max_mailbox_messages(config, value),
+                )
+            }),
+        9 => u32::try_from(value)
+            .map_err(|_| anyhow!("max_signal_queue exceeds u32"))
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_signal_queue",
+                    |config| ProcessConfigCtx::set_max_signal_queue(config, value),
+                )
+            }),
+        10 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_message_size",
+            |config| ProcessConfigCtx::set_max_message_size(config, value),
+        ),
+        11 => u32::try_from(value)
+            .map_err(|_| anyhow!("max_message_resources exceeds u32"))
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_message_resources",
+                    |config| ProcessConfigCtx::set_max_message_resources(config, value),
+                )
+            }),
         _ => Err(anyhow!("unknown config setting ID {setting}")),
     };
 
@@ -811,6 +917,136 @@ where
         .get_max_network_connections())
 }
 
+fn config_set_max_mailbox_messages<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_mailbox_messages",
+            |config| ProcessConfigCtx::set_max_mailbox_messages(config, max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_mailbox_messages<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    let config =
+        caller.data().config_resources().get(config_id).or_trap(
+            "lunatic::process::config_get_max_mailbox_messages: Config ID doesn't exist",
+        )?;
+    Ok(ProcessConfigCtx::get_max_mailbox_messages(config))
+}
+
+fn config_set_max_signal_queue<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_signal_queue",
+            |config| ProcessConfigCtx::set_max_signal_queue(config, max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_signal_queue<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    let config = caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_signal_queue: Config ID doesn't exist")?;
+    Ok(ProcessConfigCtx::get_max_signal_queue(config))
+}
+
+fn config_set_max_message_size<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u64,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_message_size",
+            |config| ProcessConfigCtx::set_max_message_size(config, max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_message_size<T>(caller: Caller<T>, config_id: u64) -> Result<u64>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    let config = caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_message_size: Config ID doesn't exist")?;
+    Ok(ProcessConfigCtx::get_max_message_size(config))
+}
+
+fn config_set_max_message_resources<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_message_resources",
+            |config| ProcessConfigCtx::set_max_message_resources(config, max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_message_resources<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    let config =
+        caller.data().config_resources().get(config_id).or_trap(
+            "lunatic::process::config_get_max_message_resources: Config ID doesn't exist",
+        )?;
+    Ok(ProcessConfigCtx::get_max_message_resources(config))
+}
+
 // Returns 1 if processes spawned from this configuration can compile Wasm modules, otherwise 0.
 //
 // Traps:
@@ -994,15 +1230,6 @@ where
                 &mut caller,
                 id_ptr,
                 anyhow!("Process doesn't have permissions to spawn sub-processes"),
-            );
-        }
-
-        let env = caller.data().environment();
-        if let Err(error) = env.can_spawn_next_process().await {
-            return return_process_error(
-                &mut caller,
-                id_ptr,
-                anyhow!("Process spawn limit reached: {error}"),
             );
         }
 
@@ -1197,7 +1424,23 @@ where
         // Lock the registry for every other process before lookup.
         let registry = state.registry().clone();
         let mut registry = registry.write().await;
-        let process = registry.get(name).copied();
+        let node_id = state
+            .distributed()
+            .as_ref()
+            .map(|distributed| distributed.node_id())
+            .unwrap_or(0);
+        let environment = state.environment();
+        let process = match registry.get(name).copied() {
+            Some((entry_node_id, process_id))
+                if entry_node_id == node_id && environment.get_process(process_id).is_none() =>
+            {
+                // Local process registration is the liveness authority. Remove
+                // a stale name atomically so get-or-spawn can reuse it.
+                registry.remove(name);
+                None
+            }
+            process => process,
+        };
 
         if let Some((node_id, process_id)) = process {
             // Return the process from the registry.
@@ -1214,6 +1457,20 @@ where
                 .or_trap("lunatic::process::get_or_spawn")?;
             Ok(2)
         } else {
+            if name.len() <= MAX_REGISTRY_NAME_BYTES
+                && ensure_registry_insert_capacity(&registry, name).is_err()
+            {
+                // Capacity may consist entirely of dead local registrations.
+                // Sweep only on saturation so normal lookup remains O(1), and
+                // never discard remote entries whose liveness is not locally
+                // authoritative.
+                registry.retain(|_, (entry_node_id, process_id)| {
+                    *entry_node_id != node_id || environment.get_process(*process_id).is_some()
+                });
+            }
+            if let Err(error) = ensure_registry_insert_capacity(&registry, name) {
+                return return_process_error_in_state(state, memory_slice, id_ptr, error);
+            }
             let name = name.to_owned();
             // Spawn a new process. This is copy of the code in `spawn` because host functions can't call
             // each other.
@@ -1225,16 +1482,6 @@ where
                     anyhow!(
                         "lunatic::process:get_or_spawn: Process doesn't have permissions to spawn sub-processes"
                     ),
-                );
-            }
-
-            let env = state.environment();
-            if let Err(error) = env.can_spawn_next_process().await {
-                return return_process_error_in_state(
-                    state,
-                    memory_slice,
-                    id_ptr,
-                    anyhow!("lunatic::process:get_or_spawn: Process spawn limit reached: {error}"),
                 );
             }
 
@@ -1354,11 +1601,6 @@ where
                 Err(error) => (state.add_error_resource(error), 1),
             };
 
-            let node_id = state
-                .distributed()
-                .as_ref()
-                .map(|d| d.node_id())
-                .unwrap_or(0);
             memory_slice
                 .get_mut(node_id_ptr as usize..(node_id_ptr + 8) as usize)
                 .or_trap("lunatic::process::get_or_spawn")?
@@ -1371,8 +1613,12 @@ where
                 .write(&proc_or_error_id.to_le_bytes())
                 .or_trap("lunatic::process::get_or_spawn")?;
 
-            // Register newly spawned process under correct name
-            registry.insert(name, (node_id, proc_or_error_id));
+            // Error-resource IDs are local diagnostic handles, not process IDs.
+            // Only publish a registry entry after central spawn admission and
+            // process creation both succeeded.
+            if result == 0 {
+                registry.insert(name, (node_id, proc_or_error_id));
+            }
 
             Ok(result)
         }
@@ -1399,13 +1645,16 @@ fn sleep_ms<T: ProcessState + ProcessCtx<T>>(
 // 2. `trap != 0` the process will die and notify all linked processes of its death.
 //
 // The default behaviour for a newly spawned process is 2.
-fn die_when_link_dies<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, trap: u32) {
+fn die_when_link_dies<T: ProcessState + ProcessCtx<T>>(
+    mut caller: Caller<T>,
+    trap: u32,
+) -> Result<()> {
     caller
         .data_mut()
         .signal_mailbox()
         .0
-        .send(Signal::DieWhenLinkDies(trap != 0))
-        .expect("The signal is sent to itself and the receiver must exist at this point");
+        .send(Signal::DieWhenLinkDies(trap != 0))?;
+    Ok(())
 }
 
 // Returns ID of the process currently running
@@ -1439,24 +1688,20 @@ fn link<T: ProcessState + ProcessCtx<T>>(
     let process = caller.data().environment().get_process(process_id);
 
     if let Some(process) = process {
-        process.send(Signal::Link(tag, Arc::new(this_process)));
+        process.send(Signal::Link(tag, Arc::new(this_process)))?;
 
         // Send link signal to itself
         caller
             .data_mut()
             .signal_mailbox()
             .0
-            .send(Signal::Link(tag, process))
-            .expect("The Link signal is sent to itself and the receiver must exist at this point");
+            .send(Signal::Link(tag, process))?;
     } else {
-        caller
-            .data_mut()
-            .signal_mailbox()
-            .0
-            .send(Signal::LinkDied(process_id, tag, DeathReason::NoProcess))
-            .expect(
-                "The LinkDied signal is sent to itself and the receiver must exist at this point",
-            );
+        caller.data_mut().signal_mailbox().0.send(Signal::LinkDied(
+            process_id,
+            tag,
+            DeathReason::NoProcess,
+        ))?;
     }
     Ok(())
 }
@@ -1473,7 +1718,7 @@ fn unlink<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u6
     if let Some(process) = process {
         process.send(Signal::UnLink {
             process_id: this_process_id,
-        });
+        })?;
     }
 
     // Send unlink signal to itself
@@ -1481,8 +1726,7 @@ fn unlink<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u6
         .data_mut()
         .signal_mailbox()
         .0
-        .send(Signal::UnLink { process_id })
-        .expect("The signal is sent to itself and the receiver must exist at this point");
+        .send(Signal::UnLink { process_id })?;
 
     Ok(())
 }
@@ -1496,14 +1740,13 @@ fn monitor<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u
         let id = caller.data().id();
         let signal_mailbox = caller.data().signal_mailbox().clone();
         let this_process = WasmProcess::new(id, signal_mailbox.0);
-        process.send(Signal::Monitor(Arc::new(this_process)));
+        process.send(Signal::Monitor(Arc::new(this_process)))?;
     } else {
         caller
             .data_mut()
             .signal_mailbox()
             .0
-            .send(Signal::ProcessDied(process_id))
-            .expect("The ProcessDied signal is sent to itself and the receiver must exist");
+            .send(Signal::ProcessDied(process_id))?;
     }
 
     Ok(())
@@ -1524,7 +1767,7 @@ fn stop_monitoring<T: ProcessState + ProcessCtx<T>>(
     if let Some(process) = process {
         process.send(Signal::StopMonitoring {
             process_id: this_process_id,
-        });
+        })?;
     }
 
     Ok(())
@@ -1535,7 +1778,7 @@ fn stop_monitoring<T: ProcessState + ProcessCtx<T>>(
 fn kill<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>, process_id: u64) -> Result<()> {
     // Send kill signal to process
     if let Some(process) = caller.data().environment().get_process(process_id) {
-        process.send(Signal::Kill);
+        process.send(Signal::Kill)?;
     }
     Ok(())
 }
@@ -1553,6 +1796,11 @@ fn exists<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>, process_id: u64) -
 mod tests {
     use std::path::Path;
 
+    use lunatic_process::config::{
+        DEFAULT_MAX_MAILBOX_MESSAGES, DEFAULT_MAX_MESSAGE_RESOURCES, DEFAULT_MAX_MESSAGE_SIZE,
+        DEFAULT_MAX_SIGNAL_QUEUE,
+    };
+
     use super::ProcessConfigCtx;
 
     #[derive(Default)]
@@ -1563,7 +1811,7 @@ mod tests {
     }
 
     // This intentionally implements only the methods required before the
-    // table/FD/network ceiling imports were added.
+    // resource-ceiling imports were added.
     impl ProcessConfigCtx for PreResourceCeilingConfig {
         fn can_compile_modules(&self) -> bool {
             self.compile
@@ -1600,8 +1848,22 @@ mod tests {
         config.set_max_table_elements(100);
         config.set_max_file_descriptors(100);
         config.set_max_network_connections(100);
+        config.set_max_mailbox_messages(100);
+        config.set_max_signal_queue(100);
+        config.set_max_message_size(100);
+        config.set_max_message_resources(100);
         assert_eq!(config.get_max_table_elements(), 0);
         assert_eq!(config.get_max_file_descriptors(), 0);
         assert_eq!(config.get_max_network_connections(), 0);
+        assert_eq!(
+            config.get_max_mailbox_messages(),
+            DEFAULT_MAX_MAILBOX_MESSAGES
+        );
+        assert_eq!(config.get_max_signal_queue(), DEFAULT_MAX_SIGNAL_QUEUE);
+        assert_eq!(config.get_max_message_size(), DEFAULT_MAX_MESSAGE_SIZE);
+        assert_eq!(
+            config.get_max_message_resources(),
+            DEFAULT_MAX_MESSAGE_RESOURCES
+        );
     }
 }

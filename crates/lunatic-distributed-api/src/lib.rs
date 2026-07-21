@@ -7,17 +7,13 @@ use lunatic_distributed::{
     control::cert::CertificateAuthority,
     distributed::{
         self,
-        client::{EnvironmentId, NodeId, ProcessId, SendParams, SpawnParams},
+        client::{EnvironmentId, NodeId, ProcessId, SendErrorKind, SendParams, SpawnParams},
         message::{ClientError, Spawn, Val},
     },
     CertAttrs, DistributedCtx, SUBJECT_DIR_ATTRS,
 };
 use lunatic_error_api::ErrorCtx;
-use lunatic_process::{
-    config::ProcessConfig,
-    env::Environment,
-    message::{DataMessage, Message},
-};
+use lunatic_process::{config::ProcessConfig, env::Environment, message::Message};
 use lunatic_process_api::ProcessCtx;
 use rcgen::{CertificateSigningRequestParams, CustomExtension};
 use tokio::time::timeout;
@@ -560,6 +556,16 @@ where
 // Traps:
 // * If it's called before creating the next message.
 // * If the message contains resources
+fn distributed_send_error_status(kind: SendErrorKind) -> u32 {
+    match kind {
+        SendErrorKind::NodeNotFound => 2,
+        SendErrorKind::Backpressure
+        | SendErrorKind::MessageTooLarge
+        | SendErrorKind::QueueClosed
+        | SendErrorKind::Serialization => 9027,
+    }
+}
+
 fn send<T, E>(
     mut caller: Caller<T>,
     node_id: u64,
@@ -577,32 +583,62 @@ where
             .take()
             .or_trap("lunatic::distributed::send::no_message")?;
 
-        if let Message::Data(DataMessage {
-            tag,
-            buffer,
-            resources,
-            ..
-        }) = message
-        {
-            if !resources.is_empty() {
-                return Err(anyhow!("Cannot send resources to remote nodes."));
+        let mut data_message = match message {
+            Message::Data(data_message) => data_message,
+            other => {
+                caller.data_mut().message_scratch_area().replace(other);
+                return Err(anyhow!("Only Message::Data can be sent across nodes."));
             }
+        };
+        if !data_message.resources.is_empty() {
+            caller
+                .data_mut()
+                .message_scratch_area()
+                .replace(Message::Data(data_message));
+            return Err(anyhow!("Cannot send resources to remote nodes."));
+        }
 
+        let distributed_context = {
             let state = caller.data();
-            let send_params = SendParams {
-                env: EnvironmentId(state.environment_id()),
-                src: ProcessId(state.id()),
-                node: NodeId(node_id),
-                dest: ProcessId(process_id),
-                tag,
-                data: buffer,
-            };
-            match state.distributed()?.node_client.send(send_params).await {
-                Ok(_) => Ok(0),
-                Err(cause) => Err(anyhow!(cause)),
+            state.distributed().map(|distributed| {
+                (
+                    EnvironmentId(state.environment_id()),
+                    ProcessId(state.id()),
+                    distributed.node_client.clone(),
+                )
+            })
+        };
+        let (env, src, node_client) = match distributed_context {
+            Ok(context) => context,
+            Err(error) => {
+                caller
+                    .data_mut()
+                    .message_scratch_area()
+                    .replace(Message::Data(data_message));
+                return Err(error);
             }
-        } else {
-            Err(anyhow!("Only Message::Data can be sent across nodes."))
+        };
+        let data = std::mem::take(&mut data_message.buffer);
+        let tag = data_message.tag;
+        let send_params = SendParams {
+            env,
+            src,
+            node: NodeId(node_id),
+            dest: ProcessId(process_id),
+            tag,
+            data,
+        };
+        match node_client.send(send_params).await {
+            Ok(_) => Ok(0),
+            Err(error) => {
+                let status = distributed_send_error_status(error.kind());
+                data_message.buffer = error.into_data();
+                caller
+                    .data_mut()
+                    .message_scratch_area()
+                    .replace(Message::Data(data_message));
+                Ok(status)
+            }
         }
     })
 }
@@ -647,51 +683,74 @@ where
             .take()
             .or_trap("lunatic::distributed::send_receive_skip_search")?;
 
-        if let Message::Data(DataMessage {
-            tag,
-            buffer,
-            resources,
-            ..
-        }) = message
-        {
-            if !resources.is_empty() {
-                return Err(anyhow!("Cannot send resources to remote nodes."));
+        let mut data_message = match message {
+            Message::Data(data_message) => data_message,
+            other => {
+                caller.data_mut().message_scratch_area().replace(other);
+                return Err(anyhow!("Only Message::Data can be sent across nodes."));
             }
+        };
+        if !data_message.resources.is_empty() {
+            caller
+                .data_mut()
+                .message_scratch_area()
+                .replace(Message::Data(data_message));
+            return Err(anyhow!("Cannot send resources to remote nodes."));
+        }
 
+        let distributed_context = {
             let state = caller.data();
-            let send_params = SendParams {
-                env: EnvironmentId(state.environment_id()),
-                src: ProcessId(state.id()),
-                node: NodeId(node_id),
-                dest: ProcessId(process_id),
-                tag,
-                data: buffer,
-            };
-            let code = match state.distributed()?.node_client.send(send_params).await {
-                Ok(_) => Ok(0),
-                Err(error) => Err(anyhow!(error)),
-            }?;
-
-            if code != 0 {
-                return Ok(code);
+            state.distributed().map(|distributed| {
+                (
+                    EnvironmentId(state.environment_id()),
+                    ProcessId(state.id()),
+                    distributed.node_client.clone(),
+                )
+            })
+        };
+        let (env, src, node_client) = match distributed_context {
+            Ok(context) => context,
+            Err(error) => {
+                caller
+                    .data_mut()
+                    .message_scratch_area()
+                    .replace(Message::Data(data_message));
+                return Err(error);
             }
+        };
+        let data = std::mem::take(&mut data_message.buffer);
+        let tag = data_message.tag;
+        let send_params = SendParams {
+            env,
+            src,
+            node: NodeId(node_id),
+            dest: ProcessId(process_id),
+            tag,
+            data,
+        };
+        if let Err(error) = node_client.send(send_params).await {
+            let status = distributed_send_error_status(error.kind());
+            data_message.buffer = error.into_data();
+            caller
+                .data_mut()
+                .message_scratch_area()
+                .replace(Message::Data(data_message));
+            return Ok(status);
+        }
 
-            let tags = [wait_on_tag];
-            let pop_skip_search = caller.data_mut().mailbox().pop_skip_search(Some(&tags));
-            if let Ok(message) = match timeout_duration {
-                // Without timeout
-                u64::MAX => Ok(pop_skip_search.await),
-                // With timeout
-                t => timeout(Duration::from_millis(t), pop_skip_search).await,
-            } {
-                // Put the message into the scratch area
-                caller.data_mut().message_scratch_area().replace(message);
-                Ok(0)
-            } else {
-                Ok(9027)
-            }
+        let tags = [wait_on_tag];
+        let pop_skip_search = caller.data_mut().mailbox().pop_skip_search(Some(&tags));
+        if let Ok(message) = match timeout_duration {
+            // Without timeout
+            u64::MAX => Ok(pop_skip_search.await),
+            // With timeout
+            t => timeout(Duration::from_millis(t), pop_skip_search).await,
+        } {
+            // Put the message into the scratch area
+            caller.data_mut().message_scratch_area().replace(message);
+            Ok(0)
         } else {
-            Err(anyhow!("Only Message::Data can be sent across nodes."))
+            Ok(9027)
         }
     })
 }

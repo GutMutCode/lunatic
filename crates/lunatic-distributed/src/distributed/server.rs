@@ -265,9 +265,8 @@ where
 
 fn decode_distributed_config<C: ProcessConfig>(encoded: &[u8], environment_id: u64) -> Result<C> {
     let config: C = rmp_serde::from_slice(encoded)?;
-    // Portable capability and limit fields currently inherit the authenticated
-    // cluster node's authority. Host filesystem paths are different: their
-    // meaning is receiver-local, so they fail closed without a node policy.
+    // Each config implementation applies its receiver-side policy here, including numeric
+    // ceilings and rejection of receiver-local capabilities such as host filesystem paths.
     if let Err(reason) = config.validate_distributed_config() {
         log::info!(
             target: "audit",
@@ -367,12 +366,15 @@ where
         if let Some(proc) = env.get_process(process_id) {
             proc.send(Signal::Message(Message::Data(DataMessage::new_from_vec(
                 tag, data,
-            ))));
+            ))))
+            .map_err(|error| ClientError::Unexpected(error.to_string()))?;
         } else {
             return Err(ClientError::ProcessNotFound);
         }
+        Ok(())
+    } else {
+        Err(ClientError::ProcessNotFound)
     }
-    Ok(())
 }
 
 #[cfg(test)]

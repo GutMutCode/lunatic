@@ -22,7 +22,8 @@ use lunatic_error_api::ErrorCtx;
 
 use crate::dns::DnsIterator;
 use crate::{
-    socket_address, NetworkingCtx, TlsClientConnectionMetadata, TlsConnection, TlsListener,
+    socket_address, validate_memory_range, NetworkingCtx, TlsClientConnectionMetadata,
+    TlsConnection, TlsListener,
 };
 
 // Register TLS networking APIs to the linker
@@ -105,23 +106,40 @@ fn tls_local_addr<T: NetworkingCtx + ErrorCtx>(
     tls_listener_id: u64,
     id_u64_ptr: u32,
 ) -> Result<u32> {
-    let tls_listener = caller
+    caller
         .data()
         .tls_listener_resources()
         .get(tls_listener_id)
         .or_trap("lunatic::network::tls_local_addr: listener ID doesn't exist")?;
-    let (dns_iter_or_error_id, result) = match tls_listener.listener.local_addr() {
-        Ok(socket_addr) => {
-            let dns_iter_id = caller
-                .data_mut()
-                .dns_resources_mut()
-                .add(DnsIterator::new(vec![socket_addr].into_iter()));
-            (dns_iter_id, 0)
+    let memory = get_memory(&mut caller)?;
+    validate_memory_range(
+        &caller,
+        &memory,
+        id_u64_ptr,
+        std::mem::size_of::<u64>(),
+        "lunatic::network::tls_local_addr",
+    )?;
+    let lease = caller.data().reserve_dns_iterator_lease();
+    let (dns_iter_or_error_id, result) = match lease {
+        Ok(lease) => {
+            let local_addr = caller
+                .data()
+                .tls_listener_resources()
+                .get(tls_listener_id)
+                .expect("validated TLS listener must remain in the resource table")
+                .listener
+                .local_addr();
+            match local_addr {
+                Ok(socket_addr) => {
+                    let iterator = DnsIterator::with_lease(vec![socket_addr].into_iter(), lease);
+                    (caller.data_mut().dns_resources_mut().add(iterator), 0)
+                }
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+            }
         }
-        Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+        Err(error) => (caller.data_mut().add_error_resource(error), 1),
     };
 
-    let memory = get_memory(&mut caller)?;
     memory
         .write(
             &mut caller,
@@ -185,22 +203,25 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
             flow_info,
             scope_id,
         )?;
-        let (tls_listener_or_error_id, result) = match TcpListener::bind(socket_addr).await {
-            Ok(listener) => {
-                audit_log("tls_bind", format!("address={}", socket_addr));
-                (
-                    caller
+        let lease = caller.data().reserve_network_handle_lease();
+        let (tls_listener_or_error_id, result) = match lease {
+            Ok(lease) => match TcpListener::bind(socket_addr).await {
+                Ok(listener) => {
+                    audit_log("tls_bind", format!("address={}", socket_addr));
+                    let id = caller
                         .data_mut()
                         .tls_listener_resources_mut()
                         .add(TlsListener {
                             listener,
                             keys,
                             certs,
-                        }),
-                    0,
-                )
-            }
-            Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+                        });
+                    lease.into_table_reservation();
+                    (id, 0)
+                }
+                Err(error) => (caller.data_mut().add_error_resource(error.into()), 1),
+            },
+            Err(error) => (caller.data_mut().add_error_resource(error), 1),
         };
         memory
             .write(
@@ -224,6 +245,7 @@ fn drop_tls_listener<T: NetworkingCtx>(mut caller: Caller<T>, tls_listener_id: u
         .tls_listener_resources_mut()
         .remove(tls_listener_id)
         .or_trap("lunatic::networking::drop_tls_listener")?;
+    caller.data_mut().release_network_handle()?;
     Ok(())
 }
 
@@ -243,42 +265,77 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
     socket_addr_id_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
     Box::new(async move {
-        let tls_listener = caller
-            .data()
-            .tls_listener_resources()
-            .get(listener_id)
-            .or_trap("lunatic::network::tls_accept")?;
-        let keys = tls_listener.keys.clone_key();
-        let certs = tls_listener.certs.clone();
-
-        let (tls_stream_or_error_id, peer_addr_iter, result) =
-            match tls_listener.listener.accept().await {
-                Ok((stream, socket_addr)) => {
-                    let config = rustls::ServerConfig::builder()
-                        .with_no_client_auth()
-                        .with_single_cert(vec![certs], keys)
-                        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
-                        .or_trap("lunatic::network::tls_accept server_config")?;
-                    let acceptor = TlsAcceptor::from(Arc::new(config));
-                    let stream = acceptor
-                        .accept(stream)
-                        .await
-                        .or_trap("unexpected tls error")?;
-
-                    let stream_id = caller.data_mut().tls_stream_resources_mut().add(Arc::new(
-                        TlsConnection::new(tokio_rustls::TlsStream::Server(stream)),
-                    ));
-                    let dns_iter_id = caller
-                        .data_mut()
-                        .dns_resources_mut()
-                        .add(DnsIterator::new(vec![socket_addr].into_iter()));
-                    audit_log("tls_accept", format!("peer={}", socket_addr));
-                    (stream_id, dns_iter_id, 0)
-                }
-                Err(error) => (caller.data_mut().add_error_resource(error.into()), 0, 1),
-            };
-
+        let (keys, certs) = {
+            let tls_listener = caller
+                .data()
+                .tls_listener_resources()
+                .get(listener_id)
+                .or_trap("lunatic::network::tls_accept")?;
+            (tls_listener.keys.clone_key(), tls_listener.certs.clone())
+        };
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certs], keys)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+            .or_trap("lunatic::network::tls_accept server_config")?;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
         let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tls_accept",
+        )?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            socket_addr_id_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tls_accept",
+        )?;
+
+        let leases = caller
+            .data()
+            .reserve_network_handle_lease()
+            .and_then(|network| {
+                caller
+                    .data()
+                    .reserve_dns_iterator_lease()
+                    .map(|dns| (network, dns))
+            });
+        let (tls_stream_or_error_id, peer_addr_iter, result) = match leases {
+            Ok((network_lease, dns_lease)) => {
+                let accept = caller
+                    .data()
+                    .tls_listener_resources()
+                    .get(listener_id)
+                    .expect("validated TLS listener must remain in the resource table")
+                    .listener
+                    .accept()
+                    .await;
+                match accept {
+                    Ok((stream, socket_addr)) => {
+                        let stream = acceptor
+                            .accept(stream)
+                            .await
+                            .or_trap("unexpected tls error")?;
+                        let stream_id = caller.data_mut().tls_stream_resources_mut().add(Arc::new(
+                            TlsConnection::new(tokio_rustls::TlsStream::Server(stream)),
+                        ));
+                        network_lease.into_table_reservation();
+                        let iterator =
+                            DnsIterator::with_lease(vec![socket_addr].into_iter(), dns_lease);
+                        let dns_iter_id = caller.data_mut().dns_resources_mut().add(iterator);
+                        audit_log("tls_accept", format!("peer={}", socket_addr));
+                        (stream_id, dns_iter_id, 0)
+                    }
+                    Err(error) => (caller.data_mut().add_error_resource(error.into()), 0, 1),
+                }
+            }
+            Err(error) => (caller.data_mut().add_error_resource(error), 0, 1),
+        };
+
         memory
             .write(
                 &mut caller,
@@ -408,6 +465,16 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
             .with_no_client_auth();
 
         let connector = TlsConnector::from(Arc::new(config));
+        let lease = match caller.data().reserve_network_handle_lease() {
+            Ok(lease) => lease,
+            Err(error) => {
+                let error_id = caller.data_mut().add_error_resource(error);
+                memory
+                    .write(&mut caller, id_u64_ptr as usize, &error_id.to_le_bytes())
+                    .or_trap("lunatic::networking::tls_connect")?;
+                return Ok(1);
+            }
+        };
         let connect = TcpStream::connect((&socket_addr[..], port as u16));
         if let Ok(result) = match timeout_duration {
             // Without timeout
@@ -444,6 +511,7 @@ fn tls_connect<T: NetworkingCtx + ErrorCtx + Send>(
                             client_metadata,
                         ),
                     ));
+                    lease.into_table_reservation();
                     audit_log("tls_connect", format!("peer={} port={}", socket_addr, port));
                     (id, 0)
                 }
@@ -475,6 +543,7 @@ fn drop_tls_stream<T: NetworkingCtx>(mut caller: Caller<T>, tls_stream_id: u64) 
         .tls_stream_resources_mut()
         .remove(tls_stream_id)
         .or_trap("lunatic::networking::drop_tls_stream")?;
+    caller.data_mut().release_network_handle()?;
     Ok(())
 }
 
@@ -489,7 +558,9 @@ fn clone_tls_stream<T: NetworkingCtx>(mut caller: Caller<T>, tls_stream_id: u64)
         .get(tls_stream_id)
         .or_trap("lunatic::networking::clone_tls_stream")?
         .clone();
+    let lease = caller.data().reserve_network_handle_lease()?;
     let id = caller.data_mut().tls_stream_resources_mut().add(stream);
+    lease.into_table_reservation();
     Ok(id)
 }
 

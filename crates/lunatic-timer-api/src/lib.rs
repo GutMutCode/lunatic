@@ -2,15 +2,19 @@ use std::{
     cmp::Ordering,
     collections::BinaryHeap,
     future::Future,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use hash_map_id::HashMapId;
 use lunatic_common_api::{IntoTrap, LinkerAsyncExt};
 use lunatic_process::{state::ProcessState, Signal};
 use lunatic_process_api::ProcessCtx;
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+};
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
 #[derive(Debug)]
@@ -39,17 +43,58 @@ impl PartialEq for HeapValue {
 
 impl Eq for HeapValue {}
 
-#[derive(Debug, Default)]
+/// Finite default for host-side delayed-message tasks owned by one process.
+pub const DEFAULT_MAX_TIMERS: usize = 1_024;
+
+#[derive(Debug)]
+struct TimerEntry {
+    handle: JoinHandle<()>,
+    // The permit is released when a timer completes and is cleaned up, is
+    // canceled, or its owning process state is dropped.
+    _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
 pub struct TimerResources {
-    hash_map: HashMapId<JoinHandle<()>>,
+    hash_map: HashMapId<TimerEntry>,
     heap: BinaryHeap<HeapValue>,
+    admission: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl Default for TimerResources {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_MAX_TIMERS)
+    }
 }
 
 impl TimerResources {
-    pub fn add(&mut self, handle: JoinHandle<()>, target_time: Instant) -> u64 {
-        self.cleanup_expired_timers();
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            hash_map: HashMapId::new(),
+            heap: BinaryHeap::new(),
+            admission: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        }
+    }
 
-        let id = self.hash_map.add(handle);
+    fn try_reserve(&mut self) -> Result<OwnedSemaphorePermit> {
+        self.cleanup_expired_timers();
+        Arc::clone(&self.admission)
+            .try_acquire_owned()
+            .map_err(|_| anyhow!("timer limit ({}) reached", self.capacity))
+    }
+
+    fn add(
+        &mut self,
+        handle: JoinHandle<()>,
+        target_time: Instant,
+        permit: OwnedSemaphorePermit,
+    ) -> u64 {
+        let id = self.hash_map.add(TimerEntry {
+            handle,
+            _permit: permit,
+        });
         self.heap.push(HeapValue {
             instant: target_time,
             key: id,
@@ -59,9 +104,21 @@ impl TimerResources {
 
     fn cleanup_expired_timers(&mut self) {
         let deadline = Instant::now();
-        while let Some(HeapValue { instant, .. }) = self.heap.peek() {
+        while let Some(HeapValue { instant, key }) = self.heap.peek() {
             if *instant > deadline {
                 // instant is after the deadline so stop
+                return;
+            }
+
+            // A deadline only makes a timer runnable; it does not prove the
+            // spawned future has completed. Releasing admission for an
+            // unfinished zero-delay task would detach its JoinHandle and let
+            // a tight guest loop retain unbounded messages outside the Store.
+            if self
+                .hash_map
+                .get(*key)
+                .is_some_and(|entry| !entry.handle.is_finished())
+            {
                 return;
             }
 
@@ -75,7 +132,31 @@ impl TimerResources {
     }
 
     pub fn remove(&mut self, id: u64) -> Option<JoinHandle<()>> {
-        self.hash_map.remove(id)
+        let entry = self.hash_map.remove(id)?;
+        // Canceled far-future timers must not leave unbounded stale deadline
+        // metadata in the heap while their admission permits are reused.
+        self.heap.retain(|deadline| deadline.key != id);
+        Some(entry.handle)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn len(&self) -> usize {
+        self.hash_map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hash_map.is_empty()
+    }
+}
+
+impl Drop for TimerResources {
+    fn drop(&mut self) {
+        for (_, entry) in self.hash_map.iter() {
+            entry.handle.abort();
+        }
     }
 }
 
@@ -136,37 +217,50 @@ fn send_after<T: ProcessState + ProcessCtx<T> + TimerCtx>(
     process_id: u64,
     delay: u64,
 ) -> Result<u64> {
+    let process = caller
+        .data()
+        .environment()
+        .get_process(process_id)
+        .or_trap("lunatic::timer::send_after: process does not exist")?;
+    let target_time = Instant::now()
+        .checked_add(Duration::from_millis(delay))
+        .ok_or_else(|| anyhow!("timer deadline overflow"))?;
+    // Reserve before taking the scratch message. A quota failure is therefore
+    // explicit and ownership preserving, and no detached task can bypass the
+    // per-process timer ceiling.
+    let timer_permit = caller.data_mut().timer_resources_mut().try_reserve()?;
     let message = caller
         .data_mut()
         .message_scratch_area()
         .take()
         .or_trap("lunatic::message::send_after")?;
 
-    let process = caller.data_mut().environment().get_process(process_id);
-
-    let target_time = Instant::now() + Duration::from_millis(delay);
     let timer_handle = tokio::task::spawn(async move {
         #[cfg(feature = "metrics")]
         metrics::increment_counter!("lunatic.timers.started");
         #[cfg(feature = "metrics")]
         metrics::increment_gauge!("lunatic.timers.active", 1.0);
-        let duration_remaining = target_time - Instant::now();
+        let duration_remaining = target_time.saturating_duration_since(Instant::now());
         if duration_remaining != Duration::ZERO {
             tokio::time::sleep(duration_remaining).await;
         }
-        if let Some(process) = process {
-            #[cfg(feature = "metrics")]
-            metrics::increment_counter!("lunatic.timers.completed");
-            #[cfg(feature = "metrics")]
-            metrics::decrement_gauge!("lunatic.timers.active", 1.0);
-            process.send(Signal::Message(message));
+        #[cfg(feature = "metrics")]
+        metrics::increment_counter!("lunatic.timers.completed");
+        #[cfg(feature = "metrics")]
+        metrics::decrement_gauge!("lunatic.timers.active", 1.0);
+        if let Err(error) = process.send(Signal::Message(message)) {
+            log::warn!(
+                "Delayed message to process {} was rejected: {}",
+                process.id(),
+                error
+            );
         }
     });
 
     let id = caller
         .data_mut()
         .timer_resources_mut()
-        .add(timer_handle, target_time);
+        .add(timer_handle, target_time, timer_permit);
     Ok(id)
 }
 
@@ -196,4 +290,74 @@ fn cancel_timer<T: ProcessState + TimerCtx + Send>(
             None => Ok(0),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::pending, time::Duration};
+
+    use super::TimerResources;
+
+    #[tokio::test]
+    async fn active_timer_limit_is_explicit_and_cancel_recovers_capacity() {
+        let mut timers = TimerResources::with_capacity(1);
+        let permit = timers.try_reserve().unwrap();
+        let handle = tokio::spawn(pending());
+        let timer_id = timers.add(
+            handle,
+            std::time::Instant::now() + Duration::from_secs(60),
+            permit,
+        );
+
+        assert_eq!(timers.capacity(), 1);
+        assert_eq!(timers.len(), 1);
+        assert!(timers.try_reserve().is_err());
+
+        timers.remove(timer_id).unwrap().abort();
+        assert!(timers.is_empty());
+        assert!(timers.heap.is_empty());
+        assert!(timers.try_reserve().is_ok());
+    }
+
+    #[tokio::test]
+    async fn repeated_far_future_cancellation_does_not_grow_deadline_heap() {
+        let mut timers = TimerResources::with_capacity(1);
+        for _ in 0..10_000 {
+            let permit = timers.try_reserve().unwrap();
+            let handle = tokio::spawn(pending());
+            let timer_id = timers.add(
+                handle,
+                std::time::Instant::now() + Duration::from_secs(86_400),
+                permit,
+            );
+            timers.remove(timer_id).unwrap().abort();
+        }
+        assert!(timers.is_empty());
+        assert!(timers.heap.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_timer_cleanup_recovers_capacity() {
+        let mut timers = TimerResources::with_capacity(1);
+        let permit = timers.try_reserve().unwrap();
+        let handle = tokio::spawn(async {});
+        timers.add(handle, std::time::Instant::now(), permit);
+        tokio::task::yield_now().await;
+
+        assert!(timers.try_reserve().is_ok());
+        assert!(timers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_but_unfinished_timer_keeps_its_admission() {
+        let mut timers = TimerResources::with_capacity(1);
+        let permit = timers.try_reserve().unwrap();
+        let handle = tokio::spawn(pending());
+        timers.add(handle, std::time::Instant::now(), permit);
+
+        for _ in 0..1_000 {
+            assert!(timers.try_reserve().is_err());
+        }
+        assert_eq!(timers.len(), 1);
+    }
 }
