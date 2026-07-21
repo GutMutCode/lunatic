@@ -43,6 +43,38 @@ pub(crate) struct Args {
     #[arg(long, value_parser = parse_key_val, action = clap::ArgAction::Append)]
     tag: Vec<(String, String)>,
 
+    /// Maximum node-wide distributed messages retained for outbound delivery.
+    #[arg(long, default_value_t = 1_024)]
+    outbound_max_messages: usize,
+
+    /// Maximum node-wide bytes retained for outbound distributed delivery.
+    #[arg(long, default_value_t = 32 * 1024 * 1024)]
+    outbound_max_bytes: usize,
+
+    /// Maximum UTF-8 bytes in one distributed registry name.
+    #[arg(long, default_value_t = 1_024)]
+    registry_max_name_bytes: usize,
+
+    /// Maximum aggregate local and global distributed registry entries.
+    #[arg(long, default_value_t = 16_384)]
+    registry_max_entries: usize,
+
+    /// Maximum aggregate bytes retained by distributed registry names.
+    #[arg(long, default_value_t = 4 * 1024 * 1024)]
+    registry_max_retained_bytes: usize,
+
+    /// Number of fixed registration lock stripes.
+    #[arg(long, default_value_t = 1_024)]
+    registry_max_name_locks: usize,
+
+    /// Maximum aggregate in-flight registry requests and responses.
+    #[arg(long, default_value_t = 4_096)]
+    registry_max_pending_responses: usize,
+
+    /// Maximum live nodes admitted to registry topology and outbound managers.
+    #[arg(long, default_value_t = 1_024)]
+    registry_max_topology_nodes: usize,
+
     #[cfg(feature = "prometheus")]
     #[command(flatten)]
     prometheus: super::common::PrometheusArgs,
@@ -89,8 +121,14 @@ pub(crate) async fn start(args: Args) -> Result<()> {
         )
     };
 
-    let control_client =
-        control::Client::new(http_client.clone(), reg.clone(), socket, node_attributes).await?;
+    let control_client = control::Client::new_with_topology_limit(
+        http_client.clone(),
+        reg.clone(),
+        socket,
+        node_attributes,
+        args.registry_max_topology_nodes,
+    )
+    .await?;
 
     let node_id = control_client.node_id();
 
@@ -105,8 +143,25 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     )
     .with_context(|| "Failed to create mTLS QUIC client")?;
 
-    let distributed_client =
-        distributed::Client::new(node_id, control_client.clone(), quic_client.clone());
+    let distributed_client = distributed::Client::new_with_limits(
+        node_id,
+        control_client.clone(),
+        quic_client.clone(),
+        distributed::DistributedLimits {
+            outbound: distributed::OutboundLimits {
+                max_messages: args.outbound_max_messages,
+                max_bytes: args.outbound_max_bytes,
+            },
+            registry: distributed::RegistryLimits {
+                max_name_bytes: args.registry_max_name_bytes,
+                max_entries: args.registry_max_entries,
+                max_retained_bytes: args.registry_max_retained_bytes,
+                max_name_locks: args.registry_max_name_locks,
+                max_pending_responses: args.registry_max_pending_responses,
+                max_topology_nodes: args.registry_max_topology_nodes,
+            },
+        },
+    );
 
     let dist = lunatic_distributed::DistributedProcessState::new(
         node_id,

@@ -707,6 +707,11 @@ pub trait ProcessState: Sized + crate::reloadable_state::ReloadableState {
 
     // Returns process ID
     fn id(&self) -> u64;
+    /// Returns an optional host lifecycle hook that is invoked exactly once
+    /// when the process leaves its environment, before death notifications.
+    fn process_exit_hook(&self) -> Option<Arc<dyn crate::env::ProcessExitHook>> {
+        None
+    }
     /// Returns the node identity attached to audit events, when known.
     fn audit_node_id(&self) -> Option<u64> {
         None

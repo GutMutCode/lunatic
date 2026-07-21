@@ -8,9 +8,11 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{atomic, atomic::AtomicU64, Arc, RwLock},
+    sync::{atomic, atomic::AtomicU64, atomic::AtomicUsize, Arc, RwLock},
     time::Duration,
 };
+
+pub const DEFAULT_MAX_TOPOLOGY_NODES: usize = 1_024;
 
 #[derive(Clone)]
 pub struct Client {
@@ -24,8 +26,31 @@ pub struct InnerClient {
     next_message_id: AtomicU64,
     next_query_id: AtomicU64,
     node_queries: DashMap<u64, Vec<u64>>,
+    pending_node_queries: AtomicUsize,
     nodes: DashMap<u64, NodeInfo>,
     node_ids: RwLock<Vec<u64>>,
+    max_topology_nodes: usize,
+}
+
+struct PendingNodeQueryReservation {
+    inner: Arc<InnerClient>,
+    active: bool,
+}
+
+impl PendingNodeQueryReservation {
+    fn commit(mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for PendingNodeQueryReservation {
+    fn drop(&mut self) {
+        if self.active {
+            self.inner
+                .pending_node_queries
+                .fetch_sub(1, atomic::Ordering::AcqRel);
+        }
+    }
 }
 
 impl Client {
@@ -35,7 +60,9 @@ impl Client {
     /// deterministic node-to-node protocol tests.
     #[doc(hidden)]
     pub fn from_static_nodes(reg: Registration, node_id: u64, nodes: Vec<NodeInfo>) -> Self {
-        let node_ids = nodes.iter().map(|node| node.id).collect();
+        let mut node_ids = nodes.iter().map(|node| node.id).collect::<Vec<_>>();
+        node_ids.sort_unstable();
+        node_ids.dedup();
         let node_map = DashMap::new();
         for node in nodes {
             node_map.insert(node.id, node);
@@ -48,8 +75,10 @@ impl Client {
                 next_message_id: AtomicU64::new(1),
                 next_query_id: AtomicU64::new(1),
                 node_queries: DashMap::new(),
+                pending_node_queries: AtomicUsize::new(0),
                 nodes: node_map,
                 node_ids: RwLock::new(node_ids),
+                max_topology_nodes: DEFAULT_MAX_TOPOLOGY_NODES,
             }),
         }
     }
@@ -59,6 +88,23 @@ impl Client {
         reg: Registration,
         node_address: SocketAddr,
         attributes: HashMap<String, String>,
+    ) -> Result<Self> {
+        Self::new_with_topology_limit(
+            http_client,
+            reg,
+            node_address,
+            attributes,
+            DEFAULT_MAX_TOPOLOGY_NODES,
+        )
+        .await
+    }
+
+    pub async fn new_with_topology_limit(
+        http_client: HttpClient,
+        reg: Registration,
+        node_address: SocketAddr,
+        attributes: HashMap<String, String>,
+        max_topology_nodes: usize,
     ) -> Result<Self> {
         let node_id = Self::start(
             &http_client,
@@ -77,9 +123,11 @@ impl Client {
                 http_client,
                 next_message_id: AtomicU64::new(1),
                 node_queries: DashMap::new(),
+                pending_node_queries: AtomicUsize::new(0),
                 next_query_id: AtomicU64::new(1),
                 nodes: Default::default(),
                 node_ids: Default::default(),
+                max_topology_nodes,
             }),
         };
 
@@ -242,18 +290,35 @@ impl Client {
 
     pub async fn refresh_nodes(&self) -> Result<()> {
         let resp: NodesList = self.get(&self.inner.reg.urls.nodes, None).await?;
-        let mut node_ids = vec![];
-        for node in resp.nodes {
+        anyhow::ensure!(
+            resp.nodes.len() <= self.inner.max_topology_nodes,
+            "Control topology contains {} nodes, exceeding configured limit {}",
+            resp.nodes.len(),
+            self.inner.max_topology_nodes
+        );
+        self.replace_nodes(resp.nodes);
+        Ok(())
+    }
+
+    fn replace_nodes(&self, nodes: Vec<NodeInfo>) {
+        let mut node_ids = Vec::with_capacity(nodes.len());
+        for node in nodes {
             let id = node.id;
             node_ids.push(id);
-            if !self.inner.nodes.contains_key(&id) {
-                self.inner.nodes.insert(id, node);
-            }
+            self.inner.nodes.insert(id, node);
         }
+        node_ids.sort_unstable();
+        node_ids.dedup();
+        let active = node_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        self.inner
+            .nodes
+            .retain(|node_id, _| active.contains(node_id));
         if let Ok(mut self_node_ids) = self.inner.node_ids.write() {
             *self_node_ids = node_ids;
         }
-        Ok(())
     }
 
     pub async fn notify_node_stopped(&self) -> Result<()> {
@@ -270,19 +335,53 @@ impl Client {
         self.inner.node_ids.read().unwrap().clone()
     }
 
+    fn reserve_node_query(&self) -> Result<PendingNodeQueryReservation> {
+        self.inner
+            .pending_node_queries
+            .fetch_update(
+                atomic::Ordering::AcqRel,
+                atomic::Ordering::Acquire,
+                |current| (current < self.inner.max_topology_nodes).then_some(current + 1),
+            )
+            .map_err(|_| {
+                anyhow!(
+                    "Pending node query limit {} reached",
+                    self.inner.max_topology_nodes
+                )
+            })?;
+        Ok(PendingNodeQueryReservation {
+            inner: self.inner.clone(),
+            active: true,
+        })
+    }
+
     pub async fn lookup_nodes(&self, query: &str) -> Result<(u64, usize)> {
+        let reservation = self.reserve_node_query()?;
         let resp: NodesList = self
             .get(&self.inner.reg.urls.get_nodes, Some(query))
             .await?;
+        anyhow::ensure!(
+            resp.nodes.len() <= self.inner.max_topology_nodes,
+            "Node query returned {} results, exceeding configured limit {}",
+            resp.nodes.len(),
+            self.inner.max_topology_nodes
+        );
         let nodes: Vec<u64> = resp.nodes.into_iter().map(move |v| v.id).collect();
         let nodes_count = nodes.len();
         let query_id = self.next_query_id();
         self.inner.node_queries.insert(query_id, nodes);
+        reservation.commit();
         Ok((query_id, nodes_count))
     }
 
     pub fn query_result(&self, query_id: &u64) -> Option<(u64, Vec<u64>)> {
-        self.inner.node_queries.remove(query_id)
+        let result = self.inner.node_queries.remove(query_id);
+        if result.is_some() {
+            self.inner
+                .pending_node_queries
+                .fetch_sub(1, atomic::Ordering::AcqRel);
+        }
+        result
     }
 
     pub fn node_count(&self) -> usize {
@@ -313,5 +412,56 @@ async fn refresh_nodes_task(client: Client) -> Result<()> {
     loop {
         client.refresh_nodes().await.ok();
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registration() -> Registration {
+        let url = "http://127.0.0.1:1/".to_string();
+        Registration {
+            node_name: uuid::Uuid::from_u128(1),
+            cert_pem_chain: Vec::new(),
+            authentication_token: "test".into(),
+            root_cert: String::new(),
+            urls: ControlUrls {
+                api_base: url.clone(),
+                nodes: url.clone(),
+                node_started: url.clone(),
+                node_stopped: url.clone(),
+                get_module: url.clone(),
+                add_module: url.clone(),
+                get_nodes: url,
+            },
+            envs: Vec::new(),
+            is_privileged: true,
+        }
+    }
+
+    fn node(id: u64, port: u16, name: &str) -> NodeInfo {
+        NodeInfo {
+            id,
+            name: name.into(),
+            address: ([127, 0, 0, 1], port).into(),
+        }
+    }
+
+    #[test]
+    fn topology_replacement_updates_metadata_and_removes_departed_nodes() {
+        let client = Client::from_static_nodes(
+            registration(),
+            1,
+            vec![node(1, 1001, "old-one"), node(2, 1002, "two")],
+        );
+
+        client.replace_nodes(vec![node(1, 2001, "new-one")]);
+
+        assert_eq!(client.node_ids(), vec![1]);
+        let current = client.node_info(1).expect("remaining node");
+        assert_eq!(current.name, "new-one");
+        assert_eq!(current.address.port(), 2001);
+        assert!(client.node_info(2).is_none());
     }
 }

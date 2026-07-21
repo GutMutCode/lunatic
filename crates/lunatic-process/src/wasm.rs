@@ -6,7 +6,7 @@ use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use wasmtime::{ResourceLimiter, Val};
 
-use crate::env::{register_process, Environment};
+use crate::env::Environment;
 use crate::module_registry::{ModuleRegistry, ProcessKey};
 use crate::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use crate::state::ProcessState;
@@ -309,6 +309,7 @@ where
         initial_module_version,
     } = options;
     let id = state.id();
+    let exit_hook = state.process_exit_hook();
     trace!("Spawning process: {}", id);
     let signal_mailbox = state.signal_mailbox().clone();
     let message_mailbox = state.message_mailbox().clone();
@@ -316,7 +317,12 @@ where
     // Store or running module initialization. If any subsequent setup fails,
     // the registration guard removes the provisional process automatically.
     let child_process_handle = Arc::new(WasmProcess::new(id, signal_mailbox.0.clone()));
-    let registration = register_process(env.clone(), id, child_process_handle.clone())?;
+    let registration = crate::env::ProcessRegistration::register_with_exit_hook(
+        env.clone(),
+        id,
+        child_process_handle.clone(),
+        exit_hook,
+    )?;
 
     let instance = runtime.instantiate(module, state).await?;
     let function = function.to_string();

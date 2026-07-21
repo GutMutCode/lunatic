@@ -75,8 +75,6 @@ pub fn node_started(
     ControlServerExtractor(control): ControlServerExtractor,
     JsonExtractor(data): JsonExtractor<NodeStart>,
 ) -> ApiResponse<NodeStarted> {
-    control.stop_node(node_auth.registration_id as u64);
-
     let (node_id, _node_address) = control.start_node(node_auth.registration_id as u64, data);
 
     info!("Node {} started with id {}", node_auth.node_name, node_id);
@@ -93,34 +91,36 @@ pub fn list_nodes(
     Query(query): Query<HashMap<String, String>>,
     ControlServerExtractor(control): ControlServerExtractor,
 ) -> ApiResponse<NodesList> {
-    let all_nodes = control.get_nodes();
-    let nds: Vec<_> = all_nodes
-        .into_values()
-        .filter(|n| n.status < 2 && !n.node_address.is_empty())
-        .collect();
-    let nds: Vec<_> = if !query.is_empty() {
-        nds.into_iter()
-            .filter(|node| query.iter().all(|(k, v)| node.attributes.get(k) == Some(v)))
-            .collect()
-    } else {
-        nds
-    };
-
-    let nodes: Vec<_> = control
-        .get_registrations()
-        .into_iter()
-        .filter_map(|(k, r)| {
-            nds.iter()
-                .find(|n| n.registration_id == k)
-                .map(|n| NodeInfo {
-                    id: k,
-                    address: n.node_address.parse().unwrap(),
-                    name: r.node_name.to_string(),
-                })
-        })
-        .collect();
+    let nodes = active_nodes(control.get_nodes(), control.get_registrations(), &query);
 
     ok(NodesList { nodes })
+}
+
+fn active_nodes(
+    nodes: HashMap<u64, crate::server::NodeDetails>,
+    registrations: HashMap<u64, crate::server::Registered>,
+    query: &HashMap<String, String>,
+) -> Vec<NodeInfo> {
+    let mut nodes: Vec<_> = nodes
+        .into_iter()
+        .filter(|(_, node)| node.status < 2 && !node.node_address.is_empty())
+        .filter(|(_, node)| {
+            query
+                .iter()
+                .all(|(key, value)| node.attributes.get(key) == Some(value))
+        })
+        .filter_map(|(node_id, node)| {
+            let registration = registrations.get(&node.registration_id)?;
+            Some(NodeInfo {
+                id: node_id,
+                address: node.node_address.parse().unwrap(),
+                name: registration.node_name.to_string(),
+            })
+        })
+        .collect();
+    nodes.sort_unstable_by_key(|node| node.id);
+
+    nodes
 }
 
 pub fn add_module(
@@ -149,4 +149,67 @@ pub fn get_module(
         .ok_or_else(|| ApiError::custom_code("error_reading_bytes"))?;
 
     ok(ModuleBytes { bytes })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use lunatic_control::api::NodeStart;
+
+    use super::active_nodes;
+    use crate::server::{start_node_record, stop_node_records, Registered};
+
+    fn node_start(address: &str) -> NodeStart {
+        NodeStart {
+            node_address: address.parse().unwrap(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn restart_lists_the_current_node_id_then_stop_removes_it() {
+        let registration_id = 7;
+        let mut next_node_id = 41;
+        let mut nodes = HashMap::new();
+        let (old_node_id, _, retired) = start_node_record(
+            &mut nodes,
+            &mut next_node_id,
+            registration_id,
+            node_start("127.0.0.1:3001"),
+        );
+        assert!(retired.is_empty());
+        let (new_node_id, _, retired) = start_node_record(
+            &mut nodes,
+            &mut next_node_id,
+            registration_id,
+            node_start("127.0.0.1:3002"),
+        );
+        assert_eq!(retired, vec![old_node_id]);
+
+        let mut registrations = HashMap::new();
+        registrations.insert(
+            registration_id,
+            Registered {
+                node_name: uuid::Uuid::nil(),
+                csr_pem: String::new(),
+                cert_pem: String::new(),
+                auth_token: String::new(),
+            },
+        );
+
+        let listed = active_nodes(nodes.clone(), registrations.clone(), &HashMap::new());
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, new_node_id);
+        assert_ne!(listed[0].id, registration_id);
+        assert!(nodes[&old_node_id].status >= 2);
+
+        assert_eq!(
+            stop_node_records(&mut nodes, registration_id),
+            vec![new_node_id]
+        );
+        assert!(active_nodes(nodes.clone(), registrations, &HashMap::new()).is_empty());
+        assert!(stop_node_records(&mut nodes, registration_id).is_empty());
+    }
 }

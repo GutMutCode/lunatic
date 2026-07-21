@@ -107,27 +107,22 @@ impl ControlServer {
 
     #[handle_request]
     pub fn start_node(&mut self, registration_id: u64, data: NodeStart) -> (u64, String) {
-        let id = self.next_node_id;
-        self.next_node_id += 1;
-        let details = NodeDetails {
+        let (id, node_address, retired_node_ids) = start_node_record(
+            &mut self.nodes,
+            &mut self.next_node_id,
             registration_id,
-            status: 0,
-            created_at: Utc::now(),
-            stopped_at: None,
-            node_address: data.node_address.to_string(),
-            attributes: data.attributes,
-        };
-        self.store.add_node(id, &details);
-        self.nodes.insert(id, details);
-        (id, data.node_address.to_string())
+            data,
+        );
+        for node_id in retired_node_ids.into_iter().chain(std::iter::once(id)) {
+            self.store.add_node(node_id, &self.nodes[&node_id]);
+        }
+        (id, node_address)
     }
 
     #[handle_message]
-    pub fn stop_node(&mut self, reg_id: u64) {
-        if let Some(node) = self.nodes.get_mut(&reg_id) {
-            node.status = 2;
-            node.stopped_at = Some(Utc::now());
-            self.store.add_node(reg_id, node);
+    pub fn stop_node(&mut self, registration_id: u64) {
+        for node_id in stop_node_records(&mut self.nodes, registration_id) {
+            self.store.add_node(node_id, &self.nodes[&node_id]);
         }
     }
 
@@ -164,6 +159,46 @@ impl ControlServer {
     pub fn sign_node(&self, csr_pem: String) -> String {
         host::sign_node(&self.ca_cert.cert, &self.ca_cert.pk, &csr_pem)
     }
+}
+
+pub(crate) fn start_node_record(
+    nodes: &mut HashMap<u64, NodeDetails>,
+    next_node_id: &mut u64,
+    registration_id: u64,
+    data: NodeStart,
+) -> (u64, String, Vec<u64>) {
+    let retired_node_ids = stop_node_records(nodes, registration_id);
+    let id = *next_node_id;
+    *next_node_id += 1;
+    let node_address = data.node_address.to_string();
+    let details = NodeDetails {
+        registration_id,
+        status: 0,
+        created_at: Utc::now(),
+        stopped_at: None,
+        node_address: node_address.clone(),
+        attributes: data.attributes,
+    };
+    nodes.insert(id, details);
+
+    (id, node_address, retired_node_ids)
+}
+
+pub(crate) fn stop_node_records(
+    nodes: &mut HashMap<u64, NodeDetails>,
+    registration_id: u64,
+) -> Vec<u64> {
+    let stopped_at = Utc::now();
+    let mut stopped_node_ids = Vec::new();
+    for (node_id, node) in nodes.iter_mut() {
+        if node.registration_id == registration_id && node.status < 2 {
+            node.status = 2;
+            node.stopped_at = Some(stopped_at);
+            stopped_node_ids.push(*node_id);
+        }
+    }
+    stopped_node_ids.sort_unstable();
+    stopped_node_ids
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

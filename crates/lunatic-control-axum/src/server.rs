@@ -3,7 +3,7 @@ use std::{
     net::{SocketAddr, TcpListener},
     sync::{
         atomic::{self, AtomicU64},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -23,6 +23,7 @@ pub struct ControlServer {
     pub registrations: DashMap<u64, Registered>,
     pub nodes: DashMap<u64, NodeDetails>,
     pub modules: DashMap<u64, Vec<u8>>,
+    node_lifecycle: Mutex<()>,
     next_registration_id: AtomicU64,
     next_node_id: AtomicU64,
     next_module_id: AtomicU64,
@@ -56,6 +57,7 @@ impl ControlServer {
             registrations: DashMap::new(),
             nodes: DashMap::new(),
             modules: DashMap::new(),
+            node_lifecycle: Mutex::new(()),
             next_registration_id: AtomicU64::new(1),
             next_node_id: AtomicU64::new(1),
             next_module_id: AtomicU64::new(1),
@@ -76,6 +78,12 @@ impl ControlServer {
     }
 
     pub fn start_node(&self, registration_id: u64, data: NodeStart) -> (u64, String) {
+        let _lifecycle = self
+            .node_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stop_nodes_for_registration(registration_id);
+
         let id = self.next_node_id.fetch_add(1, atomic::Ordering::Relaxed);
         let details = NodeDetails {
             registration_id,
@@ -89,10 +97,21 @@ impl ControlServer {
         (id, data.node_address.to_string())
     }
 
-    pub fn stop_node(&self, reg_id: u64) {
-        if let Some(mut node) = self.nodes.get_mut(&reg_id) {
-            node.status = 2;
-            node.stopped_at = Some(Utc::now());
+    pub fn stop_node(&self, registration_id: u64) {
+        let _lifecycle = self
+            .node_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.stop_nodes_for_registration(registration_id);
+    }
+
+    fn stop_nodes_for_registration(&self, registration_id: u64) {
+        let stopped_at = Utc::now();
+        for mut node in self.nodes.iter_mut() {
+            if node.registration_id == registration_id && node.status < 2 {
+                node.status = 2;
+                node.stopped_at = Some(stopped_at);
+            }
         }
     }
 

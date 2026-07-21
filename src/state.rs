@@ -10,7 +10,10 @@ use lunatic_common_api::{
     emit_audit_event, AuditAction, AuditEvent, AuditEventV1, AuditReason, AuditResult,
     AuditSubject, AuditTarget, AuditTargetKind,
 };
-use lunatic_distributed::{DistributedCtx, DistributedProcessState};
+use lunatic_distributed::{
+    distributed::{GlobalProcessId, RegistryProcessRegistration},
+    DistributedCtx, DistributedProcessState,
+};
 use lunatic_error_api::{ErrorCtx, ErrorResource};
 use lunatic_networking_api::{
     DnsIterator, DnsIteratorQuota, NetworkHandleQuota, NetworkingCtx, TcpConnection, TlsConnection,
@@ -261,6 +264,7 @@ pub struct DefaultProcessState {
     pub(crate) id: u64,
     pub(crate) environment: Arc<LunaticEnvironment>,
     pub(crate) distributed: Option<DistributedProcessState>,
+    distributed_registry_owner: Option<Arc<RegistryProcessRegistration>>,
     // The WebAssembly runtime
     runtime: Option<WasmtimeRuntime>,
     // The module that this process was spawned from
@@ -356,6 +360,15 @@ impl DefaultProcessState {
             config.get_max_message_resources(),
         );
         let id = environment.get_next_process_id();
+        let distributed_registry_owner = distributed.as_ref().map(|distributed| {
+            distributed
+                .node_client
+                .register_process_owner(GlobalProcessId::new(
+                    distributed.node_id(),
+                    environment.id(),
+                    id,
+                ))
+        });
         let mut audit_subject = AuditSubject::new()
             .with_environment_id(environment.id())
             .with_process_id(id);
@@ -366,6 +379,7 @@ impl DefaultProcessState {
             id,
             environment,
             distributed,
+            distributed_registry_owner,
             runtime: Some(runtime),
             module: Some(module),
             config: config.clone(),
@@ -411,6 +425,15 @@ impl ProcessState for DefaultProcessState {
             config.get_max_message_resources(),
         );
         let id = self.environment.get_next_process_id();
+        let distributed_registry_owner = self.distributed.as_ref().map(|distributed| {
+            distributed
+                .node_client
+                .register_process_owner(GlobalProcessId::new(
+                    distributed.node_id(),
+                    self.environment.id(),
+                    id,
+                ))
+        });
         let mut audit_subject = AuditSubject::new()
             .with_environment_id(self.environment.id())
             .with_process_id(id);
@@ -421,6 +444,7 @@ impl ProcessState for DefaultProcessState {
             id,
             environment: self.environment.clone(),
             distributed: self.distributed.clone(),
+            distributed_registry_owner,
             runtime: self.runtime.clone(),
             module: Some(module),
             config: config.clone(),
@@ -467,6 +491,7 @@ impl ProcessState for DefaultProcessState {
             id: self.id,
             environment: self.environment.clone(),
             distributed: self.distributed.clone(),
+            distributed_registry_owner: self.distributed_registry_owner.clone(),
             runtime: self.runtime.clone(),
             module: Some(module),
             config: config.clone(),
@@ -532,6 +557,12 @@ impl ProcessState for DefaultProcessState {
 
     fn id(&self) -> u64 {
         self.id
+    }
+
+    fn process_exit_hook(&self) -> Option<Arc<dyn lunatic_process::env::ProcessExitHook>> {
+        self.distributed_registry_owner
+            .clone()
+            .map(|owner| owner as Arc<dyn lunatic_process::env::ProcessExitHook>)
     }
 
     fn audit_node_id(&self) -> Option<u64> {
@@ -1260,6 +1291,9 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             config.get_max_message_resources(),
         );
         let id = environment.get_next_process_id();
+        let distributed_registry_owner = Some(distributed.node_client.register_process_owner(
+            GlobalProcessId::new(distributed.node_id(), environment.id(), id),
+        ));
         let audit_subject = AuditSubject::new()
             .with_node_id(distributed.node_id())
             .with_environment_id(environment.id())
@@ -1268,6 +1302,7 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             id,
             environment,
             distributed: Some(distributed),
+            distributed_registry_owner,
             runtime: Some(runtime),
             module: Some(module),
             config: config.clone(),

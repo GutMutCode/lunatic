@@ -96,8 +96,6 @@ pub async fn node_started(
     Json(data): Json<NodeStart>,
 ) -> ApiResponse<NodeStarted> {
     let control = control.as_ref();
-    control.stop_node(node_auth.registration_id as u64);
-
     let (node_id, _node_address) = control.start_node(node_auth.registration_id as u64, data);
 
     log::info!("Node {} started with id {}", node_auth.node_name, node_id);
@@ -115,34 +113,33 @@ pub async fn list_nodes(
     control: Extension<Arc<ControlServer>>,
 ) -> ApiResponse<NodesList> {
     let control = control.as_ref();
-    let nds: Vec<_> = control
+    let nodes = active_nodes(control, &query);
+
+    ok(NodesList { nodes })
+}
+
+fn active_nodes(control: &ControlServer, query: &HashMap<String, String>) -> Vec<NodeInfo> {
+    let mut nodes: Vec<_> = control
         .nodes
         .iter()
         .filter(|n| n.status < 2 && !n.node_address.is_empty())
-        .collect();
-    // Filter nodes based on query params and node attributes
-    let nds: Vec<_> = if !query.is_empty() {
-        nds.into_iter()
-            .filter(|node| query.iter().all(|(k, v)| node.attributes.get(k) == Some(v)))
-            .collect()
-    } else {
-        nds
-    };
-    let nodes: Vec<_> = control
-        .registrations
-        .iter()
-        .filter_map(|r| {
-            nds.iter()
-                .find(|n| n.registration_id == *r.key())
-                .map(|n| NodeInfo {
-                    id: *n.key(),
-                    address: n.node_address.parse().unwrap(),
-                    name: r.node_name.to_string(),
-                })
+        .filter(|node| {
+            query
+                .iter()
+                .all(|(key, value)| node.attributes.get(key) == Some(value))
+        })
+        .filter_map(|node| {
+            let registration = control.registrations.get(&node.registration_id)?;
+            Some(NodeInfo {
+                id: *node.key(),
+                address: node.node_address.parse().unwrap(),
+                name: registration.node_name.to_string(),
+            })
         })
         .collect();
+    nodes.sort_unstable_by_key(|node| node.id);
 
-    ok(NodesList { nodes })
+    nodes
 }
 
 pub async fn add_module(
@@ -184,4 +181,63 @@ pub fn init_routes() -> Router {
         .route("/module/:id", get(get_module))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(50 * 1024 * 1024)) // 50 mb
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use lunatic_control::api::NodeStart;
+
+    use super::active_nodes;
+    use crate::server::{ControlServer, Registered};
+
+    fn test_control_server() -> anyhow::Result<ControlServer> {
+        let ca_cert_str = lunatic_distributed::distributed::server::test_root_cert();
+        let ca_cert = lunatic_distributed::control::cert::test_root_cert()?;
+        let (ctrl_cert, ctrl_pk) =
+            lunatic_distributed::control::cert::default_server_certificates(&ca_cert)?;
+        let quic_client =
+            lunatic_distributed::quic::new_quic_client(&ca_cert_str, &ctrl_cert, &ctrl_pk)?;
+
+        Ok(ControlServer::new(ca_cert, quic_client))
+    }
+
+    fn node_start(address: &str) -> NodeStart {
+        NodeStart {
+            node_address: address.parse().unwrap(),
+            attributes: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn restarting_then_stopping_lists_only_the_current_node() -> anyhow::Result<()> {
+        let control = test_control_server()?;
+        let registration_id = 7;
+        control.registrations.insert(
+            registration_id,
+            Registered {
+                node_name: uuid::Uuid::nil(),
+                csr_pem: String::new(),
+                cert_pem: String::new(),
+                authentication_token: String::new(),
+            },
+        );
+
+        let (old_node_id, _) = control.start_node(registration_id, node_start("127.0.0.1:3001"));
+        let (new_node_id, _) = control.start_node(registration_id, node_start("127.0.0.1:3002"));
+
+        let listed = active_nodes(&control, &HashMap::new());
+        assert_eq!(
+            listed.iter().map(|node| node.id).collect::<Vec<_>>(),
+            vec![new_node_id]
+        );
+        assert!(control.nodes.get(&old_node_id).unwrap().status >= 2);
+
+        control.stop_node(registration_id);
+
+        assert!(active_nodes(&control, &HashMap::new()).is_empty());
+        assert!(control.nodes.get(&new_node_id).unwrap().status >= 2);
+        Ok(())
+    }
 }

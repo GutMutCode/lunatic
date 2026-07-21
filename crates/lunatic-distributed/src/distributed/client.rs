@@ -1,7 +1,8 @@
 use std::{
+    collections::HashSet,
     fmt,
     sync::{
-        atomic::{self, AtomicU64, AtomicUsize},
+        atomic::{self, AtomicBool, AtomicU64, AtomicUsize},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -23,7 +24,7 @@ use crate::{
     congestion::{self, node_connection_manager, MessageChunk, NodeConnectionManager},
     control,
     distributed::message::{Request, ResponseContent, Spawn},
-    distributed::registry::DistributedRegistry,
+    distributed::registry::{DistributedRegistry, RegistryLimits},
     distributed::registry_coordination::{RegistryCoordinationMessage, RegistryCoordinator},
     quic,
 };
@@ -88,10 +89,94 @@ pub(crate) struct ProcessQueueReceiver {
     pub(crate) admission_gate: Arc<AsyncMutex<()>>,
 }
 
+pub(crate) struct NodeQueue {
+    sender: Sender<MessageChunk>,
+    manager: tokio::task::AbortHandle,
+}
+
+impl NodeQueue {
+    pub(crate) fn sender(&self) -> Sender<MessageChunk> {
+        self.sender.clone()
+    }
+
+    pub(crate) fn abort(self) {
+        self.manager.abort();
+    }
+}
+
+impl Drop for NodeQueue {
+    fn drop(&mut self) {
+        self.manager.abort();
+    }
+}
+
 pub const MAX_OUTBOUND_IN_FLIGHT_MESSAGES: usize = 1_024;
 pub const MAX_OUTBOUND_IN_FLIGHT_BYTES: usize = 32 * 1024 * 1024;
 pub const OUTBOUND_PROCESS_QUEUE_CAPACITY: usize = 64;
 pub const OUTBOUND_NODE_QUEUE_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundLimits {
+    pub max_messages: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for OutboundLimits {
+    fn default() -> Self {
+        Self {
+            max_messages: MAX_OUTBOUND_IN_FLIGHT_MESSAGES,
+            max_bytes: MAX_OUTBOUND_IN_FLIGHT_BYTES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DistributedLimits {
+    pub outbound: OutboundLimits,
+    pub registry: RegistryLimits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundLimitKind {
+    Messages,
+    Bytes,
+    AccountingOverflow,
+}
+
+#[derive(Debug)]
+pub struct OutboundSaturationError {
+    kind: OutboundLimitKind,
+    max_messages: usize,
+    max_bytes: usize,
+    requested_bytes: usize,
+}
+
+impl OutboundSaturationError {
+    fn new(kind: OutboundLimitKind, limits: OutboundLimits, requested_bytes: usize) -> Self {
+        Self {
+            kind,
+            max_messages: limits.max_messages,
+            max_bytes: limits.max_bytes,
+            requested_bytes,
+        }
+    }
+
+    pub fn kind(&self) -> OutboundLimitKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for OutboundSaturationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "Distributed outbound {:?} limit reached (max_messages={}, max_bytes={}, requested_bytes={})",
+            self.kind, self.max_messages, self.max_bytes, self.requested_bytes
+        )
+    }
+}
+
+impl std::error::Error for OutboundSaturationError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendErrorKind {
@@ -188,16 +273,17 @@ struct OutboundBudgetUsage {
 }
 
 struct OutboundBudget {
-    max_messages: usize,
-    max_bytes: usize,
+    limits: OutboundLimits,
     usage: Mutex<OutboundBudgetUsage>,
 }
 
 impl OutboundBudget {
     fn new(max_messages: usize, max_bytes: usize) -> Self {
         Self {
-            max_messages,
-            max_bytes,
+            limits: OutboundLimits {
+                max_messages,
+                max_bytes,
+            },
             usage: Mutex::new(OutboundBudgetUsage::default()),
         }
     }
@@ -205,24 +291,26 @@ impl OutboundBudget {
     fn try_reserve(
         self: &Arc<Self>,
         bytes: usize,
-    ) -> Result<OutboundMessageLease, OutboundEnqueueError> {
+    ) -> std::result::Result<OutboundMessageLease, OutboundSaturationError> {
         let mut usage = self
             .usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let next_bytes = usage.bytes.checked_add(bytes).ok_or_else(|| {
-            OutboundEnqueueError::new(
-                SendErrorKind::Backpressure,
-                "Distributed outbound byte accounting overflow",
-            )
+            OutboundSaturationError::new(OutboundLimitKind::AccountingOverflow, self.limits, bytes)
         })?;
-        if usage.messages >= self.max_messages || next_bytes > self.max_bytes {
-            return Err(OutboundEnqueueError::new(
-                SendErrorKind::Backpressure,
-                format!(
-                    "Distributed outbound queue limit reached ({} messages / {} bytes)",
-                    self.max_messages, self.max_bytes
-                ),
+        if usage.messages >= self.limits.max_messages {
+            return Err(OutboundSaturationError::new(
+                OutboundLimitKind::Messages,
+                self.limits,
+                bytes,
+            ));
+        }
+        if next_bytes > self.limits.max_bytes {
+            return Err(OutboundSaturationError::new(
+                OutboundLimitKind::Bytes,
+                self.limits,
+                bytes,
             ));
         }
         usage.messages += 1;
@@ -263,10 +351,8 @@ impl OutboundBudget {
 
 impl Default for OutboundBudget {
     fn default() -> Self {
-        Self::new(
-            MAX_OUTBOUND_IN_FLIGHT_MESSAGES,
-            MAX_OUTBOUND_IN_FLIGHT_BYTES,
-        )
+        let limits = OutboundLimits::default();
+        Self::new(limits.max_messages, limits.max_bytes)
     }
 }
 
@@ -316,6 +402,62 @@ pub struct Client {
     pub inner: Arc<Inner>,
 }
 
+/// Owns the distributed-registry registrations associated with one process.
+///
+/// The final owner schedules owner-conditional cluster cleanup. Sharing the
+/// guard across hot-reload replacement states prevents the old instance from
+/// unregistering names that the replacement still owns.
+pub struct RegistryProcessRegistration {
+    client: Client,
+    global_pid: super::GlobalProcessId,
+    cleaned: AtomicBool,
+}
+
+impl RegistryProcessRegistration {
+    fn trigger_cleanup(&self) {
+        if self.cleaned.swap(true, atomic::Ordering::AcqRel) {
+            return;
+        }
+        let has_global_names = !self
+            .client
+            .registry()
+            .global_names_for_process(self.global_pid)
+            .is_empty();
+        self.client
+            .registry()
+            .remove_local_registrations(self.global_pid);
+        if !has_global_names {
+            return;
+        }
+        if let Err(error) = self
+            .client
+            .inner
+            .registry_cleanup_tx
+            .try_send(self.global_pid)
+        {
+            log::warn!(
+                "Registry process-cleanup queue rejected {}: {error}",
+                self.global_pid
+            );
+            // Saturated or runtime-less teardown still releases all local
+            // retention. Remote replicas converge on node removal/resync.
+            self.client.registry().unregister_process(self.global_pid);
+        }
+    }
+}
+
+impl lunatic_process::env::ProcessExitHook for RegistryProcessRegistration {
+    fn process_exited(&self) {
+        self.trigger_cleanup();
+    }
+}
+
+impl Drop for RegistryProcessRegistration {
+    fn drop(&mut self) {
+        self.trigger_cleanup();
+    }
+}
+
 pub struct Inner {
     control_client: control::Client,
     node_client: quic::Client,
@@ -327,11 +469,15 @@ pub struct Inner {
     pub(crate) buf_tx: DashMap<(EnvironmentId, ProcessId), ProcessQueueSender>,
     // Holds the message while its being chunked
     pub in_progress: DashMap<(EnvironmentId, ProcessId), MessageCtx>,
-    pub nodes_queues: DashMap<NodeId, Sender<MessageChunk>>,
+    pub(crate) nodes_queues: DashMap<NodeId, NodeQueue>,
     pub responses: DashMap<MessageId, Arc<IncomingResponse>>,
     pub response_tx: Sender<(MessageId, ResponseContent)>,
+    registry_cleanup_tx: Sender<super::GlobalProcessId>,
     pub has_messages: Arc<Notify>,
     outbound_budget: Arc<OutboundBudget>,
+    node_queue_admission: AsyncMutex<()>,
+    topology_nodes: Mutex<HashSet<u64>>,
+    limits: DistributedLimits,
     // Distributed process registry
     pub registry: Arc<DistributedRegistry>,
     // Registry coordinator for cross-node coordination
@@ -353,9 +499,32 @@ fn process_queue_is_current(
 
 impl Client {
     pub fn new(node_id: u64, control_client: control::Client, node_client: quic::Client) -> Self {
+        Self::new_with_limits(
+            node_id,
+            control_client,
+            node_client,
+            DistributedLimits::default(),
+        )
+    }
+
+    pub fn new_with_limits(
+        node_id: u64,
+        control_client: control::Client,
+        node_client: quic::Client,
+        limits: DistributedLimits,
+    ) -> Self {
         let (send, recv) = tokio::sync::mpsc::channel(1000);
-        let registry = Arc::new(DistributedRegistry::new(node_id));
+        let cleanup_capacity = limits.registry.max_entries.max(1);
+        let (registry_cleanup_tx, registry_cleanup_rx) =
+            tokio::sync::mpsc::channel(cleanup_capacity);
+        let registry = Arc::new(DistributedRegistry::with_limits(node_id, limits.registry));
         let coordinator = Arc::new(RegistryCoordinator::new(registry.clone(), node_id));
+        let mut topology_nodes = control_client
+            .node_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        topology_nodes.insert(node_id);
+        let outbound = limits.outbound;
 
         let client = Self {
             node_id: NodeId(node_id),
@@ -370,8 +539,15 @@ impl Client {
                 nodes_queues: DashMap::new(),
                 responses: DashMap::new(),
                 response_tx: send,
+                registry_cleanup_tx,
                 has_messages: Arc::new(Notify::new()),
-                outbound_budget: Arc::new(OutboundBudget::default()),
+                outbound_budget: Arc::new(OutboundBudget::new(
+                    outbound.max_messages,
+                    outbound.max_bytes,
+                )),
+                node_queue_admission: AsyncMutex::new(()),
+                topology_nodes: Mutex::new(topology_nodes),
+                limits,
                 registry,
                 coordinator,
             }),
@@ -380,6 +556,7 @@ impl Client {
         tokio::spawn(congestion::congestion_control_worker(client.clone()));
         tokio::spawn(process_responses(client.clone(), recv));
         tokio::spawn(registry_sync_worker(client.clone()));
+        tokio::spawn(registry_cleanup_worker(client.clone(), registry_cleanup_rx));
         client
     }
 
@@ -391,6 +568,17 @@ impl Client {
     /// Get a reference to the registry coordinator
     pub fn coordinator(&self) -> &RegistryCoordinator {
         &self.inner.coordinator
+    }
+
+    pub fn register_process_owner(
+        &self,
+        global_pid: super::GlobalProcessId,
+    ) -> Arc<RegistryProcessRegistration> {
+        Arc::new(RegistryProcessRegistration {
+            client: self.clone(),
+            global_pid,
+            cleaned: AtomicBool::new(false),
+        })
     }
 
     pub(crate) fn registry_node_ids(&self) -> Vec<u64> {
@@ -419,6 +607,9 @@ impl Client {
         node_id: u64,
         coordination: RegistryCoordinationMessage,
     ) -> Result<()> {
+        if !self.inner.control_client.node_ids().contains(&node_id) {
+            return Err(anyhow!("Registry target node {node_id} does not exist"));
+        }
         let node = self
             .inner
             .control_client
@@ -429,6 +620,18 @@ impl Client {
             message: coordination,
         };
         let data = message::serialize_message(&message)?;
+        if data.len() > quic::MAX_WIRE_MESSAGE_BYTES {
+            return Err(anyhow!(
+                "Registry coordination message size {} exceeds the transport limit {}",
+                data.len(),
+                quic::MAX_WIRE_MESSAGE_BYTES
+            ));
+        }
+        let _outbound_lease = self
+            .inner
+            .outbound_budget
+            .try_reserve(data.capacity())
+            .map_err(anyhow::Error::new)?;
         let message_id = self.next_message_id().0;
         self.inner
             .node_client
@@ -459,54 +662,122 @@ impl Client {
         &self,
         node: NodeId,
     ) -> std::result::Result<Sender<MessageChunk>, OutboundEnqueueError> {
-        if let Some(sender_ref) = self.inner.nodes_queues.get(&node) {
-            let sender = sender_ref.clone();
-            drop(sender_ref);
+        if let Some(queue_ref) = self.inner.nodes_queues.get(&node) {
+            let sender = queue_ref.sender();
+            drop(queue_ref);
             if !sender.is_closed() {
                 return Ok(sender);
             }
-            self.inner
+            if let Some((_, stale)) = self
+                .inner
                 .nodes_queues
-                .remove_if(&node, |_, current| current.same_channel(&sender));
+                .remove_if(&node, |_, current| current.sender.same_channel(&sender))
+            {
+                stale.abort();
+            }
         }
 
+        let mut is_member = self.inner.control_client.node_ids().contains(&node.0);
         let mut node_info = self.inner.control_client.node_info(node.0);
-        if node_info.is_none() {
+        if node_info.is_none() || !is_member {
             // Refresh once before declaring the route absent.
             self.inner.control_client.refresh_nodes().await.ok();
+            is_member = self.inner.control_client.node_ids().contains(&node.0);
             node_info = self.inner.control_client.node_info(node.0);
         }
-        let node_info = node_info.ok_or_else(|| {
+        let node_info = node_info.filter(|_| is_member).ok_or_else(|| {
             OutboundEnqueueError::new(
                 SendErrorKind::NodeNotFound,
                 format!("Node {} does not exist", node.0),
             )
         })?;
 
-        match self.inner.nodes_queues.entry(node) {
-            DashEntry::Occupied(mut entry) if entry.get().is_closed() => {
-                let (send, recv) = tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
-                entry.insert(send.clone());
-                tokio::spawn(node_connection_manager(NodeConnectionManager {
-                    streams: 10,
-                    node_info,
-                    client: self.inner.node_client.clone(),
-                    message_chunks: recv,
-                }));
-                Ok(send)
+        let _admission = self.inner.node_queue_admission.lock().await;
+        if let Some(queue_ref) = self.inner.nodes_queues.get(&node) {
+            let sender = queue_ref.sender();
+            let closed = sender.is_closed();
+            drop(queue_ref);
+            if !closed {
+                return Ok(sender);
             }
-            DashEntry::Occupied(entry) => Ok(entry.get().clone()),
-            DashEntry::Vacant(entry) => {
-                let (send, recv) = tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
-                entry.insert(send.clone());
-                tokio::spawn(node_connection_manager(NodeConnectionManager {
-                    streams: 10,
-                    node_info,
-                    client: self.inner.node_client.clone(),
-                    message_chunks: recv,
-                }));
-                Ok(send)
+            if let Some((_, stale)) = self
+                .inner
+                .nodes_queues
+                .remove_if(&node, |_, current| current.sender.same_channel(&sender))
+            {
+                stale.abort();
             }
+        }
+
+        if self.inner.nodes_queues.len() >= self.inner.limits.registry.max_topology_nodes {
+            return Err(OutboundEnqueueError::new(
+                SendErrorKind::Backpressure,
+                format!(
+                    "Distributed node queue limit reached ({})",
+                    self.inner.limits.registry.max_topology_nodes
+                ),
+            ));
+        }
+
+        let (send, recv) = tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
+        let task = tokio::spawn(node_connection_manager(NodeConnectionManager {
+            streams: 10,
+            node_info,
+            client: self.inner.node_client.clone(),
+            message_chunks: recv,
+        }));
+        self.inner.nodes_queues.insert(
+            node,
+            NodeQueue {
+                sender: send.clone(),
+                manager: task.abort_handle(),
+            },
+        );
+        Ok(send)
+    }
+
+    pub(crate) async fn reconcile_topology(&self) {
+        let mut active_nodes = self
+            .inner
+            .control_client
+            .node_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        active_nodes.insert(self.node_id.0);
+        self.reconcile_topology_members(active_nodes).await;
+    }
+
+    async fn reconcile_topology_members(&self, active_nodes: HashSet<u64>) {
+        let removed_nodes = {
+            let mut previous = self
+                .inner
+                .topology_nodes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let removed = previous
+                .difference(&active_nodes)
+                .copied()
+                .collect::<Vec<_>>();
+            *previous = active_nodes.clone();
+            removed
+        };
+
+        let stale_queues = self
+            .inner
+            .nodes_queues
+            .iter()
+            .filter_map(|entry| (!active_nodes.contains(&entry.key().0)).then_some(*entry.key()))
+            .collect::<Vec<_>>();
+        for node in stale_queues {
+            if let Some((_, queue)) = self.inner.nodes_queues.remove(&node) {
+                queue.abort();
+            }
+        }
+
+        if !removed_nodes.is_empty() {
+            self.inner
+                .coordinator
+                .reconcile_topology(&active_nodes, &removed_nodes);
         }
     }
 
@@ -529,7 +800,13 @@ impl Client {
                 ),
             ));
         }
-        let outbound_lease = self.inner.outbound_budget.try_reserve(data.capacity())?;
+        let outbound_lease = self
+            .inner
+            .outbound_budget
+            .try_reserve(data.capacity())
+            .map_err(|error| {
+                OutboundEnqueueError::new(SendErrorKind::Backpressure, error.to_string())
+            })?;
 
         self.ensure_node_queue(node).await?;
 
@@ -830,9 +1107,24 @@ async fn registry_sync_worker(client: Client) -> ! {
     interval.tick().await;
     loop {
         interval.tick().await;
+        client.reconcile_topology().await;
         if let Err(error) = client.synchronize_registry().await {
             log::trace!("Periodic registry synchronization failed: {error}");
         }
+    }
+}
+
+async fn registry_cleanup_worker(client: Client, mut cleanup_rx: Receiver<super::GlobalProcessId>) {
+    while let Some(global_pid) = cleanup_rx.recv().await {
+        if let Err(error) = client
+            .inner
+            .coordinator
+            .unregister_process_registrations(global_pid)
+            .await
+        {
+            log::warn!("Failed to coordinate registry cleanup for process {global_pid}: {error}");
+        }
+        client.registry().unregister_process(global_pid);
     }
 }
 
@@ -902,9 +1194,14 @@ fn expire_responses(
 mod tests {
     use super::*;
     use lunatic_control::api::{ControlUrls, Registration};
+    use lunatic_control::NodeInfo;
     use tokio::sync::mpsc::error::TryRecvError;
 
     fn test_client_without_workers() -> Client {
+        test_client_without_workers_with(DistributedLimits::default(), Vec::new())
+    }
+
+    fn test_client_without_workers_with(limits: DistributedLimits, nodes: Vec<NodeInfo>) -> Client {
         let root = crate::control::cert::test_root_cert().expect("test root certificate");
         let root_pem = root.certificate_pem().to_owned();
         let node_certificate = crate::distributed::server::gen_node_cert("client-unit-test")
@@ -933,10 +1230,16 @@ mod tests {
             envs: vec![],
             is_privileged: true,
         };
-        let control_client = control::Client::from_static_nodes(registration, 1, Vec::new());
+        let control_client = control::Client::from_static_nodes(registration, 1, nodes);
         let (response_tx, _response_rx) = tokio::sync::mpsc::channel(1);
-        let registry = Arc::new(DistributedRegistry::new(1));
+        let (registry_cleanup_tx, _registry_cleanup_rx) = tokio::sync::mpsc::channel(1);
+        let registry = Arc::new(DistributedRegistry::with_limits(1, limits.registry));
         let coordinator = Arc::new(RegistryCoordinator::new(registry.clone(), 1));
+        let mut topology_nodes = control_client
+            .node_ids()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        topology_nodes.insert(1);
         let client = Client {
             node_id: NodeId(1),
             inner: Arc::new(Inner {
@@ -950,8 +1253,15 @@ mod tests {
                 nodes_queues: DashMap::new(),
                 responses: DashMap::new(),
                 response_tx,
+                registry_cleanup_tx,
                 has_messages: Arc::new(Notify::new()),
-                outbound_budget: Arc::new(OutboundBudget::default()),
+                outbound_budget: Arc::new(OutboundBudget::new(
+                    limits.outbound.max_messages,
+                    limits.outbound.max_bytes,
+                )),
+                node_queue_admission: AsyncMutex::new(()),
+                topology_nodes: Mutex::new(topology_nodes),
+                limits,
                 registry,
                 coordinator,
             }),
@@ -971,8 +1281,8 @@ mod tests {
         let message_limit = budget.try_reserve(0);
         assert!(matches!(
             message_limit,
-            Err(OutboundEnqueueError {
-                kind: SendErrorKind::Backpressure,
+            Err(OutboundSaturationError {
+                kind: OutboundLimitKind::Messages,
                 ..
             })
         ));
@@ -993,14 +1303,168 @@ mod tests {
         let reservation = byte_budget.try_reserve(8).expect("reservation must fit");
         assert!(matches!(
             byte_budget.try_reserve(3),
-            Err(OutboundEnqueueError {
-                kind: SendErrorKind::Backpressure,
+            Err(OutboundSaturationError {
+                kind: OutboundLimitKind::Bytes,
                 ..
             })
         ));
         assert_eq!(byte_budget.current_usage(), (1, 8));
         drop(reservation);
         assert_eq!(byte_budget.current_usage(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn registry_direct_send_uses_shared_outbound_budget_and_recovers() {
+        let limits = DistributedLimits {
+            outbound: OutboundLimits {
+                max_messages: 1,
+                max_bytes: 1_024,
+            },
+            registry: RegistryLimits::default(),
+        };
+        let client = test_client_without_workers_with(
+            limits,
+            vec![NodeInfo {
+                id: 2,
+                name: "node-2.invalid".into(),
+                address: "127.0.0.1:9".parse().unwrap(),
+            }],
+        );
+        let queued_data = client
+            .inner
+            .outbound_budget
+            .try_reserve(1)
+            .expect("data-plane reservation must fit");
+
+        let error = client
+            .send_registry_coordination(
+                2,
+                RegistryCoordinationMessage::RegistryHeartbeat {
+                    node_id: 1,
+                    timestamp: 0,
+                },
+            )
+            .await
+            .expect_err("registry traffic must observe the shared message ceiling");
+        assert_eq!(
+            error
+                .downcast_ref::<OutboundSaturationError>()
+                .expect("saturation type must survive anyhow")
+                .kind(),
+            OutboundLimitKind::Messages
+        );
+        assert_eq!(client.inner.outbound_budget.current_usage(), (1, 1));
+
+        drop(queued_data);
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+        let recovered = client
+            .inner
+            .outbound_budget
+            .try_reserve(1_024)
+            .expect("released direct-send capacity must be reusable");
+        drop(recovered);
+    }
+
+    #[tokio::test]
+    async fn cancelling_failed_registry_transport_releases_its_lease() {
+        let client = test_client_without_workers_with(
+            DistributedLimits {
+                outbound: OutboundLimits {
+                    max_messages: 1,
+                    max_bytes: 1_024,
+                },
+                registry: RegistryLimits::default(),
+            },
+            vec![NodeInfo {
+                id: 2,
+                name: "node-2.invalid".into(),
+                address: "127.0.0.1:9".parse().unwrap(),
+            }],
+        );
+
+        let _ = tokio::time::timeout(
+            Duration::from_millis(20),
+            client.send_registry_coordination(
+                2,
+                RegistryCoordinationMessage::RegistryHeartbeat {
+                    node_id: 1,
+                    timestamp: 0,
+                },
+            ),
+        )
+        .await;
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+        let lease = client
+            .inner
+            .outbound_budget
+            .try_reserve(1_024)
+            .expect("transport cancellation must restore the full budget");
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn topology_churn_aborts_managers_and_removes_node_owned_registry_state() {
+        let client = test_client_without_workers();
+        for node_id in 2..102_u64 {
+            let name = format!("service-{node_id}");
+            let owner = super::super::GlobalProcessId::new(node_id, 1, 1);
+            client
+                .registry()
+                .apply_global(name.clone(), owner, node_id)
+                .unwrap();
+            *client
+                .inner
+                .topology_nodes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = HashSet::from([1, node_id]);
+
+            let (lease, usage) = test_outbound_lease(8);
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let manager = tokio::spawn(async move {
+                let _lease = lease;
+                let _ = receiver.recv().await;
+                std::future::pending::<()>().await;
+            });
+            client.inner.nodes_queues.insert(
+                NodeId(node_id),
+                NodeQueue {
+                    sender,
+                    manager: manager.abort_handle(),
+                },
+            );
+            tokio::task::yield_now().await;
+            assert_eq!(usage.current_usage(), (1, 8));
+
+            client.reconcile_topology_members(HashSet::from([1])).await;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while usage.current_usage() != (0, 0) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("removed node manager must release retained chunks");
+            assert!(!client.inner.nodes_queues.contains_key(&NodeId(node_id)));
+            assert!(client.registry().lookup_global(name).is_none());
+        }
+        assert_eq!(client.inner.nodes_queues.len(), 0);
+        assert_eq!(client.registry().global_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn process_exit_hook_is_idempotent_and_releases_registry_ownership() {
+        let client = test_client_without_workers();
+        let owner = super::super::GlobalProcessId::new(1, 7, 9);
+        client.registry().register_local("local", owner).unwrap();
+        client.registry().register_global("global", owner).unwrap();
+        let registration = client.register_process_owner(owner);
+
+        lunatic_process::env::ProcessExitHook::process_exited(registration.as_ref());
+
+        assert!(client.registry().lookup_local("local").is_none());
+        assert!(client.registry().lookup_global("global").is_none());
+        assert_eq!(client.registry().usage().entries, 0);
+        lunatic_process::env::ProcessExitHook::process_exited(registration.as_ref());
+        assert_eq!(client.registry().usage().entries, 0);
     }
 
     #[test]
@@ -1096,7 +1560,14 @@ mod tests {
 
         let (node_sender, _node_receiver) =
             tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
-        client.inner.nodes_queues.insert(node, node_sender);
+        let manager = tokio::spawn(std::future::pending::<()>());
+        client.inner.nodes_queues.insert(
+            node,
+            NodeQueue {
+                sender: node_sender,
+                manager: manager.abort_handle(),
+            },
+        );
         let (process_sender, process_receiver) =
             tokio::sync::mpsc::channel(OUTBOUND_PROCESS_QUEUE_CAPACITY);
         let admission_gate = Arc::new(AsyncMutex::new(()));

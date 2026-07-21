@@ -183,7 +183,7 @@ pub async fn congestion_control_worker(state: distributed::Client) -> ! {
                     .inner
                     .nodes_queues
                     .get(&msg_ctx.node)
-                    .map(|queue| queue.clone());
+                    .map(|queue| queue.sender());
                 let Some(node_queue) = node_queue else {
                     let node = msg_ctx.node;
                     let message_id = msg_ctx.message_id;
@@ -249,10 +249,15 @@ pub async fn congestion_control_worker(state: distributed::Client) -> ! {
                                     msg_ctx.node.0,
                                     msg_ctx.dest.0,
                                 );
-                        state
+                        if let Some((_, stale)) = state
                             .inner
                             .nodes_queues
-                            .remove_if(&msg_ctx.node, |_, sender| sender.same_channel(&node_queue));
+                            .remove_if(&msg_ctx.node, |_, queue| {
+                                queue.sender().same_channel(&node_queue)
+                            })
+                        {
+                            stale.abort();
+                        }
                         retry_after.insert(retry_key, Instant::now() + CLOSED_NODE_RETRY_DELAY);
                         false
                     }

@@ -104,6 +104,15 @@ pub trait Environment: Send + Sync {
 pub struct ProcessRegistration {
     environment: Option<Arc<dyn Environment>>,
     process_id: u64,
+    exit_hook: Option<Arc<dyn ProcessExitHook>>,
+}
+
+/// A host-owned callback that runs exactly once when process membership ends.
+///
+/// Implementations must return quickly; asynchronous cleanup should be
+/// scheduled onto the runtime instead of blocking the lifecycle path.
+pub trait ProcessExitHook: Send + Sync {
+    fn process_exited(&self);
 }
 
 impl ProcessRegistration {
@@ -117,6 +126,21 @@ impl ProcessRegistration {
         Ok(Self {
             environment: Some(environment),
             process_id,
+            exit_hook: None,
+        })
+    }
+
+    pub fn register_with_exit_hook(
+        environment: Arc<dyn Environment>,
+        process_id: u64,
+        process: Arc<dyn Process>,
+        exit_hook: Option<Arc<dyn ProcessExitHook>>,
+    ) -> Result<Self> {
+        environment.add_process(process_id, process)?;
+        Ok(Self {
+            environment: Some(environment),
+            process_id,
+            exit_hook,
         })
     }
 
@@ -130,10 +154,15 @@ impl ProcessRegistration {
     }
 
     fn unregister_inner(&mut self) -> bool {
-        self.environment
+        let removed = self
+            .environment
             .take()
             .map(|environment| environment.remove_process(self.process_id))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if let Some(exit_hook) = self.exit_hook.take() {
+            exit_hook.process_exited();
+        }
+        removed
     }
 }
 
@@ -146,6 +175,7 @@ impl fmt::Debug for ProcessRegistration {
                 &self.environment.as_ref().map(|env| env.id()),
             )
             .field("process_id", &self.process_id)
+            .field("has_exit_hook", &self.exit_hook.is_some())
             .finish()
     }
 }
@@ -470,6 +500,7 @@ impl Environments for LunaticEnvironments {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Barrier;
 
     #[derive(Debug)]
@@ -588,6 +619,40 @@ mod tests {
 
         assert!(environment.get_process(30).is_none());
         assert_eq!(environment.process_count(), 0);
+    }
+
+    struct CountingExitHook(AtomicUsize);
+
+    impl ProcessExitHook for CountingExitHook {
+        fn process_exited(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn process_exit_hook_runs_exactly_once_on_explicit_or_drop_cleanup() {
+        let environment = environment_with_limit(40, 2);
+        let explicit_hook = Arc::new(CountingExitHook(AtomicUsize::new(0)));
+        let explicit = ProcessRegistration::register_with_exit_hook(
+            environment.clone(),
+            1,
+            process(1),
+            Some(explicit_hook.clone()),
+        )
+        .unwrap();
+        assert!(explicit.unregister());
+        assert_eq!(explicit_hook.0.load(Ordering::Relaxed), 1);
+
+        let drop_hook = Arc::new(CountingExitHook(AtomicUsize::new(0)));
+        let dropped = ProcessRegistration::register_with_exit_hook(
+            environment,
+            2,
+            process(2),
+            Some(drop_hook.clone()),
+        )
+        .unwrap();
+        drop(dropped);
+        assert_eq!(drop_hook.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

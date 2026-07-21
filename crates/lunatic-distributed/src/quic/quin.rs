@@ -163,7 +163,7 @@ impl Client {
     }
 
     /// Send one complete distributed protocol message over an authenticated QUIC stream.
-    pub async fn send_message(
+    pub(crate) async fn send_message(
         &self,
         addr: SocketAddr,
         name: &str,
