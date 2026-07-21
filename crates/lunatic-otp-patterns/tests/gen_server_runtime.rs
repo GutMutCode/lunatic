@@ -77,14 +77,14 @@ async fn call_timeout_does_not_poison_the_server() {
         name: Some("timeout-counter".to_string()),
         // Leave enough room for a fast follow-up call on a loaded CI runner;
         // the deliberately slow call still exceeds this deadline by 3x.
-        timeout_ms: Some(100),
+        timeout_ms: Some(250),
     })
     .unwrap();
 
-    let error = handle.call(Call::Sleep(300)).unwrap_err();
+    let error = handle.call(Call::Sleep(750)).unwrap_err();
     assert!(error.to_string().contains("timed out"));
 
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
     assert_eq!(handle.call(Call::Get).unwrap().0, 0);
     handle.stop(TerminateReason::Normal).unwrap();
 }

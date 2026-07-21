@@ -84,6 +84,8 @@ The workflow also runs `scripts/check_bench_thresholds.py`, which separately exe
 
 The script checks configured absolute upper bounds for specific Criterion labels. It does not compare a pull request against a stored historical baseline. The workflow explicitly reports that baseline regression comparison remains manual.
 
+The `spawn process` guard is calibrated to the Wasmtime 46 hosted-Linux baseline recorded on 2026-07-21 at commit `100767b` ([Actions run 29803866397](https://github.com/GutMutCode/lunatic/actions/runs/29803866397)): a 53.827µs Criterion upper bound, with a warning above 60µs and a hard failure above 75µs. The margin provides headroom for shared-runner variance while still detecting a material regression. These CI limits do not replace the separate aspirational `<10µs` product target.
+
 Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete.
 
 ## Adding or Changing a Benchmark

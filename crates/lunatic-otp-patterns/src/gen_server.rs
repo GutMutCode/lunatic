@@ -851,14 +851,16 @@ mod tests {
     async fn call_timeout_removes_pending_reply_and_server_recovers() {
         let handle = TestServer::spawn(GenServerConfig {
             name: None,
-            timeout_ms: Some(20),
+            // Keep the follow-up call reliable on loaded hosted runners while
+            // the deliberately slow call still exceeds the deadline by 3x.
+            timeout_ms: Some(250),
         })
         .unwrap();
 
         let error = handle
             .call(TestCall::EchoAfter {
                 value: 7,
-                delay_ms: 80,
+                delay_ms: 750,
             })
             .unwrap_err();
         assert!(error.to_string().contains("timed out"));
@@ -869,7 +871,7 @@ mod tests {
             .expect("GenServer pending replies mutex poisoned")
             .is_empty());
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
         assert!(matches!(
             handle.call(TestCall::Get).unwrap(),
             TestReply::Value(0)
