@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-21
 
-Reviewed working tree based on: `1110c0ab91d9c44aecd4ab03d39318b8b62698fe`
+Reviewed working tree based on: `66aaa0d8703bd99b50a488b693b1a42b279ab36f` plus the reviewed working-tree changes for Hanary #1659
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -18,11 +18,11 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Focus | Status | Current evidence boundary |
 | --- | --- | --- |
 | Fast | Partial | Wasmtime preemption primitives exist; spawn, pooling, mailbox, and transport components are benchmarked. Live hot reload and end-to-end local/remote process delivery are not. |
-| Robust | Partial | Wasm isolation and host-side supervision components exist. Wasm link death reasons and acknowledged reload/rollback semantics remain incomplete. |
+| Robust | Partial | Wasm isolation and actual-Wasm link/monitor exit semantics are production-path tested. Acknowledged reload/rollback semantics remain incomplete. |
 | Scalable | Emerging | Concurrent registries and quotas exist, but mailboxes/signals are unbounded and cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
 | Security Through Isolation | Partial | Process configs now default to denied capabilities and enforce non-increasing child authority. Remote preopens fail closed; complete accounting, a usable receiver path policy, and structured audit events remain open. |
-| Fault Tolerance & HA | Partial | Links, monitors, host-side OTP components, snapshots, and registry quorum components exist. Critical production paths below are not complete. |
+| Fault Tolerance & HA | Partial | Actual-Wasm links and monitors, host-side OTP components, snapshots, and registry quorum components exist. Live reload and distributed recovery paths remain incomplete. |
 | Async by Default | Partial | Wasmtime preemption and several async host paths exist. Unbounded queues and unverified blocking host calls prevent a stronger claim. |
 | Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
 
@@ -33,9 +33,8 @@ Status values: **Strong** means production-path implementation plus executable v
 These gaps invalidate broad “production ready,” “all processes,” or “fully implemented” claims:
 
 1. **Live Wasm hot reload is not connected.** The running guest future takes ownership of the instance from `ProcessContext`; the reload handler later attempts to take an instance from that same empty option and can return `No instance available for hot reload` (`crates/lunatic-process/src/wasm.rs`, `crates/lunatic-process/src/lib.rs`). Existing integration tests and `benches/hot_reload.rs` manually compose Wasmtime compilation, instantiation, snapshot, and restore instead of exercising the live `Signal::HotReload` path.
-2. **Wasm link failure semantics lose the exit reason.** The Wasm runner calculates error, panic, kill, or normal outcomes, but its link-notification path currently sends `DeathReason::Normal`. Normal exits are ignored by the receiver, so linked failures are not demonstrated to propagate as intended (`crates/lunatic-process/src/lib.rs`).
-3. **Queue and environment growth are not bounded end to end.** Process message and signal channels are unbounded, and the environment does not enforce a process-count limit. Existing file, network, memory, and table checks do not close mailbox/signal/process exhaustion paths (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/env.rs`, `src/config.rs`).
-4. **Reload coordination has no process acknowledgement protocol.** Successful signal delivery is treated as successful reload; atomic commit, version lifecycle, and rollback are not proven against actual process results. Rollback send failures are logged rather than recovered (`crates/lunatic-process/src/hot_reload.rs`).
+2. **Queue and environment growth are not bounded end to end.** Process message and signal channels are unbounded, and the environment does not enforce a process-count limit. Existing file, network, memory, and table checks do not close mailbox/signal/process exhaustion paths (`crates/lunatic-process/src/mailbox.rs`, `crates/lunatic-process/src/env.rs`, `src/config.rs`).
+3. **Reload coordination has no process acknowledgement protocol.** Successful signal delivery is treated as successful reload; atomic commit, version lifecycle, and rollback are not proven against actual process results. Rollback send failures are logged rather than recovered (`crates/lunatic-process/src/hot_reload.rs`).
 
 ## 1. Fast, Robust, and Scalable
 
@@ -93,12 +92,13 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 ### Verified components
 
 - Process links and monitors, snapshot/signature components, and reload coordination structures exist.
+- `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one monitor notification, removal-before-notification ordering, and native-runner parity.
 - Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, and resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
 - Production QUIC framing has a multi-chunk transport test (`crates/lunatic-distributed/tests/quic_transport.rs`).
 
 ### Boundary
 
-- The P0 link-death and live-reload gaps prevent production failure-propagation and zero-downtime claims.
+- The live-reload gap prevents zero-downtime claims; cross-node failure propagation remains outside the local link/monitor evidence.
 - Registry coordination is real, and cleanup helpers exist, but guest name lookup, automatic process/node-lifecycle-triggered ownership cleanup, and live cross-node process-mailbox delivery are not connected and tested together.
 - Cross-node process failure, reload, rollback, and message recovery have no production-path E2E test.
 
@@ -129,20 +129,21 @@ These gaps invalidate broad “production ready,” “all processes,” or “f
 - Supervisor exit events must be forwarded manually to `handle_child_exit`; automatic monitor intake is pending.
 - GenStatem and GenEvent are not Lunatic process-runtime adapters.
 - GenServer, Supervisor, GenStatem, and GenEvent do not yet expose equivalent guest-Wasm adapters; GenServer named registration is not connected.
-- The Wasm link-death issue prevents claiming BEAM-like linked failure behavior.
+- Linked failure behavior is verified locally for actual Wasm peers; automatic Supervisor monitor intake and distributed BEAM-like recovery remain unverified.
 
 ## Validation Scope
 
 | Evidence | What it establishes | What it does not establish |
 | --- | --- | --- |
 | `cargo test --all` | Current unit and integration contracts exercised by the repository | Untested production paths, performance, scale, or multi-host behavior |
+| `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and monitor semantics | Cross-node links, Supervisor event intake, or every possible host-future suspension point |
 | `cargo test -p lunatic-otp-patterns` | Host-side OTP component and process integration behavior | Guest-Wasm adapters, automatic Supervisor monitor intake, GenStatem/GenEvent runtime integration |
 | Registry/QUIC integration tests | Real localhost mTLS transport, framing, and registry quorum behavior | Guest lookup-to-mailbox delivery, cross-host operations, distributed process recovery |
 | Criterion mailbox benchmark | Local queue-operation cost for its configured workload | End-to-end process message latency or backpressure |
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
 | Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
 
-Windows verification on 2026-07-21: `cargo test --all` completed across 57 suites with 158 passing tests, zero failures, and four ignored documentation examples. The complete restricted-parent matrix runs on Windows using checked status/error-resource APIs instead of unwinding a host error through Wasmtime 8's async fiber. Default denial, final spawn-boundary rejection, bounded error resources, checked/legacy allowed delegation, distributed sender/receiver validation, compatibility defaults, import inventory, and audit assertions pass. This confirms only the contracts exercised by those tests; it does not close the production-path gaps above.
+Windows baseline verification on 2026-07-21, before the Hanary #1659 working-tree changes, completed `cargo test --all` across 57 suites with 158 passing tests, zero failures, and four ignored documentation examples. The #1659 changes add active Wasm `receive`/`sleep_ms` cancellation and host-panic coverage plus a narrowly vendored backport of the upstream Windows fiber-local-storage guard. Those new paths passed locally on macOS; they must also pass the existing Windows CI matrix before merge. Source parity with the upstream guard is not a substitute for that runtime evidence.
 
 The benchmark documents under `docs/benchmarks/` preserve an October 2025 measurement snapshot, but the original record omitted the tested commit and exact hardware/toolchain profile. It is therefore not a reproducible baseline. Future values must be quoted with commit, dirty state, hardware, toolchain, workload, and evidence boundary; they are not release certification by default.
 
@@ -156,16 +157,15 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 
 ## Prioritized Follow-Ups
 
-1. Correct Wasm link death-reason propagation and add production-path tests.
-2. Connect and test live running-Wasm hot reload.
-3. Add reload acknowledgement, atomic commit, rollback, and version lifecycle semantics.
-4. Bound mailboxes/signals/process creation and validate resource accounting under pressure.
-5. Define structured security audit events and test schema/redaction guarantees.
-6. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
-7. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
-8. Connect Supervisor monitor intake and OTP guest/runtime adapters.
-9. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
-10. Add scale, soak, and final production-readiness gates.
+1. Connect and test live running-Wasm hot reload.
+2. Add reload acknowledgement, atomic commit, rollback, and version lifecycle semantics.
+3. Bound mailboxes/signals/process creation and validate resource accounting under pressure.
+4. Define structured security audit events and test schema/redaction guarantees.
+5. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
+6. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
+7. Connect Supervisor monitor intake and OTP guest/runtime adapters.
+8. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
+9. Add scale, soak, and final production-readiness gates.
 
 ## Related Resources
 

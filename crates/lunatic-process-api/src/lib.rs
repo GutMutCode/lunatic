@@ -1364,10 +1364,8 @@ fn environment_id<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>) -> u64 {
 }
 
 // Link current process to **process_id**. This is not an atomic operation, any of the 2 processes
-// could fail before processing the `Link` signal and may not notify the other.
-//
-// Traps:
-// * If the process ID doesn't exist.
+// could fail before processing the `Link` signal and may not notify the other. If the target no
+// longer exists, a `LinkDied` signal with `DeathReason::NoProcess` is sent to the caller.
 fn link<T: ProcessState + ProcessCtx<T>>(
     mut caller: Caller<T>,
     tag: i64,
@@ -1408,10 +1406,8 @@ fn link<T: ProcessState + ProcessCtx<T>>(
     Ok(())
 }
 
-// Unlink current process from **process_id**. This is not an atomic operation.
-//
-// Traps:
-// * If the process ID doesn't exist.
+// Unlink current process from **process_id**. This is not an atomic operation. Missing targets are
+// ignored because there is no remaining link to remove.
 fn unlink<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u64) -> Result<()> {
     // Create handle to itself
     let this_process_id = caller.data().id();
@@ -1436,12 +1432,9 @@ fn unlink<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u6
     Ok(())
 }
 
-// Start monitoring **process_id**. This is not an atomic operation.
-//
-// Traps:
-// * If the process ID doesn't exist.
-fn monitor<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>, process_id: u64) -> Result<()> {
-    // Send link signal to other process
+// Start monitoring **process_id**. This is not an atomic operation. If the target no longer
+// exists, enqueue one `ProcessDied` notification for the caller immediately.
+fn monitor<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u64) -> Result<()> {
     let process = caller.data().environment().get_process(process_id);
 
     if let Some(process) = process {
@@ -1449,15 +1442,20 @@ fn monitor<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>, process_id: u64) 
         let signal_mailbox = caller.data().signal_mailbox().clone();
         let this_process = WasmProcess::new(id, signal_mailbox.0);
         process.send(Signal::Monitor(Arc::new(this_process)));
+    } else {
+        caller
+            .data_mut()
+            .signal_mailbox()
+            .0
+            .send(Signal::ProcessDied(process_id))
+            .expect("The ProcessDied signal is sent to itself and the receiver must exist");
     }
 
     Ok(())
 }
 
-// Stop monitoring **process_id**. This is not an atomic operation.
-//
-// Traps:
-// * If the process ID doesn't exist.
+// Stop monitoring **process_id**. This is not an atomic operation. Missing targets are ignored
+// because there is no live monitor registration to remove.
 fn stop_monitoring<T: ProcessState + ProcessCtx<T>>(
     caller: Caller<T>,
     process_id: u64,
@@ -1477,10 +1475,8 @@ fn stop_monitoring<T: ProcessState + ProcessCtx<T>>(
     Ok(())
 }
 
-// Send a Kill signal to **process_id**.
-//
-// Traps:
-// * If the process ID doesn't exist.
+// Send a Kill signal to **process_id**. Missing targets are ignored; process IDs are inherently
+// racy and the target may exit between lookup and delivery.
 fn kill<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>, process_id: u64) -> Result<()> {
     // Send kill signal to process
     if let Some(process) = caller.data().environment().get_process(process_id) {

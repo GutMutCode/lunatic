@@ -25,6 +25,7 @@ enforces the configured thresholds in `scripts/check_bench_thresholds.py`.
 
 | Area | Production path exercised | Command |
 | --- | --- | --- |
+| Wasm failure propagation | Actual `spawn_wasm` normal/trap/host-panic/active-kill/missing-process exits, default and trapping-exit peers, monitor deduplication, and native-runner parity | `cargo test -p lunatic-runtime --test wasm_link_death` |
 | OTP GenServer and Supervisor | Native Lunatic processes, serialized mailbox messages, lifecycle, failure and restart policies | `cargo test -p lunatic-otp-patterns` |
 | Hot reload state | Two real Wasmtime modules, memory snapshot, replacement module behavior and restored state | `cargo test -p lunatic-process --test hot_reload_integration` |
 | Live TLS hot reload | Real TLS handshake, live resource transfer, preserved resource ID/timeouts, post-transfer traffic | `cargo test -p lunatic-runtime --lib hot_reload_transfers_live_tls_stream_with_id_and_timeouts` |

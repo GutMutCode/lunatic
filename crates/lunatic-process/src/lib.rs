@@ -209,7 +209,7 @@ pub enum Signal {
 }
 
 /// Reason why a process died
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeathReason {
     /// Process finished normally
     Normal,
@@ -654,8 +654,6 @@ where
     F: Future<Output = R> + Send + 'static,
 {
     trace!("Process {} spawned", id);
-    let fut = AssertUnwindSafe(fut).catch_unwind();
-    tokio::pin!(fut);
 
     // If the value is set to false, instead of dying too the process will receive a message about
     // the linked process' death.
@@ -672,8 +670,12 @@ where
     let labels: [(String, String); 0] = [];
     #[cfg(all(feature = "metrics", feature = "detailed_metrics"))]
     let labels = [("process_id", id.to_string())];
-    let result = loop {
-        tokio::select! {
+    let result = {
+        let fut = AssertUnwindSafe(fut).catch_unwind();
+        tokio::pin!(fut);
+
+        loop {
+            tokio::select! {
             biased;
             // Handle signals first
             signal = signal_mailbox.recv(), if has_sender => {
@@ -853,12 +855,15 @@ where
                     Err(payload) => break Finished::Panicked(format_panic_payload(payload)),
                 }
             }
+            }
         }
     };
 
+    // The guest future, including an active Wasmtime fiber, is fully cancelled and dropped before
+    // the process disappears from the environment or lifecycle notifications are emitted.
     env.remove_process(id);
 
-    let final_result = match result {
+    let (final_result, death_reason) = match result {
         Finished::Normal(result) => {
             let result: ExecutionResult<_> = result.into();
 
@@ -883,20 +888,23 @@ where
                 );
                 debug!("{}", failure);
 
-                Err(anyhow!(failure.to_string()))
+                (Err(anyhow!(failure.to_string())), DeathReason::Failure)
             } else {
-                Ok(result.into_state())
+                (Ok(result.into_state()), DeathReason::Normal)
             }
         }
         Finished::Panicked(message) => {
             warn!("Process {} panicked, notifying: {} links", id, links.len());
 
-            Err(anyhow!(format!("Process panicked: {message}")))
+            (
+                Err(anyhow!(format!("Process panicked: {message}"))),
+                DeathReason::Failure,
+            )
         }
         Finished::KillSignal => {
             // TODO: We should return the state here too, but it's not possible with the current
             //       Wasmtime API. See: https://github.com/bytecodealliance/wasmtime/issues/2986
-            Err(anyhow!("Process killed"))
+            (Err(anyhow!("Process killed")), DeathReason::Failure)
         }
     };
 
@@ -907,7 +915,7 @@ where
 
     // Notify all links that this process died
     for (linked_process, tag) in links.values() {
-        linked_process.send(Signal::LinkDied(id, *tag, DeathReason::Normal));
+        linked_process.send(Signal::LinkDied(id, *tag, death_reason));
     }
 
     final_result

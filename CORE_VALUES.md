@@ -165,7 +165,7 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - ✅ Isolated memory
 - ✅ Message passing via mailboxes
 - ⚠️  Fast spawn (slower due to WASM instantiation)
-- ⚠️ Link/monitor plumbing exists, but the current Wasm process exit path does not yet propagate every non-normal death reason correctly
+- ✅ Actual-Wasm lifecycle tests preserve normal-versus-failure reasons on links and verify one monitor notification for normal exit, guest trap, host panic, kill, and missing-process failure
 
 ### Hot Code Loading
 
@@ -202,7 +202,7 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Trapping exits for custom handling
 
 **Lunatic Implementation Status:**
-- ⚠️ Process link, monitor, and death-notification components exist, but the Wasm exit path currently loses non-normal death reasons
+- ✅ Process links preserve actual-Wasm normal-versus-failure reasons, while monitors notify once; default links terminate peers and trapping exits preserve the tagged notification
 - ⚠️ Supervisor restart strategies manage real host-side Lunatic processes; automatic monitor-event intake and guest-WASM adapters remain pending
 
 ### Distribution
@@ -334,7 +334,7 @@ Checkboxes in this section represent current production-path verification, not w
 - [ ] Memory overhead < 1KB per process (historical lower-bound estimate: ~66KiB including one 64KiB Wasm page)
 
 ### Reliability
-- [ ] Production isolation contract (Wasm memory isolation exists; least-privilege defaults, bounded resources, and failure propagation still have open gaps)
+- [ ] Production isolation contract (Wasm memory isolation, least-privilege defaults, and linked failure propagation are verified; bounded queues, process counts, and complete resource accounting remain open)
 - [ ] Live hot reload state preservation with acknowledgement and rollback proof
 - [ ] 99.999% uptime (application-dependent)
 - [ ] Automatic failure recovery via OTP supervisors (real process restart is implemented; automatic monitor-event intake is pending)

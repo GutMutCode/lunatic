@@ -177,6 +177,12 @@ wasmtime = "8"
 wasmtime-wasi = "8"
 wiggle = "8"
 
+[patch.crates-io]
+# Wasmtime 8 predates Rust 1.95's Windows Fiber Local Storage destructor hook.
+# Keep the pinned runtime API while backporting upstream wasmtime#12426 so
+# cancelling an active `call_async` future cannot abort the host process.
+wasmtime-fiber = { path = "vendor/wasmtime-fiber-8.0.1" }
+
 [workspace.metadata.git-cliff.changelog]
 header = """
 # Lunatic Changelog
