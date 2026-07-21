@@ -75,14 +75,16 @@ async fn actual_lunatic_process_handles_call_cast_and_stop() {
 async fn call_timeout_does_not_poison_the_server() {
     let handle = Counter::spawn(GenServerConfig {
         name: Some("timeout-counter".to_string()),
-        timeout_ms: Some(15),
+        // Leave enough room for a fast follow-up call on a loaded CI runner;
+        // the deliberately slow call still exceeds this deadline by 3x.
+        timeout_ms: Some(100),
     })
     .unwrap();
 
-    let error = handle.call(Call::Sleep(60)).unwrap_err();
+    let error = handle.call(Call::Sleep(300)).unwrap_err();
     assert!(error.to_string().contains("timed out"));
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::sleep(Duration::from_millis(350)).await;
     assert_eq!(handle.call(Call::Get).unwrap().0, 0);
     handle.stop(TerminateReason::Normal).unwrap();
 }
