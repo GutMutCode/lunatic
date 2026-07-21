@@ -51,6 +51,14 @@ jobs:
         run: cargo clippy --examples --tests --benches -- -D warnings
       - name: "Check formatting"
         run: cargo fmt -- --check
+      - name: "Exercise Windows Wasm lifecycle paths with visible diagnostics"
+        if: runner.os == 'Windows'
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          cargo test --test wasm_link_death actual_wasm_exit_matrix_preserves_link_and_monitor_semantics -- --exact --nocapture
+          cargo test --test wasm_link_death actual_wasm_peer_honors_default_and_trap_exit_link_modes -- --exact --nocapture
+          cargo test --test wasm_link_death -- --nocapture
       - name: "Run workspace tests and E2E suites"
         run: cargo test --all
       - name: "Run benchmarks (baseline check)"
