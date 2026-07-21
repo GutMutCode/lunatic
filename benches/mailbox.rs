@@ -77,7 +77,9 @@ fn bench_worst_case_selective(c: &mut Criterion) {
                         mailbox.push(Message::LinkDied(Some(i)));
                     }
 
-                    let tags: Vec<i64> = vec![n_msg];
+                    // Match the final queued message so `pop` scans the whole
+                    // mailbox without waiting forever for a missing tag.
+                    let tags: Vec<i64> = vec![n_msg - 1];
 
                     let _message = mailbox.pop(Some(&tags)).await;
                     black_box(_message);
