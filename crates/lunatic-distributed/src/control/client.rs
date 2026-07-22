@@ -101,12 +101,12 @@ impl Client {
 
     pub async fn new_with_topology_limit(
         http_client: HttpClient,
-        reg: Registration,
+        mut reg: Registration,
         node_address: SocketAddr,
         attributes: HashMap<String, String>,
         max_topology_nodes: usize,
     ) -> Result<Self> {
-        let node_id = Self::start(
+        let started = Self::start(
             &http_client,
             &reg,
             NodeStart {
@@ -115,6 +115,7 @@ impl Client {
             },
         )
         .await?;
+        let node_id = install_started_certificate(&mut reg, started)?;
 
         let client = Client {
             inner: Arc::new(InnerClient {
@@ -197,7 +198,11 @@ impl Client {
         }
     }
 
-    async fn start(client: &HttpClient, reg: &Registration, start: NodeStart) -> Result<u64> {
+    async fn start(
+        client: &HttpClient,
+        reg: &Registration,
+        start: NodeStart,
+    ) -> Result<NodeStarted> {
         let resp: NodeStarted = client
             .post(&reg.urls.node_started)
             .json(&start)
@@ -210,7 +215,7 @@ impl Client {
             .await?
             .json()
             .await?;
-        Ok(resp.node_id as u64)
+        Ok(resp)
     }
 
     pub async fn get<T: DeserializeOwned>(&self, url: &str, query: Option<&str>) -> Result<T> {
@@ -408,6 +413,18 @@ impl Client {
     }
 }
 
+fn install_started_certificate(reg: &mut Registration, started: NodeStarted) -> Result<u64> {
+    anyhow::ensure!(
+        !started.cert_pem_chain.is_empty(),
+        "Control server did not return a node-ID-bound certificate from /started; upgrade the \
+         control plane before starting nodes"
+    );
+    let node_id = u64::try_from(started.node_id)
+        .context("Control server returned a negative node identity from /started")?;
+    reg.cert_pem_chain = started.cert_pem_chain;
+    Ok(node_id)
+}
+
 async fn refresh_nodes_task(client: Client) -> Result<()> {
     loop {
         client.refresh_nodes().await.ok();
@@ -497,5 +514,37 @@ mod tests {
                 .load(atomic::Ordering::Acquire),
             0
         );
+    }
+
+    #[test]
+    fn started_response_installs_identity_bound_certificate() {
+        let mut reg = registration();
+        let node_id = install_started_certificate(
+            &mut reg,
+            NodeStarted {
+                node_id: 42,
+                cert_pem_chain: vec!["node-42-certificate".into()],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(node_id, 42);
+        assert_eq!(reg.cert_pem_chain, vec!["node-42-certificate"]);
+    }
+
+    #[test]
+    fn legacy_started_response_without_bound_certificate_fails_closed() {
+        let mut reg = registration();
+        let error = install_started_certificate(
+            &mut reg,
+            NodeStarted {
+                node_id: 42,
+                cert_pem_chain: Vec::new(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("upgrade the control plane"));
+        assert!(reg.cert_pem_chain.is_empty());
     }
 }

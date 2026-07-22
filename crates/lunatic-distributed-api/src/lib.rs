@@ -7,25 +7,25 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use asn1_rs::ToDer;
 use lunatic_common_api::{
     emit_audit_event, get_memory, write_to_guest_vec, AuditAction, AuditEvent, AuditEventV1,
     AuditReason, AuditResult, AuditSubject, AuditTarget, AuditTargetKind, IntoTrap, LinkerAsyncExt,
     SensitiveData,
 };
 use lunatic_distributed::{
-    control::cert::CertificateAuthority,
+    control::cert::{
+        sign_node_certificate, sign_node_certificate_using_csr_name, CertificateAuthority,
+    },
     distributed::{
         self,
         client::{EnvironmentId, NodeId, ProcessId, SendErrorKind, SendParams, SpawnParams},
         message::{ClientError, Spawn, Val},
     },
-    CertAttrs, DistributedCtx, SUBJECT_DIR_ATTRS,
+    CertAttrs, DistributedCtx,
 };
 use lunatic_error_api::ErrorCtx;
 use lunatic_process::{config::ProcessConfig, env::Environment, message::Message};
 use lunatic_process_api::ProcessCtx;
-use rcgen::{CertificateSigningRequestParams, CustomExtension};
 use tokio::time::timeout;
 use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _};
 
@@ -135,6 +135,12 @@ where
         default_server_certificates,
     )?;
     linker.func_wrap7_async("lunatic::distributed", "sign_node", sign_node)?;
+    linker.func_wrap9_async(
+        "lunatic::distributed",
+        "sign_node_for_name",
+        sign_node_for_name,
+    )?;
+    linker.func_wrap10_async("lunatic::distributed", "sign_node_for_id", sign_node_for_id)?;
     Ok(())
 }
 
@@ -348,6 +354,98 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn sign_node<T, E>(
+    caller: Caller<T>,
+    cert_pem_ptr: u32,
+    cert_pem_len: u32,
+    pk_pem_ptr: u32,
+    pk_pem_len: u32,
+    csr_pem_ptr: u32,
+    csr_pem_len: u32,
+    len_ptr: u32,
+) -> Box<dyn Future<Output = Result<u32>> + Send + '_>
+where
+    T: DistributedCtx<E> + Send,
+    E: Environment,
+{
+    sign_node_with_identity(
+        caller,
+        cert_pem_ptr,
+        cert_pem_len,
+        pk_pem_ptr,
+        pk_pem_len,
+        csr_pem_ptr,
+        csr_pem_len,
+        None,
+        None,
+        len_ptr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_node_for_name<T, E>(
+    caller: Caller<T>,
+    cert_pem_ptr: u32,
+    cert_pem_len: u32,
+    pk_pem_ptr: u32,
+    pk_pem_len: u32,
+    csr_pem_ptr: u32,
+    csr_pem_len: u32,
+    node_name_ptr: u32,
+    node_name_len: u32,
+    len_ptr: u32,
+) -> Box<dyn Future<Output = Result<u32>> + Send + '_>
+where
+    T: DistributedCtx<E> + Send,
+    E: Environment,
+{
+    sign_node_with_identity(
+        caller,
+        cert_pem_ptr,
+        cert_pem_len,
+        pk_pem_ptr,
+        pk_pem_len,
+        csr_pem_ptr,
+        csr_pem_len,
+        Some((node_name_ptr, node_name_len)),
+        None,
+        len_ptr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_node_for_id<T, E>(
+    caller: Caller<T>,
+    cert_pem_ptr: u32,
+    cert_pem_len: u32,
+    pk_pem_ptr: u32,
+    pk_pem_len: u32,
+    csr_pem_ptr: u32,
+    csr_pem_len: u32,
+    node_name_ptr: u32,
+    node_name_len: u32,
+    node_id: u64,
+    len_ptr: u32,
+) -> Box<dyn Future<Output = Result<u32>> + Send + '_>
+where
+    T: DistributedCtx<E> + Send,
+    E: Environment,
+{
+    sign_node_with_identity(
+        caller,
+        cert_pem_ptr,
+        cert_pem_len,
+        pk_pem_ptr,
+        pk_pem_len,
+        csr_pem_ptr,
+        csr_pem_len,
+        Some((node_name_ptr, node_name_len)),
+        Some(node_id),
+        len_ptr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_node_with_identity<T, E>(
     mut caller: Caller<T>,
     cert_pem_ptr: u32,
     cert_pem_len: u32,
@@ -355,6 +453,8 @@ fn sign_node<T, E>(
     pk_pem_len: u32,
     csr_pem_ptr: u32,
     csr_pem_len: u32,
+    expected_dns_name: Option<(u32, u32)>,
+    node_id: Option<u64>,
     len_ptr: u32,
 ) -> Box<dyn Future<Output = Result<u32>> + Send + '_>
 where
@@ -385,27 +485,34 @@ where
         let csr_pem =
             std::str::from_utf8(csr_pem_bytes).or_trap("lunatic::distributed::sign_node")?;
 
+        let expected_dns_name = expected_dns_name
+            .map(|(ptr, len)| {
+                let bytes = memory
+                    .data(&caller)
+                    .get(ptr as usize..(ptr + len) as usize)
+                    .or_trap("lunatic::distributed::sign_node")?;
+                Ok::<_, anyhow::Error>(
+                    std::str::from_utf8(bytes)
+                        .or_trap("lunatic::distributed::sign_node")?
+                        .to_owned(),
+                )
+            })
+            .transpose()?;
+
         let ca_cert = CertificateAuthority::from_pem(cert_pem, pk_pem)
             .or_trap("lunatic::distributed::sign_node")?;
-        let mut csr = CertificateSigningRequestParams::from_pem(csr_pem)
-            .or_trap("lunatic::distributed::sign_node")?;
-        // Add json to custom certificate extension
-        csr.params
-            .custom_extensions
-            .push(CustomExtension::from_oid_content(
-                &SUBJECT_DIR_ATTRS,
-                serde_json::to_string(&CertAttrs {
-                    allowed_envs: vec![],
-                    is_privileged: true,
-                })
-                .or_trap("lunatic::distributed::sign_node")?
-                .to_der_vec()
-                .or_trap("lunatic::distributed::sign_node")?,
-            ));
-        let cert_pem = csr
-            .signed_by(ca_cert.issuer())
-            .or_trap("lunatic::distributed::sign_node")?
-            .pem();
+        let attrs = CertAttrs {
+            node_id,
+            allowed_envs: vec![],
+            is_privileged: true,
+        };
+        let cert_pem = match expected_dns_name {
+            Some(expected_dns_name) => {
+                sign_node_certificate(csr_pem, &ca_cert, &expected_dns_name, &attrs)
+            }
+            None => sign_node_certificate_using_csr_name(csr_pem, &ca_cert, &attrs),
+        }
+        .or_trap("lunatic::distributed::sign_node")?;
         let data = bincode::serialize(&cert_pem).or_trap("lunatic::distributed::sign_node")?;
         let ptr = write_to_guest_vec(&mut caller, &memory, &data, len_ptr)
             .await

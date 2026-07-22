@@ -1,4 +1,5 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use lunatic_control::{
     api::{ControlUrls, Registration},
     NodeInfo,
@@ -8,7 +9,10 @@ use lunatic_distributed::{
         self,
         cert::{CertificateAuthority, CertificateRequest},
     },
-    distributed::{Client, GlobalProcessId},
+    distributed::{
+        message::{self, Request},
+        Client, GlobalProcessId, RegistryCoordinationMessage,
+    },
     quic, CertAttrs, SUBJECT_DIR_ATTRS,
 };
 use quinn::{Endpoint, VarInt};
@@ -46,7 +50,7 @@ impl TestCluster {
 
         for id in 1..=node_count as u64 {
             let name = format!("node-{id}.lunatic.test");
-            let (cert, key) = node_certificate(&root, &name)?;
+            let (cert, key) = node_certificate(&root, &name, id)?;
             let endpoint =
                 quic::new_quic_server("[::1]:0".parse()?, vec![cert.clone()], &key, &root_cert)?;
             let address = endpoint.local_addr()?;
@@ -116,6 +120,18 @@ impl TestCluster {
         Ok(())
     }
 
+    async fn stall_registry_server(&mut self, index: usize) {
+        if let Some(task) = self.nodes[index].server_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(
+            self.nodes[index].endpoint.is_some(),
+            "stalled server must keep its QUIC endpoint alive"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     async fn wait_for_value(
         &self,
         name: &str,
@@ -165,13 +181,18 @@ fn spawn_registry_server(mut endpoint: Endpoint, client: Client) -> JoinHandle<(
     })
 }
 
-fn node_certificate(root: &CertificateAuthority, name: &str) -> Result<(String, String)> {
+fn node_certificate(
+    root: &CertificateAuthority,
+    name: &str,
+    node_id: u64,
+) -> Result<(String, String)> {
     let mut params = CertificateParams::new(vec![name.to_string()])?;
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Lunatic Inc.");
     params.distinguished_name.push(DnType::CommonName, "Node");
     let attributes = serde_json::to_string(&CertAttrs {
+        node_id: Some(node_id),
         allowed_envs: vec![],
         is_privileged: true,
     })?;
@@ -186,6 +207,120 @@ fn node_certificate(root: &CertificateAuthority, name: &str) -> Result<(String, 
         cert.serialize_pem_with_signer(root)?,
         cert.serialize_private_key_pem(),
     ))
+}
+
+async fn send_registry_message_with_claim(
+    cluster: &TestCluster,
+    certificate_node_index: usize,
+    target_node_index: usize,
+    claimed_node_id: u64,
+    message: RegistryCoordinationMessage,
+) -> Result<()> {
+    send_registry_requests_as(
+        cluster,
+        certificate_node_index,
+        target_node_index,
+        vec![Request::Registry {
+            node_id: claimed_node_id,
+            message,
+        }],
+    )
+    .await
+}
+
+async fn send_registry_requests_as(
+    cluster: &TestCluster,
+    certificate_node_index: usize,
+    target_node_index: usize,
+    requests: Vec<Request>,
+) -> Result<()> {
+    let certificate_node = &cluster.nodes[certificate_node_index];
+    let target_node = &cluster.nodes[target_node_index];
+    let attacker = quic::new_quic_client(
+        &cluster.root_cert,
+        &certificate_node.cert,
+        &certificate_node.key,
+    )?;
+    let target_name = format!("node-{}.lunatic.test", target_node_index + 1);
+    let connection = attacker._connect(target_node.address, &target_name).await?;
+    let mut stream = connection.open_uni().await?;
+    for (offset, request) in requests.into_iter().enumerate() {
+        let data = Bytes::from(message::serialize_message(&request)?);
+        quic::write_message(&mut stream, 7_001 + offset as u64, data).await?;
+    }
+    stream.finish()?;
+    let _ = stream.stopped().await?;
+    Ok(())
+}
+
+async fn capture_registry_sync_request(
+    endpoint: Endpoint,
+    expected_requesting_node_id: u64,
+) -> Result<u64> {
+    loop {
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or_else(|| anyhow!("leader endpoint closed before synchronization request"))?;
+        let connection = incoming.await?;
+        let recv = connection.accept_uni().await?;
+        let (captured_tx, mut captured_rx) = tokio::sync::mpsc::unbounded_channel();
+        quic::handle_request_stream(recv, move |_message_id, request| {
+            let _ = captured_tx.send(request);
+            async {}
+        })
+        .await;
+        let Some(request) = captured_rx.recv().await else {
+            continue;
+        };
+        if let Request::Registry {
+            message:
+                RegistryCoordinationMessage::RegistrySyncRequest {
+                    request_id,
+                    requesting_node_id,
+                },
+            ..
+        } = request
+        {
+            if requesting_node_id == expected_requesting_node_id {
+                return Ok(request_id);
+            }
+        }
+    }
+}
+
+async fn capture_registry_register_decision(
+    endpoint: Endpoint,
+    expected_request_id: u64,
+) -> Result<()> {
+    loop {
+        let incoming = endpoint
+            .accept()
+            .await
+            .ok_or_else(|| anyhow!("node endpoint closed before registry decision"))?;
+        let connection = incoming.await?;
+        let recv = connection.accept_uni().await?;
+        let (captured_tx, mut captured_rx) = tokio::sync::mpsc::unbounded_channel();
+        quic::handle_request_stream(recv, move |_message_id, request| {
+            let _ = captured_tx.send(request);
+            async {}
+        })
+        .await;
+        while let Some(request) = captured_rx.recv().await {
+            if matches!(
+                request,
+                Request::Registry {
+                    message: RegistryCoordinationMessage::GlobalRegisterDecision {
+                        request_id,
+                        ..
+                    },
+                    ..
+                } if request_id == expected_request_id
+            ) {
+                return Ok(());
+            }
+        }
+    }
 }
 
 fn der_utf8_string(value: &str) -> Vec<u8> {
@@ -340,5 +475,162 @@ async fn recovered_node_resynchronizes_a_commit_missed_during_partition() -> Res
     cluster
         .wait_for_value("partitioned-service", gpid, Duration::from_secs(6))
         .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn certificate_identity_cannot_spoof_registry_leader_claim() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
+    let cluster = TestCluster::new(3).await?;
+    let forged_name = "forged-leader-commit";
+    let forged_owner = GlobalProcessId::new(1, 1, 9_001);
+    let barrier_name = "authenticated-node-two-barrier";
+    let barrier_owner = GlobalProcessId::new(2, 1, 9_011);
+
+    // Node 2 owns the mTLS certificate on this connection, but the redundant
+    // wire field claims node 1, the elected coordinator. Without the transport
+    // identity comparison this leader-only notification would mutate leader node 1.
+    send_registry_requests_as(
+        &cluster,
+        1,
+        0,
+        vec![
+            Request::Registry {
+                node_id: 1,
+                message: RegistryCoordinationMessage::GlobalRegisterNotify {
+                    name: forged_name.to_string(),
+                    global_pid: forged_owner,
+                    registered_at: 1,
+                },
+            },
+            Request::Registry {
+                node_id: 2,
+                message: RegistryCoordinationMessage::GlobalRegisterRequest {
+                    request_id: 55_001,
+                    requesting_node_id: 2,
+                    name: barrier_name.to_string(),
+                    global_pid: barrier_owner,
+                },
+            },
+        ],
+    )
+    .await?;
+
+    cluster
+        .wait_for_value(barrier_name, barrier_owner, Duration::from_secs(5))
+        .await?;
+    assert!(
+        cluster.nodes[0]
+            .client
+            .registry()
+            .lookup_global(forged_name)
+            .is_none(),
+        "registry state changed after a certificate/payload node-ID mismatch"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn certificate_identity_cannot_inject_a_leader_snapshot() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
+    let mut cluster = TestCluster::new(3).await?;
+    cluster.stall_registry_server(0).await;
+    cluster.stall_registry_server(1).await;
+
+    // Capture node 3's actual request ID from the production-framed stream so background
+    // synchronization timing cannot make this regression pass without reaching the pending call.
+    let leader_endpoint = cluster.nodes[0]
+        .endpoint
+        .as_ref()
+        .expect("stalled leader endpoint")
+        .clone();
+    let capture = tokio::spawn(capture_registry_sync_request(leader_endpoint, 3));
+    let node_three = cluster.client(2);
+    let sync = tokio::spawn(async move { node_three.synchronize_registry().await });
+    let request_id = tokio::time::timeout(Duration::from_secs(2), capture)
+        .await
+        .context("node-3 synchronization request was not captured")???;
+    assert!(
+        !sync.is_finished(),
+        "synchronization must still have its captured request pending"
+    );
+
+    let forged_name = "forged-registry-snapshot";
+    let forged_owner = GlobalProcessId::new(1, 1, 9_002);
+    let barrier_request_id = 55_002;
+    let barrier_endpoint = cluster.nodes[1]
+        .endpoint
+        .as_ref()
+        .expect("stalled node-2 endpoint")
+        .clone();
+    let barrier = tokio::spawn(capture_registry_register_decision(
+        barrier_endpoint,
+        barrier_request_id,
+    ));
+    send_registry_requests_as(
+        &cluster,
+        1,
+        2,
+        vec![
+            Request::Registry {
+                node_id: 2,
+                message: RegistryCoordinationMessage::RegistrySyncResponse {
+                    request_id,
+                    global_entries: vec![(forged_name.to_string(), forged_owner, 1)],
+                },
+            },
+            Request::Registry {
+                node_id: 2,
+                message: RegistryCoordinationMessage::GlobalRegisterRequest {
+                    request_id: barrier_request_id,
+                    requesting_node_id: 2,
+                    name: "snapshot-processing-barrier".to_string(),
+                    global_pid: GlobalProcessId::new(2, 1, 9_003),
+                },
+            },
+        ],
+    )
+    .await?;
+
+    tokio::time::timeout(Duration::from_secs(2), barrier)
+        .await
+        .context("node 3 did not finish processing the rejected snapshot")???;
+    assert!(
+        !sync.is_finished(),
+        "a non-coordinator snapshot must not consume the pending synchronization"
+    );
+    assert!(
+        cluster.nodes[2]
+            .client
+            .registry()
+            .lookup_global(forged_name)
+            .is_none(),
+        "registry snapshot from a non-coordinator certificate was applied"
+    );
+
+    let legitimate_name = "legitimate-registry-snapshot";
+    let legitimate_owner = GlobalProcessId::new(1, 1, 9_004);
+    send_registry_message_with_claim(
+        &cluster,
+        0,
+        2,
+        1,
+        RegistryCoordinationMessage::RegistrySyncResponse {
+            request_id,
+            global_entries: vec![(legitimate_name.to_string(), legitimate_owner, 2)],
+        },
+    )
+    .await?;
+    tokio::time::timeout(Duration::from_secs(2), sync)
+        .await
+        .context("legitimate leader snapshot did not complete synchronization")???;
+    assert_eq!(
+        cluster.nodes[2]
+            .client
+            .registry()
+            .lookup_global(legitimate_name)
+            .map(|entry| entry.global_pid),
+        Some(legitimate_owner)
+    );
     Ok(())
 }

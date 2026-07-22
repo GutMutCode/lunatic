@@ -7,12 +7,15 @@ use std::{
     },
 };
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use axum::{Extension, Router};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use lunatic_control::api::{NodeStart, Register};
-use lunatic_distributed::control::cert::CertificateAuthority;
+use lunatic_distributed::{
+    control::cert::{sign_node_certificate, CertificateAuthority},
+    CertAttrs,
+};
 use uuid::Uuid;
 
 use crate::routes;
@@ -77,14 +80,52 @@ impl ControlServer {
         self.registrations.insert(id, registered);
     }
 
-    pub fn start_node(&self, registration_id: u64, data: NodeStart) -> (u64, String) {
+    pub fn start_node(
+        &self,
+        registration_id: u64,
+        data: NodeStart,
+    ) -> Result<(u64, String, String)> {
         let _lifecycle = self
             .node_lifecycle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.stop_nodes_for_registration(registration_id);
 
-        let id = self.next_node_id.fetch_add(1, atomic::Ordering::Relaxed);
+        let id = self.next_node_id.load(atomic::Ordering::Relaxed);
+        anyhow::ensure!(
+            id <= lunatic_distributed::distributed::MAX_NODE_ID,
+            "distributed node ID space is exhausted"
+        );
+        self.next_node_id.store(id + 1, atomic::Ordering::Relaxed);
+        let (csr_pem, node_name) = {
+            let registration = self
+                .registrations
+                .get(&registration_id)
+                .ok_or_else(|| anyhow!("registration {registration_id} no longer exists"))?;
+            (
+                registration.csr_pem.clone(),
+                registration.node_name.hyphenated().to_string(),
+            )
+        };
+        let cert_pem = sign_node_certificate(
+            &csr_pem,
+            &self.ca_cert,
+            &node_name,
+            &CertAttrs {
+                node_id: Some(id),
+                allowed_envs: vec![],
+                is_privileged: true,
+            },
+        )?;
+
+        // Keep the old node active if certificate issuance fails. Once the
+        // replacement identity is ready, lifecycle and certificate state move
+        // together while this lock excludes a concurrent restart/stop.
+        self.stop_nodes_for_registration(registration_id);
+        self.registrations
+            .get_mut(&registration_id)
+            .ok_or_else(|| anyhow!("registration {registration_id} no longer exists"))?
+            .cert_pem = cert_pem.clone();
+
         let details = NodeDetails {
             registration_id,
             status: 0,
@@ -94,7 +135,7 @@ impl ControlServer {
             attributes: data.attributes,
         };
         self.nodes.insert(id, details);
-        (id, data.node_address.to_string())
+        Ok((id, data.node_address.to_string(), cert_pem))
     }
 
     pub fn stop_node(&self, registration_id: u64) {
@@ -123,8 +164,10 @@ impl ControlServer {
 }
 
 fn prepare_app() -> Result<Router> {
-    let ca_cert_str = lunatic_distributed::distributed::server::test_root_cert();
-    let ca_cert = lunatic_distributed::control::cert::test_root_cert()?;
+    // This server keeps registrations and numeric node IDs only in memory. Rotate the CA with
+    // that state so a leaf issued before a restart can never regain a reused numeric identity.
+    let ca_cert = CertificateAuthority::generate()?;
+    let ca_cert_str = ca_cert.certificate_pem().to_owned();
     let (ctrl_cert, ctrl_pk) =
         lunatic_distributed::control::cert::default_server_certificates(&ca_cert)?;
     let quic_client =

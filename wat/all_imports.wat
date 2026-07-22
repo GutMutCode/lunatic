@@ -11,6 +11,8 @@
     (import "lunatic::distributed" "send" (func (param i64 i64) (result i32)))
     (import "lunatic::distributed" "send_receive_skip_search" (func (param i64 i64 i64 i64) (result i32)))
     (import "lunatic::distributed" "sign_node" (func (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+    (import "lunatic::distributed" "sign_node_for_id" (func (param i32 i32 i32 i32 i32 i32 i32 i32 i64 i32) (result i32)))
+    (import "lunatic::distributed" "sign_node_for_name" (func (param i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
     (import "lunatic::distributed" "spawn" (func (param i64 i64 i64 i32 i32 i32 i32 i32) (result i32)))
     (import "lunatic::distributed" "test_root_cert" (func (param i32) (result i32)))
 

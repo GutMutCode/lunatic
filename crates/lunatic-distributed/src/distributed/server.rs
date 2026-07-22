@@ -19,8 +19,9 @@ use wasmtime::ResourceLimiter;
 
 use crate::{
     control::cert::CertificateRequest,
+    distributed::audit_verified_peer_protocol_denial,
     distributed::message::{Request, Response},
-    quic::{self, NodeEnvPermission},
+    quic::{self, NodeEnvPermission, VerifiedNodeId},
     DistributedCtx, DistributedProcessState,
 };
 
@@ -107,13 +108,13 @@ impl Drop for PendingServerAudit {
 }
 
 fn audit_request_authorization(
-    local_node_id: u64,
+    verified_remote_node_id: u64,
     environment_id: u64,
     result: AuditResult,
     reason: AuditReason,
 ) {
     emit_audit_event(request_authorization_event(
-        local_node_id,
+        verified_remote_node_id,
         environment_id,
         result,
         reason,
@@ -121,7 +122,7 @@ fn audit_request_authorization(
 }
 
 fn request_authorization_event(
-    local_node_id: u64,
+    verified_remote_node_id: u64,
     environment_id: u64,
     result: AuditResult,
     reason: AuditReason,
@@ -131,7 +132,7 @@ fn request_authorization_event(
         AuditAction::Validate,
         result,
         reason,
-        AuditSubject::new().with_node_id(local_node_id),
+        AuditSubject::new().with_node_id(verified_remote_node_id),
         AuditTarget::new(AuditTargetKind::DistributedRequest)
             .with_environment_id(environment_id)
             .with_sensitive_data(SensitiveData::Redacted),
@@ -197,10 +198,11 @@ where
     Ok(())
 }
 
-pub async fn handle_message<T, E>(
+pub(crate) async fn handle_message<T, E>(
     ctx: ServerCtx<T, E>,
     msg_id: u64,
     msg: Request,
+    peer_node_id: VerifiedNodeId,
     node_permissions: Arc<NodeEnvPermission>,
 ) where
     T: ProcessState
@@ -212,7 +214,7 @@ pub async fn handle_message<T, E>(
         + 'static,
     E: Environment + 'static,
 {
-    if let Err(e) = handle_message_err(ctx, msg_id, msg, node_permissions).await {
+    if let Err(e) = handle_message_err(ctx, msg_id, msg, peer_node_id, node_permissions).await {
         log::error!("Error handling message: {e}");
     }
 }
@@ -221,6 +223,7 @@ async fn handle_message_err<T, E>(
     ctx: ServerCtx<T, E>,
     msg_id: u64,
     msg: Request,
+    peer_node_id: VerifiedNodeId,
     node_permissions: Arc<NodeEnvPermission>,
 ) -> Result<()>
 where
@@ -233,30 +236,49 @@ where
         + 'static,
     E: Environment + 'static,
 {
+    if !ctx.node_client.is_active_node(peer_node_id.get()) {
+        audit_verified_peer_protocol_denial(peer_node_id);
+        return Err(anyhow!(
+            "Authenticated peer is no longer an active topology member"
+        ));
+    }
+
+    let claimed_node_id = match &msg {
+        Request::Spawn(spawn) => Some(spawn.response_node_id),
+        Request::Message { node_id, .. } | Request::Registry { node_id, .. } => Some(*node_id),
+        Request::Response(_) => None,
+    };
+    if claimed_node_id.is_some_and(|claimed| claimed != peer_node_id.get()) {
+        audit_verified_peer_protocol_denial(peer_node_id);
+        return Err(anyhow!(
+            "Distributed request source did not match authenticated peer"
+        ));
+    }
+
     let env_id = match &msg {
-        Request::Spawn(spawn) => Some((spawn.response_node_id, spawn.environment_id)),
+        Request::Spawn(spawn) => Some(spawn.environment_id),
         Request::Message {
-            node_id,
             environment_id,
             process_id: _,
             tag: _,
             data: _,
-        } => Some((*node_id, *environment_id)),
+            ..
+        } => Some(*environment_id),
         Request::Response(_) => None,
         Request::Registry { .. } => None,
     };
-    if let Some((node_id, env_id)) = env_id {
+    if let Some(env_id) = env_id {
         if let Some(ref allowed_envs) = node_permissions.0 {
             if !allowed_envs.contains(&env_id) {
                 audit_request_authorization(
-                    ctx.distributed.node_id(),
+                    peer_node_id.get(),
                     env_id,
                     AuditResult::Denied,
                     AuditReason::PolicyDenied,
                 );
                 ctx.node_client
                     .send_response(ResponseParams {
-                        node_id: NodeId(node_id),
+                        node_id: NodeId(peer_node_id.get()),
                         response: Response {
                             message_id: msg_id,
                             content: ResponseContent::Error(ClientError::Unexpected(format!(
@@ -271,14 +293,14 @@ where
         if let Some(ref allowed_envs) = ctx.allowed_envs {
             if !allowed_envs.contains(&env_id) {
                 audit_request_authorization(
-                    ctx.distributed.node_id(),
+                    peer_node_id.get(),
                     env_id,
                     AuditResult::Denied,
                     AuditReason::PolicyDenied,
                 );
                 ctx.node_client
                     .send_response(ResponseParams {
-                        node_id: NodeId(node_id),
+                        node_id: NodeId(peer_node_id.get()),
                         response: Response {
                             message_id: msg_id,
                             content: ResponseContent::Error(ClientError::Unexpected(format!(
@@ -291,7 +313,7 @@ where
             }
         }
         audit_request_authorization(
-            ctx.distributed.node_id(),
+            peer_node_id.get(),
             env_id,
             AuditResult::Allowed,
             AuditReason::PolicyAllowed,
@@ -300,29 +322,24 @@ where
     match msg {
         Request::Spawn(spawn) => {
             log::trace!("lunatic::distributed::server process Spawn");
-            let node_id = spawn.response_node_id;
             match handle_spawn(ctx.clone(), spawn).await {
                 Ok(Ok(id)) => {
                     log::trace!("lunatic::distributed::server Spawned {id}");
-                    // The platform sends the spawn instructions with node_id = 0
-                    // in this case we do not respond
-                    if node_id != 0 {
-                        ctx.node_client
-                            .send_response(ResponseParams {
-                                node_id: NodeId(node_id),
-                                response: Response {
-                                    message_id: msg_id,
-                                    content: ResponseContent::Spawned(id),
-                                },
-                            })
-                            .await?;
-                    }
+                    ctx.node_client
+                        .send_response(ResponseParams {
+                            node_id: NodeId(peer_node_id.get()),
+                            response: Response {
+                                message_id: msg_id,
+                                content: ResponseContent::Spawned(id),
+                            },
+                        })
+                        .await?;
                 }
                 Ok(Err(client_error)) => {
                     log::trace!("lunatic::distributed::server Spawn error: {client_error:?}");
                     ctx.node_client
                         .send_response(ResponseParams {
-                            node_id: NodeId(node_id),
+                            node_id: NodeId(peer_node_id.get()),
                             response: Response {
                                 message_id: msg_id,
                                 content: ResponseContent::Error(client_error),
@@ -334,7 +351,7 @@ where
                     log::trace!("lunatic::distributed::server Spawn error: {error}");
                     ctx.node_client
                         .send_response(ResponseParams {
-                            node_id: NodeId(node_id),
+                            node_id: NodeId(peer_node_id.get()),
                             response: Response {
                                 message_id: msg_id,
                                 content: ResponseContent::Error(ClientError::Unexpected(
@@ -347,7 +364,7 @@ where
             };
         }
         Request::Message {
-            node_id,
+            node_id: _,
             environment_id,
             process_id,
             tag,
@@ -358,7 +375,7 @@ where
                 Ok(_) => {
                     ctx.node_client
                         .send_response(ResponseParams {
-                            node_id: NodeId(node_id),
+                            node_id: NodeId(peer_node_id.get()),
                             response: Response {
                                 message_id: msg_id,
                                 content: ResponseContent::Sent,
@@ -369,7 +386,7 @@ where
                 Err(error) => {
                     ctx.node_client
                         .send_response(ResponseParams {
-                            node_id: NodeId(node_id),
+                            node_id: NodeId(peer_node_id.get()),
                             response: Response {
                                 message_id: msg_id,
                                 content: ResponseContent::Error(error),
@@ -381,12 +398,14 @@ where
         }
         Request::Response(response) => {
             log::trace!("distributed::server process Response");
-            ctx.node_client.recv_response(response).await;
+            ctx.node_client
+                .recv_response(peer_node_id, response)
+                .await?;
         }
         Request::Registry { node_id, message } => {
             log::trace!("distributed::server process Registry");
             ctx.node_client
-                .handle_registry_message(node_id, message)
+                .handle_registry_message(peer_node_id, node_id, message)
                 .await?;
         }
     };
@@ -709,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn receiver_authorization_event_omits_unverified_remote_identity() {
+    fn receiver_authorization_event_uses_verified_remote_identity() {
         let event =
             request_authorization_event(7, 13, AuditResult::Allowed, AuditReason::PolicyAllowed);
         assert_eq!(event.result(), AuditResult::Allowed);

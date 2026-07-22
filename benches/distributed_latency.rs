@@ -56,9 +56,9 @@ fn control_lookup_benchmark(c: &mut Criterion) {
             let control = ControlHandle::new().await.expect("control server to start");
 
             let mut nodes = Vec::new();
-            for index in 0..2 {
+            for _ in 0..2 {
                 let node_addr: SocketAddr = "127.0.0.1:0".parse().expect("socket addr");
-                let node = register_node(&control, node_addr, format!("bench-node-{index}")).await;
+                let node = register_node(&control, node_addr).await;
                 nodes.push(node.expect("node registration"));
             }
 
@@ -150,7 +150,7 @@ impl LiveMailboxHarness {
 
         for id in 1..=2u64 {
             let name = format!("bench-node-{id}.lunatic.test");
-            let (cert, key) = node_certificate(&root, &name)?;
+            let (cert, key) = node_certificate(&root, &name, id)?;
             let endpoint =
                 quic::new_quic_server(bench_bind_addr(), vec![cert.clone()], &key, &root_cert)?;
             let address = endpoint.local_addr()?;
@@ -346,13 +346,18 @@ async fn wait_for_registry(client: &Client, expected: GlobalProcessId) -> Result
     }
 }
 
-fn node_certificate(root: &CertificateAuthority, name: &str) -> Result<(String, String)> {
+fn node_certificate(
+    root: &CertificateAuthority,
+    name: &str,
+    node_id: u64,
+) -> Result<(String, String)> {
     let mut params = CertificateParams::new(vec![name.to_string()])?;
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Lunatic Inc.");
     params.distinguished_name.push(DnType::CommonName, "Node");
     let attributes = serde_json::to_string(&CertAttrs {
+        node_id: Some(node_id),
         allowed_envs: vec![],
         is_privileged: true,
     })?;
@@ -434,17 +439,14 @@ impl ControlHandle {
     }
 }
 
-async fn register_node(
-    control: &ControlHandle,
-    node_addr: SocketAddr,
-    node_name: String,
-) -> Result<control::Client> {
+async fn register_node(control: &ControlHandle, node_addr: SocketAddr) -> Result<control::Client> {
     let http_client = HttpClient::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .context("failed to build control HTTP client")?;
 
-    let node_cert = gen_node_cert(&node_name)?;
+    let node_name = Uuid::new_v4();
+    let node_cert = gen_node_cert(&node_name.hyphenated().to_string())?;
     let csr_pem = node_cert
         .serialize_request_pem()
         .context("failed to serialize node CSR")?;
@@ -452,7 +454,7 @@ async fn register_node(
     let registration = control::Client::register(
         &http_client,
         Url::parse(&control.base_url())?,
-        Uuid::new_v4(),
+        node_name,
         csr_pem,
     )
     .await?;

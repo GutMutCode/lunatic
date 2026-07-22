@@ -56,6 +56,28 @@ pub const SUBJECT_DIR_ATTRS: [u64; 4] = [2, 5, 29, 9];
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CertAttrs {
+    /// Numeric node identity assigned by the control plane.
+    ///
+    /// Certificates issued before node identities were bound omit this field.
+    /// They remain deserializable so transports can reject them with a clear
+    /// migration error instead of treating their payload claims as trusted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
     pub allowed_envs: Vec<u64>,
     pub is_privileged: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CertAttrs;
+
+    #[test]
+    fn legacy_certificate_attributes_deserialize_without_node_identity() {
+        let attrs: CertAttrs =
+            serde_json::from_str(r#"{"allowed_envs":[3],"is_privileged":false}"#).unwrap();
+
+        assert_eq!(attrs.node_id, None);
+        assert_eq!(attrs.allowed_envs, vec![3]);
+        assert!(!attrs.is_privileged);
+    }
 }

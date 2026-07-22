@@ -30,6 +30,30 @@ use crate::{distributed, CertAttrs, DistributedCtx};
 
 pub const MESSAGE_CHUNK_SIZE: usize = 1024;
 
+/// A numeric node identity extracted from a CA-signed peer certificate.
+///
+/// The field and constructor stay private to this transport module so a raw wire claim cannot be
+/// accidentally promoted to an authenticated identity elsewhere in the distributed runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VerifiedNodeId(u64);
+
+impl VerifiedNodeId {
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(node_id: u64) -> Self {
+        Self(node_id)
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedPeer {
+    node_id: VerifiedNodeId,
+    certificate_attrs: CertAttrs,
+}
+
 /// Maximum serialized distributed request accepted by the QUIC transport.
 ///
 /// This transport ceiling is deliberately finite and larger than the default process-message
@@ -157,9 +181,46 @@ impl Client {
                     log::error!("Error connecting to {name} at {addr}, try {try_num}. Error: {e}")
                 }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            if try_num < retry {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
         }
         Err(anyhow!("Failed to connect to {name} at {addr}"))
+    }
+
+    /// Connect to a distributed node and verify that its signed numeric identity matches the
+    /// intended topology entry in addition to the normal CA and SAN checks performed by rustls.
+    pub(crate) async fn try_connect_node(
+        &self,
+        addr: SocketAddr,
+        name: &str,
+        expected_node_id: u64,
+        retry: u32,
+    ) -> Result<quinn::Connection> {
+        for try_num in 1..(retry + 1) {
+            match self._connect(addr, name).await {
+                Ok(conn) => match get_verified_peer(&conn) {
+                    Ok(peer) if peer.node_id.get() == expected_node_id => return Ok(conn),
+                    Ok(peer) => log::error!(
+                        "Authenticated node identity {} did not match expected node {} for {name} at {addr}, try {try_num}",
+                        peer.node_id.get(),
+                        expected_node_id
+                    ),
+                    Err(error) => log::error!(
+                        "Failed to authenticate distributed node {name} at {addr}, try {try_num}. Error: {error}"
+                    ),
+                },
+                Err(error) => {
+                    log::error!("Error connecting to {name} at {addr}, try {try_num}. Error: {error}")
+                }
+            }
+            if try_num < retry {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        Err(anyhow!(
+            "Failed to connect to authenticated node {expected_node_id} ({name}) at {addr}"
+        ))
     }
 
     /// Send one complete distributed protocol message over an authenticated QUIC stream.
@@ -167,10 +228,13 @@ impl Client {
         &self,
         addr: SocketAddr,
         name: &str,
+        expected_node_id: u64,
         message_id: u64,
         data: Bytes,
     ) -> Result<()> {
-        let conn = self._connect(addr, name).await?;
+        let conn = self
+            .try_connect_node(addr, name, expected_node_id, 1)
+            .await?;
         let mut stream = conn.open_uni().await?;
         write_message(&mut stream, message_id, data).await?;
         stream.finish()?;
@@ -236,7 +300,7 @@ fn validate_wire_message_size(message_size: usize) -> Result<()> {
     Ok(())
 }
 
-fn get_cert_attrs(conn: &Connection) -> Result<CertAttrs> {
+fn get_verified_peer(conn: &Connection) -> Result<VerifiedPeer> {
     let peer_identity = match conn
         .peer_identity()
         .ok_or(anyhow!("Peer must provide an identity."))?
@@ -245,19 +309,39 @@ fn get_cert_attrs(conn: &Connection) -> Result<CertAttrs> {
         Ok(certs) => Ok(certs),
         Err(_) => Err(anyhow!("Failed to downcast peer identity.")),
     }?;
-    if peer_identity.len() != 1 {
-        return Err(anyhow!("More than one identity certificate detected."));
-    }
     let cert = peer_identity
         .first()
         .ok_or_else(|| anyhow!("Peer identity certificate is missing."))?;
+    verified_peer_from_certificate(cert)
+}
+
+fn verified_peer_from_certificate(cert: &CertificateDer<'_>) -> Result<VerifiedPeer> {
     let (_rem, x509) = x509_parser::certificate::X509Certificate::from_der(cert.as_ref())?;
     let oid = oid!(2.5.29 .9);
     let ext = x509
         .get_extension_unique(&oid)?
         .ok_or_else(|| anyhow!("Missing critical Lunatic certificate extension."))?;
     let (_rem, value) = Utf8String::from_der(ext.value)?;
-    Ok(serde_json::from_str(&value.string())?)
+    let certificate_attrs: CertAttrs = serde_json::from_str(&value.string())?;
+    let node_id = certificate_attrs.node_id.ok_or_else(|| {
+        anyhow!(
+            "Peer certificate does not bind a numeric node identity; rotate this legacy certificate"
+        )
+    })?;
+    if node_id == 0 {
+        return Err(anyhow!(
+            "Peer certificate contains reserved node identity 0"
+        ));
+    }
+    if node_id > crate::distributed::MAX_NODE_ID {
+        return Err(anyhow!(
+            "Peer certificate node identity exceeds the compact distributed ID range"
+        ));
+    }
+    Ok(VerifiedPeer {
+        node_id: VerifiedNodeId(node_id),
+        certificate_attrs,
+    })
 }
 
 fn read_certificate(pem: &str) -> Result<CertificateDer<'static>> {
@@ -436,7 +520,14 @@ async fn handle_quic_connection_registry(
     _connection_permit: OwnedSemaphorePermit,
 ) -> Result<()> {
     let conn = conn.await?;
-    get_cert_attrs(&conn)?;
+    let peer = get_verified_peer(&conn)?;
+    let peer_node_id = peer.node_id;
+    if !client.is_active_node(peer_node_id.get()) {
+        distributed::audit_verified_peer_protocol_denial(peer_node_id);
+        return Err(anyhow!(
+            "Authenticated peer is not an active topology member"
+        ));
+    }
     loop {
         match conn.accept_uni().await {
             Ok(mut recv) => {
@@ -448,6 +539,7 @@ async fn handle_quic_connection_registry(
                 tokio::spawn(handle_quic_stream_registry(
                     client.clone(),
                     recv,
+                    peer_node_id,
                     receive_budget.clone(),
                     stream_permit,
                 ));
@@ -462,6 +554,7 @@ async fn handle_quic_connection_registry(
 async fn handle_quic_stream_registry(
     client: distributed::Client,
     recv: quinn::RecvStream,
+    peer_node_id: VerifiedNodeId,
     receive_budget: Arc<ReceiveBudget>,
     _stream_permit: OwnedSemaphorePermit,
 ) {
@@ -474,7 +567,10 @@ async fn handle_quic_stream_registry(
             async move {
                 match request {
                     distributed::message::Request::Registry { node_id, message } => {
-                        if let Err(error) = client.handle_registry_message(node_id, message).await {
+                        if let Err(error) = client
+                            .handle_registry_message(peer_node_id, node_id, message)
+                            .await
+                        {
                             log::warn!("Error handling registry coordination message: {error}");
                         }
                     }
@@ -523,8 +619,15 @@ where
 {
     log::info!("New node connection");
     let conn = conn.await?;
-    let node_cert_attrs = get_cert_attrs(&conn)?;
-    let node_permissions = Arc::new(NodeEnvPermission::new(node_cert_attrs));
+    let peer = get_verified_peer(&conn)?;
+    if !ctx.node_client.is_active_node(peer.node_id.get()) {
+        distributed::audit_verified_peer_protocol_denial(peer.node_id);
+        return Err(anyhow!(
+            "Authenticated peer is not an active topology member"
+        ));
+    }
+    let peer_node_id = peer.node_id;
+    let node_permissions = Arc::new(NodeEnvPermission::new(peer.certificate_attrs));
     log::info!("Remote {} connected", conn.remote_address());
     loop {
         if let Some(reason) = conn.close_reason() {
@@ -543,6 +646,7 @@ where
                 tokio::spawn(handle_quic_stream_node(
                     ctx.clone(),
                     recv,
+                    peer_node_id,
                     node_permissions.clone(),
                     receive_budget.clone(),
                     stream_permit,
@@ -562,6 +666,7 @@ where
 async fn handle_quic_stream_node<T, E>(
     ctx: distributed::server::ServerCtx<T, E>,
     recv: quinn::RecvStream,
+    peer_node_id: VerifiedNodeId,
     node_permissions: Arc<NodeEnvPermission>,
     receive_budget: Arc<ReceiveBudget>,
     _stream_permit: OwnedSemaphorePermit,
@@ -584,7 +689,14 @@ async fn handle_quic_stream_node<T, E>(
             let ctx = ctx.clone();
             let node_permissions = node_permissions.clone();
             async move {
-                distributed::server::handle_message(ctx, msg_id, request, node_permissions).await;
+                distributed::server::handle_message(
+                    ctx,
+                    msg_id,
+                    request,
+                    peer_node_id,
+                    node_permissions,
+                )
+                .await;
             }
         },
     )
@@ -1358,7 +1470,68 @@ async fn handle_request_stream_with_budget<F, Fut>(
 
 #[cfg(test)]
 mod tests {
+    use rcgen::{CertificateParams, CustomExtension};
+
     use super::*;
+
+    fn signed_peer_certificate(node_id: Option<u64>) -> CertificateDer<'static> {
+        let authority = crate::control::cert::test_root_cert().unwrap();
+        let request = crate::distributed::server::gen_node_cert("verified-peer.test").unwrap();
+        let certificate = crate::control::cert::sign_node_certificate(
+            &request.serialize_request_pem().unwrap(),
+            &authority,
+            "verified-peer.test",
+            &CertAttrs {
+                node_id,
+                allowed_envs: vec![11],
+                is_privileged: false,
+            },
+        )
+        .unwrap();
+        read_certificate(&certificate).unwrap()
+    }
+
+    fn unchecked_signed_peer_certificate(node_id: u64) -> CertificateDer<'static> {
+        let authority = crate::control::cert::test_root_cert().unwrap();
+        let mut params = CertificateParams::new(vec!["verified-peer.test".into()]).unwrap();
+        let attrs = serde_json::to_vec(&CertAttrs {
+            node_id: Some(node_id),
+            allowed_envs: vec![11],
+            is_privileged: false,
+        })
+        .unwrap();
+        let mut encoded = vec![0x0c, attrs.len() as u8];
+        encoded.extend_from_slice(&attrs);
+        params
+            .custom_extensions
+            .push(CustomExtension::from_oid_content(
+                &crate::SUBJECT_DIR_ATTRS,
+                encoded,
+            ));
+        let request = crate::control::cert::CertificateRequest::new(params).unwrap();
+        read_certificate(&request.serialize_pem_with_signer(&authority).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn signed_node_identity_is_required_and_reserved_zero_is_rejected() {
+        let peer = verified_peer_from_certificate(&signed_peer_certificate(Some(7))).unwrap();
+        assert_eq!(peer.node_id.get(), 7);
+        assert_eq!(peer.certificate_attrs.allowed_envs, vec![11]);
+
+        let legacy_error =
+            verified_peer_from_certificate(&signed_peer_certificate(None)).unwrap_err();
+        assert!(legacy_error.to_string().contains("legacy certificate"));
+
+        let zero_error =
+            verified_peer_from_certificate(&unchecked_signed_peer_certificate(0)).unwrap_err();
+        assert!(zero_error.to_string().contains("reserved node identity 0"));
+
+        let range_error = verified_peer_from_certificate(&unchecked_signed_peer_certificate(
+            crate::distributed::MAX_NODE_ID + 1,
+        ))
+        .unwrap_err();
+        assert!(range_error.to_string().contains("compact distributed ID"));
+    }
 
     fn valid_chunk(message_id: u64, message_size: usize, chunk_id: u64, byte: u8) -> Chunk {
         let offset = usize::try_from(chunk_id).unwrap() * MESSAGE_CHUNK_SIZE;

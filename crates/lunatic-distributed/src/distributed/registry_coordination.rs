@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex, Notify};
 
+use crate::quic::VerifiedNodeId;
+
 const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY_INTERVAL: Duration = Duration::from_millis(100);
 const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1090,11 +1092,12 @@ impl RegistryCoordinator {
     }
 
     /// Dispatch one registry protocol message received from QUIC.
-    pub async fn handle_message(
+    pub(crate) async fn handle_message(
         &self,
-        source_node_id: u64,
+        source_node_id: VerifiedNodeId,
         message: RegistryCoordinationMessage,
     ) -> Result<()> {
+        let source_node_id = source_node_id.get();
         match message {
             RegistryCoordinationMessage::GlobalRegisterRequest {
                 request_id,
@@ -1105,7 +1108,7 @@ impl RegistryCoordinator {
                 if source_node_id != requesting_node_id
                     || global_pid.node_id() != requesting_node_id
                 {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry request source or owner did not match requesting node"
                     ));
@@ -1131,7 +1134,7 @@ impl RegistryCoordinator {
                 global_pid,
             } => {
                 if source_node_id != self.leader()? || global_pid.node_id() != requesting_node_id {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry prepare did not come from the coordinator or named owner"
                     ));
@@ -1147,7 +1150,7 @@ impl RegistryCoordinator {
                 result,
             } => {
                 if source_node_id != responding_node_id {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry response source did not match responding node"
                     ));
@@ -1156,24 +1159,26 @@ impl RegistryCoordinator {
                     self.record_vote(requesting_node_id, request_id, responding_node_id, result,),
                     RecordVoteOutcome::NonMember
                 ) {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!("Registry vote came from a nonmember"));
                 }
             }
             RegistryCoordinationMessage::GlobalRegisterDecision { request_id, result } => {
-                let pending = lock_unpoisoned(&self.pending_callers).remove(&request_id);
-                let Some(pending) = pending else {
+                let expected_coordinator = lock_unpoisoned(&self.pending_callers)
+                    .get(&request_id)
+                    .map(|pending| pending.coordinator_node_id);
+                let Some(expected_coordinator) = expected_coordinator else {
                     return Ok(());
                 };
-                if source_node_id != pending.coordinator_node_id
-                    || source_node_id != self.leader()?
-                {
-                    self.audit_protocol_denial();
+                if source_node_id != expected_coordinator || source_node_id != self.leader()? {
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry decision did not come from the expected coordinator"
                     ));
                 }
-                let _ = pending.sender.send(result);
+                if let Some(pending) = lock_unpoisoned(&self.pending_callers).remove(&request_id) {
+                    let _ = pending.sender.send(result);
+                }
             }
             RegistryCoordinationMessage::GlobalRegisterNotify {
                 name,
@@ -1182,7 +1187,7 @@ impl RegistryCoordinator {
             } => {
                 let members = self.members()?;
                 if source_node_id != members[0] || !members.contains(&global_pid.node_id()) {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry commit did not come from the coordinator or names an inactive owner"
                     ));
@@ -1199,7 +1204,7 @@ impl RegistryCoordinator {
                     || expected_global_pid.node_id() != requesting_node_id
                     || self.leader()? != self.node_id
                 {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!("Invalid global unregistration request"));
                 }
                 let response = self
@@ -1213,26 +1218,30 @@ impl RegistryCoordinator {
                 self.send_to(requesting_node_id, response).await?;
             }
             RegistryCoordinationMessage::GlobalUnregisterResponse { request_id, result } => {
-                let pending = lock_unpoisoned(&self.pending_unregisters).remove(&request_id);
-                let Some(pending) = pending else {
+                let expected_coordinator = lock_unpoisoned(&self.pending_unregisters)
+                    .get(&request_id)
+                    .map(|pending| pending.coordinator_node_id);
+                let Some(expected_coordinator) = expected_coordinator else {
                     return Ok(());
                 };
-                if source_node_id != pending.coordinator_node_id
-                    || source_node_id != self.leader()?
-                {
-                    self.audit_protocol_denial();
+                if source_node_id != expected_coordinator || source_node_id != self.leader()? {
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry unregistration response did not come from the expected coordinator"
                     ));
                 }
-                let _ = pending.sender.send(result);
+                if let Some(pending) =
+                    lock_unpoisoned(&self.pending_unregisters).remove(&request_id)
+                {
+                    let _ = pending.sender.send(result);
+                }
             }
             RegistryCoordinationMessage::GlobalUnregisterNotify {
                 name,
                 expected_global_pid,
             } => {
                 if source_node_id != self.leader()? {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!(
                         "Registry unregistration did not come from the coordinator"
                     ));
@@ -1244,7 +1253,7 @@ impl RegistryCoordinator {
                 requesting_node_id,
             } => {
                 if source_node_id != requesting_node_id || self.leader()? != self.node_id {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!("Invalid registry synchronization request"));
                 }
                 let response = self.handle_sync_request(request_id, requesting_node_id);
@@ -1254,19 +1263,31 @@ impl RegistryCoordinator {
                 request_id,
                 global_entries,
             } => {
-                let pending = lock_unpoisoned(&self.pending_syncs).remove(&request_id);
-                let Some(pending) = pending else {
-                    return Ok(());
+                // Serialize topology reconciliation with pending validation, removal, and
+                // snapshot application. A duplicate response or cancellation must never apply a
+                // snapshot after another task has already removed the corresponding waiter.
+                let (pending, apply_result) = {
+                    let _topology_guard = lock_unpoisoned(&self.topology_fence);
+                    let mut pending_syncs = lock_unpoisoned(&self.pending_syncs);
+                    let Some(expected_coordinator) = pending_syncs
+                        .get(&request_id)
+                        .map(|pending| pending.coordinator_node_id)
+                    else {
+                        return Ok(());
+                    };
+                    if source_node_id != expected_coordinator || source_node_id != self.leader()? {
+                        self.audit_protocol_denial(source_node_id);
+                        return Err(anyhow!(
+                            "Registry snapshot did not come from the expected coordinator"
+                        ));
+                    }
+                    let pending = pending_syncs.remove(&request_id).ok_or_else(|| {
+                        anyhow!("Registry synchronization waiter disappeared during validation")
+                    })?;
+                    drop(pending_syncs);
+                    let apply_result = self.handle_sync_response(global_entries);
+                    (pending, apply_result)
                 };
-                if source_node_id != pending.coordinator_node_id
-                    || source_node_id != self.leader()?
-                {
-                    self.audit_protocol_denial();
-                    return Err(anyhow!(
-                        "Registry snapshot did not come from the expected coordinator"
-                    ));
-                }
-                let apply_result = self.handle_sync_response(global_entries);
                 let waiter_result = match &apply_result {
                     Ok(()) => Ok(()),
                     Err(error) if error.downcast_ref::<RegistryCapacityError>().is_some() => {
@@ -1279,7 +1300,7 @@ impl RegistryCoordinator {
             }
             RegistryCoordinationMessage::RegistryHeartbeat { node_id, .. } => {
                 if source_node_id != node_id {
-                    self.audit_protocol_denial();
+                    self.audit_protocol_denial(source_node_id);
                     return Err(anyhow!("Registry heartbeat source did not match node id"));
                 }
             }
@@ -1531,8 +1552,8 @@ impl RegistryCoordinator {
         self.registry.remove_node_registrations(failed_node_id)
     }
 
-    fn audit_protocol_denial(&self) {
-        emit_audit_event(protocol_denial_event(self.node_id));
+    fn audit_protocol_denial(&self, verified_remote_node_id: u64) {
+        emit_audit_event(protocol_denial_event(verified_remote_node_id));
     }
 
     fn audit_registry_event(
@@ -1598,13 +1619,13 @@ fn stable_name_hash(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn protocol_denial_event(local_node_id: u64) -> AuditEventV1 {
+fn protocol_denial_event(verified_remote_node_id: u64) -> AuditEventV1 {
     AuditEventV1::new(
         AuditEvent::DistributedRequestAuthorization,
         AuditAction::Validate,
         AuditResult::Denied,
         AuditReason::ProtocolDenied,
-        AuditSubject::new().with_node_id(local_node_id),
+        AuditSubject::new().with_node_id(verified_remote_node_id),
         AuditTarget::new(AuditTargetKind::DistributedRequest)
             .with_sensitive_data(SensitiveData::Redacted),
     )
@@ -1667,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn protocol_denial_event_omits_unverified_remote_identity() {
+    fn protocol_denial_event_uses_verified_remote_identity() {
         let event = protocol_denial_event(7);
 
         assert_eq!(event.result(), AuditResult::Denied);

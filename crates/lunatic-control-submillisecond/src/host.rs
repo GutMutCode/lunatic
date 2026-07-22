@@ -20,6 +20,29 @@ mod api {
             csr_pem_len: u32,
             len_ptr: *mut u32,
         ) -> u32;
+        pub fn sign_node_for_id(
+            cert_pem_ptr: *const u8,
+            cert_pem_len: u32,
+            key_pair_pem_ptr: *const u8,
+            key_pair_pem_len: u32,
+            csr_pem_ptr: *const u8,
+            csr_pem_len: u32,
+            node_name_ptr: *const u8,
+            node_name_len: u32,
+            node_id: u64,
+            len_ptr: *mut u32,
+        ) -> u32;
+        pub fn sign_node_for_name(
+            cert_pem_ptr: *const u8,
+            cert_pem_len: u32,
+            key_pair_pem_ptr: *const u8,
+            key_pair_pem_len: u32,
+            csr_pem_ptr: *const u8,
+            csr_pem_len: u32,
+            node_name_ptr: *const u8,
+            node_name_len: u32,
+            len_ptr: *mut u32,
+        ) -> u32;
     }
 }
 
@@ -57,6 +80,52 @@ pub fn sign_node(cert_pem: &str, pk_pem: &str, csr_pem: &str) -> String {
             pk_pem.len() as u32,
             csr_pem.as_ptr(),
             csr_pem.len() as u32,
+            len_ptr,
+        )
+    })
+    .unwrap()
+}
+
+pub fn sign_node_for_name(
+    cert_pem: &str,
+    pk_pem: &str,
+    csr_pem: &str,
+    node_name: &str,
+) -> String {
+    call_host_alloc(|len_ptr| unsafe {
+        api::sign_node_for_name(
+            cert_pem.as_ptr(),
+            cert_pem.len() as u32,
+            pk_pem.as_ptr(),
+            pk_pem.len() as u32,
+            csr_pem.as_ptr(),
+            csr_pem.len() as u32,
+            node_name.as_ptr(),
+            node_name.len() as u32,
+            len_ptr,
+        )
+    })
+    .unwrap()
+}
+
+pub fn sign_node_for_id(
+    cert_pem: &str,
+    pk_pem: &str,
+    csr_pem: &str,
+    node_name: &str,
+    node_id: u64,
+) -> String {
+    call_host_alloc(|len_ptr| unsafe {
+        api::sign_node_for_id(
+            cert_pem.as_ptr(),
+            cert_pem.len() as u32,
+            pk_pem.as_ptr(),
+            pk_pem.len() as u32,
+            csr_pem.as_ptr(),
+            csr_pem.len() as u32,
+            node_name.as_ptr(),
+            node_name.len() as u32,
+            node_id,
             len_ptr,
         )
     })

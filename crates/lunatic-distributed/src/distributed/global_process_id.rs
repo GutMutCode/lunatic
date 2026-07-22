@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Largest node identity preserved by the public compact global-process-ID encoding.
+pub const MAX_NODE_ID: u64 = 0xFF_FFFF_FFFF;
+
 /// Global process identifier that provides location transparency across distributed nodes
 ///
 /// Format: (node_id, environment_id, process_id)
@@ -58,7 +61,7 @@ impl GlobalProcessId {
     /// Decode from compact u128 format
     pub fn from_compact(compact: u128) -> Self {
         Self {
-            node_id: ((compact >> 88) & 0xFF_FFFF_FFFF) as u64,
+            node_id: ((compact >> 88) & MAX_NODE_ID as u128) as u64,
             environment_id: ((compact >> 48) & 0xFF_FFFF_FFFF) as u64,
             process_id: (compact & 0xFFFF_FFFF_FFFF) as u64,
         }

@@ -23,10 +23,11 @@ use tokio::sync::{
 use crate::{
     congestion::{self, node_connection_manager, MessageChunk, NodeConnectionManager},
     control,
+    distributed::audit_verified_peer_protocol_denial,
     distributed::message::{Request, ResponseContent, Spawn},
     distributed::registry::{DistributedRegistry, ProcessName, RegistryLimits},
     distributed::registry_coordination::{RegistryCoordinationMessage, RegistryCoordinator},
-    quic,
+    quic::{self, VerifiedNodeId},
 };
 
 use super::message::Response;
@@ -455,7 +456,21 @@ pub(crate) fn test_outbound_lease(bytes: usize) -> (OutboundMessageLease, Outbou
     (lease, OutboundBudgetProbe { budget })
 }
 
-type IncomingResponse = (AsyncCell<ResponseContent>, Instant);
+struct IncomingResponse {
+    expected_node: NodeId,
+    response: AsyncCell<ResponseContent>,
+    created_at: Instant,
+}
+
+impl IncomingResponse {
+    fn new(expected_node: NodeId) -> Self {
+        Self {
+            expected_node,
+            response: AsyncCell::new(),
+            created_at: Instant::now(),
+        }
+    }
+}
 
 /// Removes a response waiter if the operation is cancelled or returns early.
 ///
@@ -470,8 +485,9 @@ impl<'a> ResponseWaiterGuard<'a> {
     fn insert(
         responses: &'a DashMap<MessageId, Arc<IncomingResponse>>,
         message_id: MessageId,
+        expected_node: NodeId,
     ) -> Self {
-        responses.insert(message_id, Arc::new((AsyncCell::new(), Instant::now())));
+        responses.insert(message_id, Arc::new(IncomingResponse::new(expected_node)));
         Self {
             responses,
             message_id,
@@ -599,7 +615,7 @@ pub struct Inner {
     // Holds the message while its being chunked
     pub in_progress: DashMap<(EnvironmentId, ProcessId), MessageCtx>,
     pub(crate) nodes_queues: DashMap<NodeId, NodeQueue>,
-    pub responses: DashMap<MessageId, Arc<IncomingResponse>>,
+    responses: DashMap<MessageId, Arc<IncomingResponse>>,
     pub response_tx: Sender<(MessageId, ResponseContent)>,
     registry_cleanup_tx: Sender<super::GlobalProcessId>,
     registry_cleanup_pending: Mutex<HashMap<super::GlobalProcessId, RegistryCleanupRetry>>,
@@ -716,6 +732,10 @@ impl Client {
         self.inner.control_client.node_ids()
     }
 
+    pub(crate) fn is_active_node(&self, node_id: u64) -> bool {
+        self.inner.control_client.node_info(node_id).is_some()
+    }
+
     /// Register a cluster-wide process name through the registry quorum.
     pub async fn register_global(
         &self,
@@ -766,15 +786,28 @@ impl Client {
         let message_id = self.next_message_id().0;
         self.inner
             .node_client
-            .send_message(node.address, &node.name, message_id, data.into())
+            .send_message(node.address, &node.name, node.id, message_id, data.into())
             .await
     }
 
-    pub async fn handle_registry_message(
+    pub(crate) async fn handle_registry_message(
         &self,
-        source_node_id: u64,
+        source_node_id: VerifiedNodeId,
+        claimed_node_id: u64,
         message: RegistryCoordinationMessage,
     ) -> Result<()> {
+        if !self.is_active_node(source_node_id.get()) {
+            audit_verified_peer_protocol_denial(source_node_id);
+            return Err(anyhow!(
+                "Authenticated registry peer is not an active topology member"
+            ));
+        }
+        if claimed_node_id != source_node_id.get() {
+            audit_verified_peer_protocol_denial(source_node_id);
+            return Err(anyhow!(
+                "Registry request source did not match authenticated peer"
+            ));
+        }
         self.inner
             .coordinator
             .handle_message(source_node_id, message)
@@ -1168,7 +1201,7 @@ impl Client {
         let message_id = self.next_message_id();
         // Install the waiter before outbound admission. A fast receiver can
         // otherwise return the mailbox result before this node can correlate it.
-        let _waiter = ResponseWaiterGuard::insert(&self.inner.responses, message_id);
+        let _waiter = ResponseWaiterGuard::insert(&self.inner.responses, message_id, node);
         if let Err(error) = self
             .new_message(message_id, source_env, src, node, dest, serialized)
             .await
@@ -1227,7 +1260,7 @@ impl Client {
         let message_id = self.next_message_id();
         self.inner
             .responses
-            .insert(message_id, Arc::new((AsyncCell::new(), Instant::now())));
+            .insert(message_id, Arc::new(IncomingResponse::new(params.node)));
         if let Err(error) = self
             .new_message(
                 message_id,
@@ -1265,11 +1298,31 @@ impl Client {
     }
 
     // Receive response
-    pub async fn recv_response(&self, response: Response) {
+    pub(crate) async fn recv_response(
+        &self,
+        source_node_id: VerifiedNodeId,
+        response: Response,
+    ) -> Result<()> {
+        let message_id = MessageId(response.message_id);
+        let Some(waiter) = self.inner.responses.get(&message_id) else {
+            log::warn!(
+                "Dropping distributed response for unknown message {}",
+                message_id.0
+            );
+            return Ok(());
+        };
+        if waiter.expected_node.0 != source_node_id.get() {
+            drop(waiter);
+            audit_verified_peer_protocol_denial(source_node_id);
+            return Err(anyhow!(
+                "Distributed response source did not match the expected authenticated peer"
+            ));
+        }
+        drop(waiter);
         if let Err(error) = self
             .inner
             .response_tx
-            .send((MessageId(response.message_id), response.content))
+            .send((message_id, response.content))
             .await
         {
             let (message_id, _) = error.0;
@@ -1278,6 +1331,7 @@ impl Client {
                 message_id.0
             );
         }
+        Ok(())
     }
 
     pub async fn await_response(&self, message_id: MessageId) -> Result<ResponseContent> {
@@ -1288,7 +1342,7 @@ impl Client {
             .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| anyhow!("message does not exist"))?;
         // Never retain a DashMap shard guard while waiting for a remote response.
-        let response = response_cell.0.take().await;
+        let response = response_cell.response.take().await;
         self.inner.responses.remove(&message_id);
         Ok(response)
     }
@@ -1443,7 +1497,7 @@ fn deliver_response(
     response: ResponseContent,
 ) -> bool {
     if let Some(cell) = responses.get(&message_id) {
-        cell.0.set(response);
+        cell.response.set(response);
         true
     } else {
         log::warn!(
@@ -1461,13 +1515,13 @@ fn expire_responses(
 ) {
     let mut completed = Vec::new();
     for entry in responses.iter() {
-        if now.saturating_duration_since(entry.1) <= timeout {
+        if now.saturating_duration_since(entry.created_at) <= timeout {
             continue;
         }
-        if entry.0.is_set() {
+        if entry.response.is_set() {
             completed.push(*entry.key());
         } else {
-            entry.0.set(ResponseContent::Error(
+            entry.response.set(ResponseContent::Error(
                 crate::distributed::message::ClientError::ResponseTimeout,
             ));
         }
@@ -2297,11 +2351,16 @@ mod tests {
         let now = Instant::now();
         let stale_completed = MessageId(1);
         let stale_pending = MessageId(2);
-        let completed = Arc::new((
-            AsyncCell::new_with(ResponseContent::Sent),
-            now - Duration::from_secs(10),
-        ));
-        let pending = Arc::new((AsyncCell::new(), now - Duration::from_secs(10)));
+        let completed = Arc::new(IncomingResponse {
+            expected_node: NodeId(2),
+            response: AsyncCell::new_with(ResponseContent::Sent),
+            created_at: now - Duration::from_secs(10),
+        });
+        let pending = Arc::new(IncomingResponse {
+            expected_node: NodeId(2),
+            response: AsyncCell::new(),
+            created_at: now - Duration::from_secs(10),
+        });
         responses.insert(stale_completed, completed);
         responses.insert(stale_pending, pending.clone());
 
@@ -2309,9 +2368,40 @@ mod tests {
 
         assert!(!responses.contains_key(&stale_completed));
         assert!(responses.contains_key(&stale_pending));
-        assert!(pending.0.is_set(), "pending waiter must receive a timeout");
+        assert!(
+            pending.response.is_set(),
+            "pending waiter must receive a timeout"
+        );
 
         expire_responses(&responses, now, Duration::from_secs(5));
         assert!(!responses.contains_key(&stale_pending));
+    }
+
+    #[tokio::test]
+    async fn response_from_wrong_authenticated_node_keeps_expected_waiter() {
+        let client = test_client_without_workers();
+        let message_id = MessageId(77);
+        let waiter = Arc::new(IncomingResponse::new(NodeId(2)));
+        client.inner.responses.insert(message_id, waiter.clone());
+
+        let result = client
+            .recv_response(
+                VerifiedNodeId::for_test(3),
+                Response {
+                    message_id: message_id.0,
+                    content: ResponseContent::Spawned(999),
+                },
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(client.inner.responses.contains_key(&message_id));
+        assert!(!waiter.response.is_set());
+        assert!(deliver_response(
+            &client.inner.responses,
+            message_id,
+            ResponseContent::Spawned(42),
+        ));
+        assert!(waiter.response.is_set());
     }
 }

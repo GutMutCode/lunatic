@@ -1,6 +1,5 @@
 use std::{collections::HashMap, sync::Arc};
 
-use asn1_rs::ToDer;
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Query},
@@ -8,8 +7,7 @@ use axum::{
     Extension, Json, Router,
 };
 use lunatic_control::{api::*, NodeInfo};
-use lunatic_distributed::{control::cert::TEST_ROOT_CERT, CertAttrs, SUBJECT_DIR_ATTRS};
-use rcgen::{CertificateSigningRequestParams, CustomExtension};
+use lunatic_distributed::{control::cert::sign_node_certificate, CertAttrs};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
@@ -26,31 +24,21 @@ pub async fn register(
 
     let control = control.as_ref();
 
-    let mut sign_request =
-        CertificateSigningRequestParams::from_pem(&reg.csr_pem).map_err(|e| {
-            ApiError::custom(
-                "sign_error",
-                format!("Certificate Signing Request invalid pem format: {}", e),
-            )
-        })?;
-    // Add json to custom certificate extension
-    sign_request
-        .params
-        .custom_extensions
-        .push(CustomExtension::from_oid_content(
-            &SUBJECT_DIR_ATTRS,
-            serde_json::to_string(&CertAttrs {
-                allowed_envs: vec![],
-                is_privileged: true,
-            })
-            .map_err(|e| ApiError::log_internal("Error serializing allowed envs to JSON", e))?
-            .to_der_vec()
-            .map_err(|e| ApiError::log_internal("Error serializing allowed envs to der", e))?,
-        ));
-    let cert_pem = sign_request
-        .signed_by(control.ca_cert.issuer())
-        .map_err(|e| ApiError::custom("sign_error", e.to_string()))?
-        .pem();
+    // Registration proves possession of the private key, but the numeric node
+    // identity does not exist until `/started`. This provisional certificate
+    // is replaced before it can be used for node-to-node QUIC.
+    let node_name = reg.node_name.hyphenated().to_string();
+    let cert_pem = sign_node_certificate(
+        &reg.csr_pem,
+        &control.ca_cert,
+        &node_name,
+        &CertAttrs {
+            node_id: None,
+            allowed_envs: vec![],
+            is_privileged: true,
+        },
+    )
+    .map_err(|e| ApiError::custom("sign_error", e.to_string()))?;
 
     let mut authentication_token = [0u8; 32];
     getrandom::getrandom(&mut authentication_token)
@@ -63,7 +51,7 @@ pub async fn register(
         node_name: reg.node_name,
         cert_pem_chain: vec![cert_pem],
         authentication_token,
-        root_cert: TEST_ROOT_CERT.into(),
+        root_cert: control.ca_cert.certificate_pem().to_owned(),
         urls: ControlUrls {
             api_base: format!("http://{host}/"),
             nodes: format!("http://{host}/nodes"),
@@ -96,7 +84,9 @@ pub async fn node_started(
     Json(data): Json<NodeStart>,
 ) -> ApiResponse<NodeStarted> {
     let control = control.as_ref();
-    let (node_id, _node_address) = control.start_node(node_auth.registration_id as u64, data);
+    let (node_id, _node_address, cert_pem) = control
+        .start_node(node_auth.registration_id as u64, data)
+        .map_err(|e| ApiError::custom("sign_error", e.to_string()))?;
 
     log::info!("Node {} started with id {}", node_auth.node_name, node_id);
 
@@ -104,6 +94,7 @@ pub async fn node_started(
 
     ok(NodeStarted {
         node_id: node_id as i64,
+        cert_pem_chain: vec![cert_pem],
     })
 }
 
@@ -214,18 +205,24 @@ mod tests {
     async fn restarting_then_stopping_lists_only_the_current_node() -> anyhow::Result<()> {
         let control = test_control_server()?;
         let registration_id = 7;
+        let node_name = uuid::Uuid::from_u128(7);
         control.registrations.insert(
             registration_id,
             Registered {
-                node_name: uuid::Uuid::nil(),
-                csr_pem: String::new(),
+                node_name,
+                csr_pem: lunatic_distributed::distributed::server::gen_node_cert(
+                    &node_name.hyphenated().to_string(),
+                )?
+                .serialize_request_pem()?,
                 cert_pem: String::new(),
                 authentication_token: String::new(),
             },
         );
 
-        let (old_node_id, _) = control.start_node(registration_id, node_start("127.0.0.1:3001"));
-        let (new_node_id, _) = control.start_node(registration_id, node_start("127.0.0.1:3002"));
+        let (old_node_id, _, old_cert) =
+            control.start_node(registration_id, node_start("127.0.0.1:3001"))?;
+        let (new_node_id, _, new_cert) =
+            control.start_node(registration_id, node_start("127.0.0.1:3002"))?;
 
         let listed = active_nodes(&control, &HashMap::new());
         assert_eq!(
@@ -233,6 +230,15 @@ mod tests {
             vec![new_node_id]
         );
         assert!(control.nodes.get(&old_node_id).unwrap().status >= 2);
+        assert_ne!(old_cert, new_cert);
+        assert_eq!(
+            control
+                .registrations
+                .get(&registration_id)
+                .unwrap()
+                .cert_pem,
+            new_cert
+        );
 
         control.stop_node(registration_id);
 

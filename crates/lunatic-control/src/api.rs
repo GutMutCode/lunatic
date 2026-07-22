@@ -57,6 +57,12 @@ pub struct NodeStart {
 pub struct NodeStarted {
     // TODO u64 ids should be JSON string but parsed into u64?
     pub node_id: i64,
+    /// Certificate chain reissued for the newly allocated node identity.
+    ///
+    /// The default keeps response parsing compatible with older control
+    /// servers; distributed clients deliberately reject an empty chain.
+    #[serde(default)]
+    pub cert_pem_chain: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -424,7 +424,7 @@ pub async fn node_connection_manager(mut manager: NodeConnectionManager) -> Resu
         // Setup conn or fail
         let conn = match manager
             .client
-            .try_connect(node_info.address, &node_info.name, 3)
+            .try_connect_node(node_info.address, &node_info.name, node_info.id, 3)
             .await
         {
             Ok(conn) => conn,

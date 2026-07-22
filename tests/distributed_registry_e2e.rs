@@ -11,7 +11,12 @@ use lunatic_control::{
 };
 use lunatic_distributed::{
     control::{self, cert::CertificateAuthority},
-    distributed::{server::ServerCtx, Client, GlobalProcessId},
+    distributed::{
+        client::{EnvironmentId, NodeId, ProcessId, SpawnParams},
+        message::{self, Request, Response, ResponseContent, Spawn},
+        server::ServerCtx,
+        Client, GlobalProcessId,
+    },
     quic, CertAttrs, DistributedProcessState, SUBJECT_DIR_ATTRS,
 };
 use lunatic_process::{
@@ -29,7 +34,7 @@ use lunatic_runtime::{DefaultProcessConfig, DefaultProcessState};
 use quinn::{Endpoint, VarInt};
 use rcgen::{CertificateParams, CustomExtension, DnType};
 use tokio::{
-    sync::{mpsc, RwLock},
+    sync::{mpsc, Mutex, RwLock},
     task::JoinHandle,
     time::timeout,
 };
@@ -39,6 +44,10 @@ const ENVIRONMENT_ID: u64 = 41;
 const SERVICE_NAME: &str = "guest-service";
 const CROSS_ENVIRONMENT_NAME: &str = "cross-environment";
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+// The distributed connection manager keys peers by numeric node ID. Keep the
+// independent localhost clusters in this file from overlapping those IDs.
+static TEST_CLUSTER_LOCK: Mutex<()> = Mutex::const_new(());
 
 const REGISTRY_GUEST: &str = r#"
 (module
@@ -189,6 +198,10 @@ impl Process for TagObserver {
 }
 
 struct TestNode {
+    name: String,
+    address: std::net::SocketAddr,
+    cert: String,
+    key: String,
     client: Client,
     distributed: DistributedProcessState,
     envs: LunaticEnvironments,
@@ -197,6 +210,7 @@ struct TestNode {
 }
 
 struct TestCluster {
+    root_cert: String,
     nodes: Vec<TestNode>,
     runtime: WasmtimeRuntime,
     module: Arc<WasmtimeCompiledModule<DefaultProcessState>>,
@@ -210,7 +224,7 @@ impl TestCluster {
 
         for id in 1..=node_count as u64 {
             let name = format!("guest-node-{id}.lunatic.test");
-            let (cert, key) = node_certificate(&root, &name)?;
+            let (cert, key) = node_certificate(&root, &name, id)?;
             let endpoint =
                 quic::new_quic_server("[::1]:0".parse()?, vec![cert.clone()], &key, &root_cert)?;
             let address = endpoint.local_addr()?;
@@ -232,7 +246,7 @@ impl TestCluster {
         ))?);
         let mut nodes = Vec::with_capacity(node_count);
 
-        for (id, _name, _address, cert, key, mut endpoint) in materials {
+        for (id, name, address, cert, key, mut endpoint) in materials {
             let control_client = control::Client::from_static_nodes(
                 test_registration(id, &root_cert, &cert),
                 id,
@@ -260,6 +274,10 @@ impl TestCluster {
                 }
             });
             nodes.push(TestNode {
+                name,
+                address,
+                cert,
+                key,
                 client,
                 distributed,
                 envs,
@@ -269,6 +287,7 @@ impl TestCluster {
         }
 
         Ok(Self {
+            root_cert,
             nodes,
             runtime,
             module,
@@ -327,6 +346,49 @@ impl TestCluster {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
+
+    async fn stall_node_server(&mut self, index: usize) {
+        if let Some(task) = self.nodes[index].server_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(
+            self.nodes[index].endpoint.is_some(),
+            "stalled node server must keep its QUIC endpoint alive"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    async fn send_request_as(
+        &self,
+        source_index: usize,
+        target_index: usize,
+        wire_message_id: u64,
+        request: Request,
+    ) -> Result<()> {
+        self.send_requests_as(source_index, target_index, vec![(wire_message_id, request)])
+            .await
+    }
+
+    async fn send_requests_as(
+        &self,
+        source_index: usize,
+        target_index: usize,
+        requests: Vec<(u64, Request)>,
+    ) -> Result<()> {
+        let source = &self.nodes[source_index];
+        let target = &self.nodes[target_index];
+        let raw_client = quic::new_quic_client(&self.root_cert, &source.cert, &source.key)?;
+        let connection = raw_client._connect(target.address, &target.name).await?;
+        let mut stream = connection.open_uni().await?;
+        for (wire_message_id, request) in requests {
+            let data = message::serialize_message(&request)?;
+            quic::write_message(&mut stream, wire_message_id, data.into()).await?;
+        }
+        stream.finish()?;
+        let _ = stream.stopped().await?;
+        Ok(())
+    }
 }
 
 impl Drop for TestCluster {
@@ -378,13 +440,18 @@ fn send_trigger(process: &Arc<dyn Process>, tag: i64) -> Result<()> {
         .map_err(|error| anyhow!(error.to_string()))
 }
 
-fn node_certificate(root: &CertificateAuthority, name: &str) -> Result<(String, String)> {
+fn node_certificate(
+    root: &CertificateAuthority,
+    name: &str,
+    node_id: u64,
+) -> Result<(String, String)> {
     let mut params = CertificateParams::new(vec![name.to_string()])?;
     params
         .distinguished_name
         .push(DnType::OrganizationName, "Lunatic Inc.");
     params.distinguished_name.push(DnType::CommonName, "Node");
     let attributes = serde_json::to_string(&CertAttrs {
+        node_id: Some(node_id),
         allowed_envs: vec![],
         is_privileged: true,
     })?;
@@ -436,6 +503,7 @@ fn test_registration(node_id: u64, root_cert: &str, cert: &str) -> Registration 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn guest_registry_resolves_a_live_remote_mailbox_and_cleans_up_owner_exit() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
     let cluster = TestCluster::new(2).await?;
 
     // Seed a different-environment entry through the same cluster quorum. The
@@ -510,5 +578,89 @@ async fn guest_registry_resolves_a_live_remote_mailbox_and_cleans_up_owner_exit(
     cluster
         .wait_for_registry(CROSS_ENVIRONMENT_NAME, None)
         .await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn spawn_response_waiter_accepts_only_the_intended_mtls_peer() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
+    let mut cluster = TestCluster::new(3).await?;
+    let barrier_environment = cluster.create_environment(0).await?;
+    let (barrier_process, mut barrier_tags) = add_observer(&barrier_environment)?;
+    cluster.stall_node_server(1).await;
+
+    // Node 1 creates a waiter for a spawn response from node 2. Keeping node
+    // 2's endpoint alive but removing its accept loop prevents a real response
+    // while preserving a reachable topology target.
+    let node_one = cluster.nodes[0].client.clone();
+    let message_id = node_one
+        .spawn(SpawnParams {
+            env: EnvironmentId(ENVIRONMENT_ID),
+            src: ProcessId(7_001),
+            node: NodeId(2),
+            spawn: Spawn {
+                response_node_id: 1,
+                environment_id: ENVIRONMENT_ID,
+                module_id: 1,
+                function: "spoof-target".to_string(),
+                params: Vec::new(),
+                config: Vec::new(),
+            },
+        })
+        .await?;
+
+    // Node 3 knows the message ID but is not the authenticated peer retained
+    // by the waiter. Its response must neither complete nor remove that waiter.
+    cluster
+        .send_requests_as(
+            2,
+            0,
+            vec![
+                (
+                    8_001,
+                    Request::Response(Response {
+                        message_id: message_id.0,
+                        content: ResponseContent::Spawned(999),
+                    }),
+                ),
+                (
+                    8_002,
+                    Request::Message {
+                        node_id: 3,
+                        environment_id: ENVIRONMENT_ID,
+                        process_id: barrier_process.id(),
+                        tag: Some(93),
+                        data: Vec::new(),
+                    },
+                ),
+            ],
+        )
+        .await?;
+    wait_for_tag(&mut barrier_tags, 93).await?;
+    assert!(
+        timeout(
+            Duration::from_millis(50),
+            node_one.await_response(message_id)
+        )
+        .await
+        .is_err(),
+        "spawn waiter accepted a response authenticated as node 3"
+    );
+
+    cluster
+        .send_request_as(
+            1,
+            0,
+            8_003,
+            Request::Response(Response {
+                message_id: message_id.0,
+                content: ResponseContent::Spawned(42),
+            }),
+        )
+        .await?;
+    let response = timeout(Duration::from_secs(2), node_one.await_response(message_id))
+        .await
+        .context("node-2 spawn response did not complete its waiter")??;
+    assert_eq!(response, ResponseContent::Spawned(42));
     Ok(())
 }

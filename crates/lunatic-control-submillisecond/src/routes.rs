@@ -25,7 +25,10 @@ pub fn register(
 ) -> ApiResponse<Registration> {
     info!("Registration for node name {}", reg.node_name);
 
-    let cert_pem = control.sign_node(reg.csr_pem.clone());
+    let cert_pem = control.sign_node_for_name(
+        reg.csr_pem.clone(),
+        reg.node_name.hyphenated().to_string(),
+    );
 
     let mut authentication_token = [0u8; 32];
     getrandom::getrandom(&mut authentication_token).map_err(|err| {
@@ -75,7 +78,8 @@ pub fn node_started(
     ControlServerExtractor(control): ControlServerExtractor,
     JsonExtractor(data): JsonExtractor<NodeStart>,
 ) -> ApiResponse<NodeStarted> {
-    let (node_id, _node_address) = control.start_node(node_auth.registration_id as u64, data);
+    let (node_id, _node_address, cert_pem) =
+        control.start_node(node_auth.registration_id as u64, data);
 
     info!("Node {} started with id {}", node_auth.node_name, node_id);
 
@@ -83,6 +87,7 @@ pub fn node_started(
 
     ok(NodeStarted {
         node_id: node_id as i64,
+        cert_pem_chain: vec![cert_pem],
     })
 }
 

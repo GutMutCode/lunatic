@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-22
 
-Reviewed working tree based on: `c11061cc4c0ab6158a792c7019eac6dfdc4f6d87` plus the reviewed working-tree changes for Hanary #1664
+Reviewed working tree based on: `f472608b1a91154fe511dc9a2c65abb32400ac2a` plus the reviewed working-tree changes for Hanary #1679
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -92,13 +92,14 @@ missing.
 - Production-import integration tests cover default compile/create/spawn/preopen denial, Windows-safe checked escalation errors and rollback, legacy void-setter no-op safety, checked and legacy delegation through actual child spawn, guest-readable returned error IDs, final selected-config validation through both local spawn imports, bounded error resources under repeated denial, sender-side remote-preopen rejection, and typed allowed/denied audit emission (`tests/capability_attenuation.rs`). Receiver tests deserialize and validate configs through the production receive helper (`crates/lunatic-distributed/src/distributed/server.rs`).
 - `AuditEventV1` provides stable enum fields, available process/environment/node identity, typed targets, machine reason codes, and writer-ordered sequence numbers. String-free targets omit paths, endpoints, registry names, credentials, payloads, argv/env values, and raw errors before enqueue. Common tests cover exact JSON, redaction state, concurrent-producer FIFO, queue saturation, disabled/unavailable sinks, writer error/panic, counters, and bounded flush (`crates/lunatic-common-api/src/audit.rs`).
 - Privileged operation boundaries now record compile/config/preopen/WASI directory access, local and distributed spawn, TCP/TLS/UDP/DNS operations, covered resource-limit denials, hot-reload terminal outcomes, distributed-registry changes/snapshots, and distributed authorization denials. Operation-level guards emit one terminal result on success, denial, failure, timeout, or early trap.
+- Distributed mTLS certificates bind a control-plane-issued numeric node ID. Outbound connections verify the intended topology ID, inbound requests fence inactive members and reject mismatched source claims, response waiters require the expected authenticated peer, and registry leader/snapshot decisions consume only the certificate identity. Protocol-denial audit subjects use that verified peer (`crates/lunatic-distributed/src/quic/quin.rs`, `crates/lunatic-distributed/src/distributed/server.rs`, `crates/lunatic-distributed/src/distributed/client.rs`).
 - Networking paths enforce several per-process limits, and Wasmtime uses memory/table resource limiting (`crates/lunatic-networking-api`, `src/state.rs`).
 - A directly tested same-runtime helper can transfer supported live network resource maps between process states without serializing TLS traffic keys. Serialized active TLS restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
 
 ### Boundary
 
 - Filesystem preopens are canonicalized and attenuated locally, but path replacement still has a check/open race. Remote preopens are unavailable until a receiver-controlled path mapping/allowlist is implemented; this is a functionality gap, not an ambient-authority fallback.
-- Distributed receivers apply the fixed default capability and resource ceiling, but operators cannot yet select a stricter per-node policy; fuel has no receiver-owned finite ceiling. mTLS authenticates certificate and permission attributes but does not bind the peer to a signed numeric node ID. Registry control messages still trust a payload-claimed node ID for leader checks, so an authenticated peer can spoof leader-origin messages. Audit authorization records omit that unverified remote ID rather than presenting it as identity.
+- Distributed receivers apply the fixed default capability and resource ceiling, but operators cannot yet select a stricter per-node policy; fuel has no receiver-owned finite ceiling. Identity-bound certificates fail closed across legacy/new mixed data planes, so rollout requires the control plane first and coordinated node endpoint recreation. Membership removal is enforced after each node refreshes its topology view.
 - Every guest-visible TCP/TLS listener or stream and UDP socket owns a paired FD/network lease, and DNS/address iterators are finite. General WASI file handles and network destination policy are not connected to those limits.
 - Local actor ingress and resource transfer are bounded, but aggregate host/cluster memory, CPU, disk, and remote-transport budgets are not closed by one global policy.
 - Audit delivery is best-effort and fail-open: a dedicated writer uses a bounded 1,024-record queue, drops newest on saturation, opens a health circuit on sink failure, exposes counters, and waits at most 250 ms at graceful shutdown. The default sink ends at the enabled Rust `log` facade; it does not prove disk/remote persistence, action-plus-audit atomicity, retention, or tamper evidence. An explicit `RUST_LOG` can still disable `audit=info`, and remaining non-privileged host calls are outside the event inventory.
@@ -110,8 +111,8 @@ missing.
 
 - Process links and monitors, snapshot/signature components, and reload coordination structures exist.
 - `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one monitor notification, removal-before-notification ordering, and native-runner parity.
-- Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, and resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
-- `tests/distributed_registry_e2e.rs` runs two actual Wasm guests on two full node servers. It covers guest registration and replica lookup, confirmed request/reply through live cross-node mailboxes, missing environment/process errors, explicit removal, cross-environment fail-closed lookup, and owner-exit cleanup on both replicas.
+- Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, resynchronization, rejection of a node-2 certificate claiming node 1 for leader notifications, and rejection of a node-2-authenticated synchronization snapshot while node 3 expects coordinator node 1. The latter proves processing with a same-stream response marker before a legitimate node-1 snapshot completes the preserved waiter (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- `tests/distributed_registry_e2e.rs` runs actual Wasm guests on full node servers. It covers guest registration and replica lookup, confirmed request/reply through live cross-node mailboxes, missing environment/process errors, explicit removal, cross-environment fail-closed lookup, and owner-exit cleanup on both replicas. A three-node mTLS case also proves that a spawn waiter expecting node 2 rejects a matching response ID from node 3 without consuming the waiter, then accepts node 2's response.
 - Confirmed sends correlate `Sent`/typed error responses before reporting success, preserve bounded waiter/outbound accounting on timeout or cancellation, and distinguish missing environments, missing processes, receiver backpressure, and oversized/rejected delivery. Owner cleanup retains a bounded retry record with backoff until quorum coordination succeeds.
 - Production QUIC framing has a multi-chunk transport test (`crates/lunatic-distributed/tests/quic_transport.rs`).
 
@@ -177,7 +178,7 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 ## Prioritized Follow-Ups
 
 1. Add an operator-selectable required/fail-closed durable audit sink and health endpoint, then extend the typed inventory to any remaining privileged host boundaries.
-2. Bind each authenticated transport peer to its numeric node ID and reject mismatched claims; then add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
+2. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
 3. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
 4. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
 5. Connect Supervisor monitor intake and OTP guest/runtime adapters.

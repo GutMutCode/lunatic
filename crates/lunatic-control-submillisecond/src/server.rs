@@ -76,7 +76,16 @@ impl ControlServer {
         let modules = store.load_modules()?;
 
         let next_registration_id = registrations.keys().fold(1, |max, k| max.max(k + 1));
-        let next_node_id = nodes.keys().fold(1, |max, k| max.max(k + 1));
+        // Persisted state supplies a monotonic high-water mark. A fresh or reset store starts at
+        // a random positive value so the long-lived bundled CA cannot make a leaf from an older
+        // store generation active again through numeric ID reuse.
+        let next_node_id = match nodes.keys().max() {
+            Some(maximum) => maximum
+                .checked_add(1)
+                .filter(|node_id| *node_id <= lunatic_distributed::distributed::MAX_NODE_ID)
+                .ok_or_else(|| anyhow::anyhow!("distributed node ID space is exhausted"))?,
+            None => fresh_node_id_base()?,
+        };
         let next_module_id = modules.keys().fold(1, |max, k| max.max(k + 1));
 
         Ok(ControlServer {
@@ -106,7 +115,24 @@ impl ControlServer {
     }
 
     #[handle_request]
-    pub fn start_node(&mut self, registration_id: u64, data: NodeStart) -> (u64, String) {
+    pub fn start_node(&mut self, registration_id: u64, data: NodeStart) -> (u64, String, String) {
+        let (csr_pem, node_name) = {
+            let registration = self
+                .registrations
+                .get(&registration_id)
+                .expect("authenticated registration must exist");
+            (
+                registration.csr_pem.clone(),
+                registration.node_name.hyphenated().to_string(),
+            )
+        };
+        let cert_pem = host::sign_node_for_id(
+            &self.ca_cert.cert,
+            &self.ca_cert.pk,
+            &csr_pem,
+            &node_name,
+            self.next_node_id,
+        );
         let (id, node_address, retired_node_ids) = start_node_record(
             &mut self.nodes,
             &mut self.next_node_id,
@@ -116,7 +142,15 @@ impl ControlServer {
         for node_id in retired_node_ids.into_iter().chain(std::iter::once(id)) {
             self.store.add_node(node_id, &self.nodes[&node_id]);
         }
-        (id, node_address)
+
+        let registration = self
+            .registrations
+            .get_mut(&registration_id)
+            .expect("authenticated registration must exist");
+        registration.cert_pem.clone_from(&cert_pem);
+        self.store.add_registration(registration_id, registration);
+
+        (id, node_address, cert_pem)
     }
 
     #[handle_message]
@@ -159,6 +193,18 @@ impl ControlServer {
     pub fn sign_node(&self, csr_pem: String) -> String {
         host::sign_node(&self.ca_cert.cert, &self.ca_cert.pk, &csr_pem)
     }
+
+    #[handle_request]
+    pub fn sign_node_for_name(&self, csr_pem: String, node_name: String) -> String {
+        host::sign_node_for_name(&self.ca_cert.cert, &self.ca_cert.pk, &csr_pem, &node_name)
+    }
+}
+
+fn fresh_node_id_base() -> anyhow::Result<u64> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("failed to generate node ID epoch: {error}"))?;
+    Ok((u64::from_le_bytes(bytes) & lunatic_distributed::distributed::MAX_NODE_ID).max(1))
 }
 
 pub(crate) fn start_node_record(

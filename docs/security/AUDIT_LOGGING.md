@@ -58,13 +58,13 @@ The implemented boundary records:
 
 Events are emitted at one operation boundary. Replica application does not repeat the coordinator's logical registry event, and quota helpers do not emit a second event when their owning network/spawn operation already records the denial.
 
-Receiver authorization events record the verified local node as the subject and
-the requested environment as the target. They deliberately leave the remote
-node identity `null`: the current mTLS certificate attributes authorize
-environment access but do not bind a signed numeric node ID. Registry protocol
-denial events likewise omit the request payload's claimed node ID. Until the
-transport supplies an authenticated peer ID, that payload field is protocol
-input rather than trustworthy audit identity.
+Distributed request-authorization and protocol-denial events record the remote
+node ID extracted from the CA-signed peer certificate as the subject. The
+requested environment remains a typed target where applicable. A redundant
+payload claim is compared with that identity but is never emitted as the audit
+subject, even when the claim is the reason for rejection. Subsequent spawn or
+mailbox execution events can still use the receiving local node as their
+subject because those events describe local work, not peer authentication.
 
 This coverage is intentionally narrower than "every host call." Routine reads/writes, message contents, and non-security diagnostics are not audit events.
 
@@ -132,11 +132,16 @@ cover successful, denied, failed, and redacted outcomes. The live-Wasm reload
 test captures one record for each commit, rollback, in-doubt, and blocked
 attempt. WASI directory tests cover successful access and cancellation-guard
 behavior. Distributed receiver decode/authorization and atomic-admission
-classification are tested at their production helpers, including omission of
-unverified remote identity; a full remote-spawn
-audit capture still depends on the existing QUIC integration path and is not
-claimed as a standalone audit-delivery E2E.
+classification are tested at their production helpers. Identity tests assert
+that the certificate-derived remote ID is the subject and the unverified
+payload claim is not promoted into the target. The mTLS registry integration
+suite also proves that a certificate/payload ID mismatch is rejected before
+registry state changes; a full remote-spawn audit capture is not claimed as a
+standalone audit-delivery E2E.
 
 For deployment routing and the precise external boundary, see [Audit Logging Persistence](./AUDIT_LOGGING_PERSISTENCE.md).
 
-**Last reviewed:** 2026-07-21
+For certificate issuance and rotation, see
+[Distributed Node Identity](../distributed/NODE_IDENTITY.md).
+
+**Last reviewed:** 2026-07-22

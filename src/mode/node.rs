@@ -131,6 +131,9 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     .await?;
 
     let node_id = control_client.node_id();
+    // `/started` rotates the provisional registration certificate to one that
+    // is cryptographically bound to the newly allocated numeric node ID.
+    let reg = control_client.reg();
 
     log::info!("Registration successful, node id {}", node_id);
 
