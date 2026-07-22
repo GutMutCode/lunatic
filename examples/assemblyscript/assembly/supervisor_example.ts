@@ -1,5 +1,9 @@
-// Supervisor pattern implementation in AssemblyScript for Lunatic
-// This demonstrates OTP-style process supervision with restart strategies
+// EDUCATIONAL IN-MEMORY SIMULATION ONLY.
+//
+// WorkerHandle is an ordinary object and failures are invoked manually below.
+// This file does not spawn, link, or monitor Lunatic processes and is not a
+// guest Supervisor adapter. It is intentionally excluded from the default
+// build and E2E verification.
 
 // Restart strategy types
 export enum RestartStrategy {

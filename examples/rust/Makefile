@@ -1,49 +1,30 @@
-.PHONY: build clean test counter echo gen_server all
+.PHONY: all build clean test guest-e2e guest-e2e-test host-examples
 
-BUILD_DIR = build
-TARGET = wasm32-wasip1
+GUEST_E2E_TARGET = wasm32-unknown-unknown
+GUEST_E2E_MANIFEST = guest-e2e/Cargo.toml
+GUEST_E2E_WASM = guest-e2e/target/$(GUEST_E2E_TARGET)/release/lunatic_rust_guest_e2e.wasm
+LUNATIC ?= ../../target/debug/lunatic
+PINNED_CARGO ?= cargo +1.94.0
 
-all: counter echo gen_server
+all: guest-e2e
 
-build: all
+build: guest-e2e
 
-counter: $(BUILD_DIR)/counter.wasm
+test: guest-e2e-test
 
-echo: $(BUILD_DIR)/echo_server.wasm
+guest-e2e: $(GUEST_E2E_WASM)
 
-gen_server: $(BUILD_DIR)/gen_server_example.wasm
+guest-e2e-test: guest-e2e
+	$(LUNATIC) run $(GUEST_E2E_WASM)
 
-$(BUILD_DIR)/counter.wasm: src/counter.rs Cargo.toml
-	@mkdir -p $(BUILD_DIR)
-	cargo build --target=$(TARGET) --release --bin counter
-	cp target/$(TARGET)/release/counter.wasm $(BUILD_DIR)/
-	@echo "✓ Built counter.wasm"
+host-examples:
+	cargo check --locked --manifest-path Cargo.toml
 
-$(BUILD_DIR)/echo_server.wasm: src/echo_server.rs Cargo.toml
-	@mkdir -p $(BUILD_DIR)
-	cargo build --target=$(TARGET) --release --bin echo_server
-	cp target/$(TARGET)/release/echo_server.wasm $(BUILD_DIR)/
-	@echo "✓ Built echo_server.wasm"
-
-$(BUILD_DIR)/gen_server_example.wasm: src/gen_server_example.rs Cargo.toml
-	@mkdir -p $(BUILD_DIR)
-	cargo build --target=$(TARGET) --release --bin gen_server_example
-	cp target/$(TARGET)/release/gen_server_example.wasm $(BUILD_DIR)/
-	@echo "✓ Built gen_server_example.wasm"
+$(GUEST_E2E_WASM): guest-e2e/src/lib.rs guest-e2e/Cargo.toml guest-e2e/Cargo.lock Makefile
+	$(PINNED_CARGO) build --locked --manifest-path $(GUEST_E2E_MANIFEST) --target=$(GUEST_E2E_TARGET) --release
+	@echo "Built $(GUEST_E2E_WASM)"
 
 clean:
-	cargo clean
-	rm -rf $(BUILD_DIR)
-
-test: build
-	@echo "Testing WASM modules..."
-	@if command -v wasm-validate >/dev/null 2>&1; then \
-		wasm-validate $(BUILD_DIR)/counter.wasm && \
-		wasm-validate $(BUILD_DIR)/echo_server.wasm && \
-		wasm-validate $(BUILD_DIR)/gen_server_example.wasm && \
-		echo "✓ All WASM modules are valid"; \
-	else \
-		echo "⚠ wasm-validate not found, skipping validation"; \
-	fi
+	$(PINNED_CARGO) clean --manifest-path $(GUEST_E2E_MANIFEST)
 
 .DEFAULT_GOAL := all

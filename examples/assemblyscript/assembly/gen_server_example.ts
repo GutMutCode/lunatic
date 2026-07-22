@@ -1,5 +1,9 @@
-// GenServer pattern implementation in AssemblyScript for Lunatic
-// This demonstrates OTP-style message passing using TypeScript classes
+// EDUCATIONAL IN-MEMORY SIMULATION ONLY.
+//
+// This file demonstrates the shape of a GenServer-style API with ordinary
+// AssemblyScript objects. It does not import Lunatic host functions, spawn a
+// Lunatic process, use a mailbox, or implement the OTP1 guest wire contract.
+// It is intentionally excluded from the default build and E2E verification.
 
 // Message types for GenServer communication
 export enum CounterRequestType {

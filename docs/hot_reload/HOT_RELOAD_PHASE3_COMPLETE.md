@@ -132,8 +132,8 @@ All APIs compile and have correct signatures.
 ## Example Usage (When Integrated)
 
 ```rust
-// In --watch mode (future)
-lunatic run --watch --hot-reload app.wasm
+// The eventual integration retained --watch as the sole reload flag.
+lunatic run --watch app.wasm
 
 // Or programmatically
 use lunatic::hot_reload;

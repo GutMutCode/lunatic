@@ -273,18 +273,18 @@ test result: ok. 4 passed; 0 failed; 0 ignored
 
 ## Performance Impact
 
-### ✅ Negligible Overhead
+### Overhead Not Quantified in This Phase
 
 **Per Connection**:
 - `can_open_network_connection()`: 1 comparison + 1 increment
-- Overhead: <10ns
+- Overhead: Not measured in this phase
 - Connection setup: ~1-10ms (network I/O dominates)
-- Impact: <0.001% overhead
+- Impact: Requires a production-path benchmark before a percentage can be claimed
 
 **Per Close**:
 - `close_network_connection()`: 1 decrement
-- Overhead: <5ns  
-- Impact: Completely negligible
+- Overhead: Not measured in this phase
+- Impact: Requires measurement
 
 ---
 

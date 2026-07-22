@@ -249,7 +249,8 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - ✅ Supervisor OneForOne, OneForAll, RestForOne, restart policies, intensity limits, ordered shutdown, and escalation are driven by actual process monitor events, including an actual guest-Wasm trap and children that terminate before ordinary monitor intake
 - ✅ GenStatem and GenEvent have native Lunatic-process mailbox/lifecycle adapters
 - ✅ An actual-Wasm OTP1 fixture verifies guest cast, correlated call/reply, timeout, and acknowledged stop over the existing language-neutral message ABI
-- ⚠️ High-level Rust/TinyGo/AssemblyScript guest SDKs, guest-side Supervisor/GenStatem/GenEvent libraries, and distributed OTP integration remain pending
+- ✅ Pinned Rust, TinyGo, and AssemblyScript compiler outputs exercise guest process spawn, tagged message round trip, timeout, and attenuated-child permission denial in CI
+- ⚠️ High-level Rust/TinyGo/AssemblyScript guest SDKs, language-specific OTP1 adapters, guest-side Supervisor/GenStatem/GenEvent libraries, and distributed OTP integration remain pending
 
 ---
 
@@ -345,7 +346,7 @@ Checkboxes in this section represent current production-path verification, not w
 - [x] Node-control bearer boundary (redacted runtime secrets, same-origin transport, redirect/proxy fail-closed behavior, acknowledgement-safe rotation, expiry/revocation, and production-path E2E; remote HTTPS plus enrollment admission remain operator responsibilities and the legacy submillisecond server is quarantined)
 
 ### Developer Experience
-- [ ] Multi-language guest API support (basic Rust, Go, and AssemblyScript build examples exist; equivalent runtime APIs and CI E2E coverage do not)
+- [ ] Multi-language guest API support (a pinned Rust, TinyGo, and AssemblyScript primitive ABI matrix now runs in CI; stable equivalent SDK packages and broad API parity remain open)
 - [ ] Rich ecosystem (libraries in Rust, JS, Go, etc.)
 - [ ] Comprehensive documentation
 - [ ] Production-ready tooling

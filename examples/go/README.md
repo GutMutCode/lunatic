@@ -1,251 +1,117 @@
-# Go (TinyGo) Examples for Lunatic
+# Go (TinyGo) guest examples
 
-This directory contains examples demonstrating how to use Lunatic runtime with Go, compiled to WebAssembly using TinyGo.
+This directory contains one executable Lunatic guest-API scenario and several
+older Go/TinyGo source examples. Only `guest_e2e.go` is runtime-verified: the
+counter is a generic Wasm export example, while the GenServer and Supervisor
+files simulate those patterns with in-module Go state, goroutines, and channels.
 
-## Prerequisites
+## Verified guest scenario
 
-- [TinyGo](https://tinygo.org/) 0.30.0 or later
-- Go 1.21 or later (for module management)
-- Lunatic runtime (built from this repo)
-- Optional: `wasm-validate` from [wabt](https://github.com/WebAssembly/wabt) for testing
+`guest_e2e.go` uses `//go:wasmimport` declarations for the production
+`lunatic::process`, `lunatic::wasi`, `lunatic::message`, and `lunatic::error`
+namespaces. A successful run proves that a TinyGo WASI Preview 1 guest can:
 
-## Why TinyGo?
+1. Create an attenuated child configuration and pass its role through WASI
+   command-line arguments.
+2. Spawn a fresh instance of the same module through its `_start` entry point.
+3. Observe that the child cannot spawn another process and read the returned
+   permission error through an error-resource handle.
+4. Receive timeout status `9027` from an empty mailbox.
+5. Notify its root process with tag `99`, then complete a tagged `41 -> 42`
+   message round trip.
+6. Notify an external observer with completion tag `4202`.
 
-Standard Go compiler doesn't support WASI target yet. TinyGo is a Go compiler designed for embedded systems and WebAssembly, with excellent WASM support.
+The host integration harness supplies the observer process ID as root
+`argv[0]`. When launched directly from the CLI, the filename in that position
+does not parse as an ID, so the guest uses observer ID zero, skips the external
+notification, and prints `GO_GUEST_E2E_OK` after all internal assertions pass.
 
-### Installing TinyGo
+## Toolchain
 
-**macOS:**
-```bash
-brew install tinygo
-```
+The reproducible target requires exactly TinyGo `0.41.1` and emits a core Wasm
+module for WASI Preview 1 (`wasip1`). The Makefile rejects a different TinyGo
+version instead of silently producing an untested artifact. CI also verifies
+the Binaryen `116` optimizer bundled in TinyGo's checksum-verified Linux package.
 
-**Linux:**
-```bash
-wget https://github.com/tinygo-org/tinygo/releases/download/v0.30.0/tinygo_0.30.0_amd64.deb
-sudo dpkg -i tinygo_0.30.0_amd64.deb
-```
+- Go 1.25.5 and TinyGo 0.41.1 (the versions pinned by CI)
+- Lunatic runtime built from this repository
+- GNU Make or an equivalent Make implementation
+- Optional: `wasm-validate` from WABT for an additional structural check
 
-**Verify Installation:**
-```bash
-tinygo version
-# Should output: tinygo version 0.30.0 ...
-```
+Go has had its own `wasip1/wasm` port since Go 1.21, but this example pins
+TinyGo because TinyGo is the compiler whose generated guest is covered by this
+scenario. The `go 1.21` line in `go.mod` is a module language-version floor; it
+does not pin TinyGo.
 
-## Building Examples
+## Build and run
 
-### Using Make (Recommended)
-
-```bash
-cd examples/go
-make build
-```
-
-### Manual Build
-
-```bash
-tinygo build -o build/counter.wasm -target=wasi counter.go
-```
-
-## Running Examples
-
-### Basic Counter
+From this directory:
 
 ```bash
-# From the lunatic repo root
-./target/debug/lunatic run examples/go/build/counter.wasm
+make guest-e2e
 ```
 
-### With Watch Mode
+The equivalent compiler invocation is:
 
 ```bash
-# Terminal 1: Run with watch mode
-./target/debug/lunatic run --watch examples/go/build/counter.wasm
-
-# Terminal 2: Modify and rebuild
-# Edit counter.go (e.g., change increment logic)
-cd examples/go
-make build
-# Watch mode will automatically reload!
-```
-
-## Example Structure
-
-- `counter.go` - Simple counter with various operations
-- `go.mod` - Go module definition
-- `Makefile` - Build automation
-- `build/` - Compiled WASM output (generated)
-
-## Key Concepts Demonstrated
-
-### 1. Export Functions to WASM
-
-```go
-//export increment
-func increment() int32 {
-    counter++
-    return counter
-}
-```
-
-The `//export` comment directive tells TinyGo to export this function to WebAssembly.
-
-### 2. Module Initialization
-
-```go
-//export _start
-func _start() {
-    counter = 0
-    fmt.Println("Go Counter initialized!")
-}
-```
-
-`_start` is called when Lunatic loads the module.
-
-### 3. State Management
-
-```go
-var counter int32 = 0  // Module-level state
-
-//export increment
-func increment() int32 {
-    counter++  // State persists across function calls
-    return counter
-}
-```
-
-### 4. Type Compatibility
-
-TinyGo types map to WASM types:
-- `int32` → `i32`
-- `int64` → `i64`
-- `float32` → `f32`
-- `float64` → `f64`
-- `bool` → `i32` (0 or 1)
-
-## Language-Specific Considerations
-
-### Go/TinyGo vs Rust
-
-**Pros:**
-- Familiar to Go developers
-- Simple syntax
-- Good standard library subset
-- Easier concurrency concepts
-
-**Cons:**
-- Larger WASM binary size (vs Rust)
-- Not all Go standard library available in TinyGo
-- Limited Lunatic API support (manual bindings needed)
-- Slower compilation than standard Go
-
-### TinyGo Limitations
-
-Not all Go features are available:
-- ❌ Full `reflect` package
-- ❌ Some `syscall` functions
-- ❌ CGo
-- ✅ Most of `fmt`, `math`, `strings`
-- ✅ Basic concurrency (goroutines, channels)
-- ✅ Structs, interfaces, methods
-
-### Recommended Use Cases
-
-- ✅ Business logic modules
-- ✅ Data processing
-- ✅ Algorithms and computation
-- ⚠️ Heavy I/O (better in Rust with full Lunatic API)
-- ⚠️ Process management (better in Rust)
-
-## Example Functions
-
-### Counter Operations
-
-```go
-//export increment
-func increment() int32          // Returns counter++
-
-//export get_count
-func get_count() int32           // Returns current value
-
-//export reset
-func reset()                     // Sets counter to 0
-
-//export set_count
-func set_count(value int32)      // Sets counter to value
-
-//export multiply_count
-func multiply_count(factor int32) int32  // Multiplies counter
-
-//export is_even
-func is_even() bool              // Checks if counter is even
-```
-
-### Calling from Lunatic
-
-In the future, you could call these from a Rust process:
-
-```rust
-// Example (not yet implemented in Lunatic)
-let module = lunatic::spawn_module("counter.wasm")?;
-module.call("increment", &[])?;
-let count = module.call("get_count", &[])?;
-```
-
-## Building Optimized WASM
-
-For production, add optimization flags:
-
-```bash
-tinygo build -o build/counter.wasm \
-  -target=wasi \
-  -opt=2 \
+tinygo build \
+  -o build/guest_e2e.wasm \
+  -target=wasip1 \
+  -scheduler=none \
+  -opt=z \
   -no-debug \
-  counter.go
+  guest_e2e.go
 ```
 
-**Flags:**
-- `-opt=2`: Optimization level (0-2, or z/s for size)
-- `-no-debug`: Remove debug info
-- `-scheduler=none`: Disable scheduler (if no goroutines)
+TinyGo invokes `wasm-opt` during this build. The official Linux package used by
+CI bundles Binaryen 116; installations that do not bundle the optimizer must
+provide a compatible `wasm-opt` themselves.
 
-## Testing WASM Output
+Build the runtime from the repository root, then execute the guest:
 
 ```bash
-# Validate WASM
-make test
-
-# Or manually
-wasm-validate build/counter.wasm
-
-# Inspect WASM
-wasm-objdump -x build/counter.wasm
+cargo build --locked --bin lunatic
+make -C examples/go run-guest-e2e
 ```
 
-## Common Issues
+`make -C examples/go test` performs the same Lunatic execution first and only
+then runs `wasm-validate` when that optional tool is installed. Missing
+`wasm-validate` never substitutes for the runtime E2E.
 
-### Issue: "tinygo: command not found"
-**Solution:** Install TinyGo (see Prerequisites)
+## Why `_start` and `-scheduler=none`?
 
-### Issue: Large WASM file size
-**Solution:** Use optimization flags (`-opt=2`)
+Every Lunatic process receives a fresh Wasm instance. TinyGo command modules
+initialize their language runtime through `_start`, so the parent spawns that
+entry point and uses child `argv[0] == "child"` for role selection. Calling an
+arbitrary exported Go function in a fresh instance would bypass this
+initialization contract. A TinyGo `-buildmode=c-shared` reactor exports
+`_initialize` instead of the `_start` entry point expected by `lunatic run`, so
+it is not used here.
 
-### Issue: Function not exported
-**Solution:** Ensure `//export` comment is immediately above function
+The E2E intentionally compiles with `-scheduler=none`. Its concurrency comes
+from separate Lunatic processes and bounded host mailboxes, not TinyGo
+goroutines or channels.
 
-### Issue: Import errors
-**Solution:** Some Go packages aren't available in TinyGo. Check [TinyGo packages](https://tinygo.org/docs/reference/lang-support/)
+## Boundary of the other files
 
-## Next Steps
+- `counter.go` demonstrates Wasm exports and module-local state only. It does
+  not call a Lunatic host API.
+- `gen_server_example.go` uses a goroutine and Go channels inside one module.
+  It is an in-module pattern simulation, not a Lunatic GenServer adapter.
+- `supervisor_example.go` models workers and restart strategies as Go objects.
+  It does not spawn, link, or monitor Lunatic processes and is not runtime E2E
+  evidence.
+- The local imports in `guest_e2e.go` are a minimal executable adapter, not a
+  published or versioned Go SDK. Guest Supervisor/GenStatem/GenEvent libraries,
+  distributed OTP, resource-transfer wrappers, WASI Preview 2 components, and
+  cross-language API parity remain outside this example.
 
-1. Explore Rust examples for full Lunatic API access
-2. See AssemblyScript examples for TypeScript developers
-3. Check main Lunatic documentation for process spawning
-4. Look at `examples/wat/` for low-level WASM examples
+The legacy files remain available through individual Make targets or
+`make simulations`, but they are intentionally excluded from the default
+`make build` and `make test` paths.
 
-## Resources
+## ABI maintenance
 
-- [TinyGo Documentation](https://tinygo.org/docs/)
-- [TinyGo WASM Guide](https://tinygo.org/docs/guides/webassembly/)
-- [Lunatic Documentation](https://lunatic.solutions/)
-- [Go WebAssembly Wiki](https://github.com/golang/go/wiki/WebAssembly)
+The import declarations must stay aligned with `wat/all_imports.wat`. The E2E
+provides an additional link-time and execution-time guard: a namespace, name,
+or signature mismatch prevents `guest_e2e.wasm` from starting against Lunatic.

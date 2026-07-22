@@ -6,8 +6,9 @@ import (
 	"time"
 )
 
-// Supervisor pattern implementation in Go for Lunatic
-// This demonstrates OTP-style process supervision with restart strategies
+// EDUCATIONAL IN-MODULE SIMULATION ONLY.
+// This file uses goroutines and has no Lunatic imports, processes, mailboxes,
+// or OTP1 adapter. It is not part of the runtime certification build.
 
 // Restart strategy types
 type RestartStrategy string

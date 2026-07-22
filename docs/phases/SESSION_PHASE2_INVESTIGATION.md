@@ -147,10 +147,10 @@ This work:
 ✅ Benchmark build: Success
 
 ### Performance Validation
-Benchmark results confirm current implementation is optimal:
-- FIFO receive (no tags): 347ns (baseline)
-- Selective receive (1-5 tags): ~500ns-3μs (acceptable)
-- Selective receive (10 tags): ~3μs (rare case, still fast)
+This historical session recorded relative mailbox results, but not the tested
+commit, dirty state, hardware, or complete toolchain. The exact timings are
+therefore withdrawn as a current baseline. Re-run `cargo bench --bench mailbox`
+with reproducibility metadata before comparing FIFO and selective receive costs.
 
 ---
 

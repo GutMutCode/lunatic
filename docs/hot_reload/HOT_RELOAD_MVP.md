@@ -1,162 +1,85 @@
-# Hot Reload MVP Implementation
+# Watch-Mode Hot Reload
 
-## Overview
+## Current status
 
-This is the MVP (Minimum Viable Product) implementation of hot reloading for Lunatic runtime. It provides automatic process restart when WebAssembly files change during development.
+Lunatic exposes one file-triggered reload command:
 
-## Features
+```bash
+lunatic run --watch app.wasm
+```
 
-- **File Watching**: Automatically detects changes to `.wasm` files
-- **Process Restart**: Restarts the process when changes are detected
-- **Development Mode**: Enabled with the `--watch` flag
-- **Simple & Fast**: No state preservation (restart-based approach)
+When the watched WebAssembly file changes, Lunatic compiles and registers the
+new module, then applies the update to the running local process through the
+reload coordinator. A successful compatible update preserves process identity,
+linear memory, FIFO mailbox contents, and the supported in-process host
+resources exercised by the production-path tests. If signature validation or
+new-instance preparation fails, the previous instance keeps running.
+
+The authoritative evidence boundary is documented in
+[Core Values Status](../core_values/status.md). The main executable regression
+test is [`tests/live_hot_reload.rs`](../../tests/live_hot_reload.rs).
 
 ## Usage
 
-### Basic Example
+```bash
+# Run a module and watch its .wasm file.
+lunatic run --watch app.wasm
+
+# Pass guest arguments after the module path.
+lunatic run --watch app.wasm arg1 arg2
+
+# Grant directory access while watching the module.
+lunatic run --watch --dir /path/to/dir app.wasm
+```
+
+Lunatic watches the compiled `.wasm` file; it does not rebuild guest source.
+Recompile the guest in another terminal, for example:
 
 ```bash
-# Run your wasm module in watch mode
-lunatic run --watch myapp.wasm
-
-# Or with additional arguments
-lunatic run --watch myapp.wasm arg1 arg2
-
-# With directory access
-lunatic run --watch --dir /path/to/dir myapp.wasm
+cargo build --target wasm32-wasip1
 ```
 
-### Development Workflow
+## Reload flow
 
-1. Start your application in watch mode:
-   ```bash
-   lunatic run --watch app.wasm
-   ```
-
-2. Edit your source code
-
-3. Recompile to WebAssembly:
-   ```bash
-   cargo build --target wasm32-wasi
-   ```
-
-4. Lunatic automatically detects the change and restarts your application
-
-## Architecture
-
-### Components
-
-1. **FileWatcher** (`src/hot_reload/watcher.rs`)
-   - Uses the `notify` crate for cross-platform file watching
-   - Monitors `.wasm` files for modifications
-   - Sends events through a tokio channel
-
-2. **Process Manager** (`src/mode/run.rs`)
-   - Receives file change events
-   - Aborts the current process
-   - Spawns a new process with the updated code
-
-### Flow Diagram
-
-```
-┌─────────────────┐
-│  File System    │
-│   (.wasm file)  │
-└────────┬────────┘
-         │ change detected
-         ▼
-┌─────────────────┐
-│  FileWatcher    │
-│   (notify)      │
-└────────┬────────┘
-         │ FileChangeEvent
-         ▼
-┌─────────────────┐
-│ Process Manager │
-│                 │
-│  1. Abort old   │
-│  2. Start new   │
-└─────────────────┘
+```text
+.wasm change
+    -> compile candidate module
+    -> validate and register candidate version
+    -> prepare affected local processes
+    -> commit all prepared replacements, or resume the previous instances
 ```
 
-## Limitations (MVP)
+The watcher debounces rapid file-system events. An invalid candidate is
+reported as a reload failure and is not committed.
 
-This MVP implementation has the following limitations:
+## Current limitations
 
-1. **No State Preservation**: Process state is lost on reload
-2. **Development Only**: Not recommended for production use
-3. **Single File**: Watches only the main `.wasm` file
-4. **Manual Recompilation**: You must recompile your code manually
-
-## Future Enhancements
-
-Potential improvements for future versions:
-
-- **State Preservation**: Save and restore process state across reloads
-- **Smart Reloading**: Only reload affected processes
-- **Module Versioning**: Support multiple module versions simultaneously  
-- **Distributed Reload**: Coordinate reloads across distributed nodes
-- **Auto-recompilation**: Integrate with build tools (cargo watch)
-
-## Implementation Details
-
-### File Watching
-
-Uses `notify::RecommendedWatcher` which selects the best backend for each platform:
-- **macOS**: FSEvents
-- **Linux**: inotify
-- **Windows**: ReadDirectoryChangesW
-
-### Event Filtering
-
-Only triggers on:
-- `Modify(Data)` events: File content changes
-- `Create` events: New file creation
-
-Ignores temporary files and non-`.wasm` files.
-
-### Process Lifecycle
-
-```rust
-// Simplified pseudocode
-loop {
-    select! {
-        // File changed
-        event = rx.recv() => {
-            abort_current_process();
-            start_new_process();
-        }
-        // Process finished
-        result = process.await => {
-            if error {
-                wait_for_changes();
-            } else {
-                exit();
-            }
-        }
-    }
-}
-```
+- The validated path is process-local; distributed and cross-node reload are
+  not established.
+- The replacement module must satisfy the runtime's compatibility checks.
+- Compatible linear memory, mailbox contents, process identity, and selected
+  in-process resources are covered. This is not a guarantee that every WASI or
+  application-managed resource can migrate.
+- Live TCP/TLS transfer is tested at the runtime resource-transfer boundary,
+  not by a guest-driven reload E2E. Persisted snapshots, host restarts, and
+  cross-node migration cannot restore active TCP/TLS streams.
+- Source recompilation remains external to Lunatic.
+- End-to-end hot-reload latency and production scale are not established by the
+  repository's current benchmarks.
 
 ## Testing
 
-To test the hot reload functionality:
+Run the production-path integration test:
 
-1. Create a simple wasm module
-2. Run it with `--watch`
-3. Modify and recompile
-4. Observe the automatic restart
+```bash
+cargo test --test live_hot_reload
+```
 
-## Contributing
-
-This is an initial MVP. Contributions welcome for:
-- Bug fixes
-- Performance improvements
-- Additional features (see Future Enhancements)
-- Documentation improvements
+For a manual file-watcher demonstration, follow
+[the demo instructions](../../examples/DEMO_INSTRUCTIONS.md).
 
 ## References
 
-- [Erlang Hot Code Loading](https://www.erlang.org/doc/reference_manual/code_loading.html)
-- [notify crate](https://docs.rs/notify/)
-- [Lunatic Process Model](../README.md#architecture)
+- [Hot reload architecture history](HOT_RELOAD_ARCHITECTURE.md)
+- [Core Values Status](../core_values/status.md)
+- [Lunatic Process Model](../../README.md#architecture)

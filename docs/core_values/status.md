@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-22
 
-Reviewed working tree based on: `52101a2` plus the reviewed working-tree changes for Hanary #1665
+Reviewed working tree based on: `22bde05` plus the reviewed working-tree changes for Hanary #1666
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -20,7 +20,7 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Fast | Partial | Wasmtime preemption primitives and live process-local hot reload are production-path tested. A two-node registry-to-live-native-mailbox round trip is benchmarked; hot-reload latency and guest-host-call messaging latency are not. |
 | Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and acknowledged atomic reload/rollback/in-doubt behavior are production-path tested. Cross-node recovery remains incomplete. |
 | Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
-| Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
+| Language Independence | Partial | Rust, TinyGo, and AssemblyScript compiler output now passes one shared process/message/timeout/permission E2E in CI. These low-level fixtures are not equivalent published guest SDKs, and broader host APIs remain uncovered. |
 | Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. The provider-handle guest TLS ABI and version-2 listener snapshots exclude raw private-key bytes, Cloud CLI credentials use native protected stores, and typed/redacted V1 audit events cover major privileged boundaries, but deprecated raw TLS and distributed CA/signing compatibility imports remain, complete resource accounting and receiver path policy remain open, and audit delivery is not durable/required. |
 | Fault Tolerance & HA | Partial | Actual-Wasm links/monitors, process-local live reload, and automatic native Supervisor restart/escalation paths are production-path tested. Guest-side and distributed recovery paths remain incomplete. |
 | Async by Default | Partial | Wasmtime preemption, bounded actor ingress, and several async host paths exist. Unverified blocking host calls and scheduler fairness prevent a stronger claim. |
@@ -73,14 +73,16 @@ missing.
 ### Verified components
 
 - Host subsystems expose language-neutral Wasm imports, and `tests/imports_match.rs` checks registrations against `wat/all_imports.wat`.
-- The repository contains Rust, TinyGo, AssemblyScript, and WAT source examples and build recipes.
+- Rust `1.94.0`, Go `1.25.5` with TinyGo `0.41.1`, and AssemblyScript `0.27.37` source fixtures compile from a clean checkout in the `multilanguage_guests` CI job.
+- `tests/multilanguage_guest_e2e.rs` loads each compiler artifact through the production linker and verifies same-module process spawn, a tagged `41 -> 42` round trip, bounded timeout status `9027`, and an attenuated child's spawn denial with a guest-readable error handle. CI also invokes every fixture through the current `lunatic run` interface.
+- `examples/MULTI_LANGUAGE_GUIDE.md` links each verified matrix cell to its fixture, integration oracle, and CI gate and records the exact Wasm/WASI boundary.
 
 ### Boundary
 
-- The example sources and recipes have not yet been validated as a complete multi-language build-and-run matrix; they do not demonstrate equivalent access to the complete Lunatic runtime API.
+- The verified adapters intentionally cover a narrow raw host-ABI slice. They do not demonstrate equivalent access to the complete Lunatic runtime API or provide stable application-facing packages.
 - Rust OTP examples still use host-side `lunatic-otp-patterns`. The actual-Wasm OTP1 fixture proves the low-level wire path, not a packaged Rust guest SDK.
 - Go and AssemblyScript OTP samples are manual pattern simulations, not runtime adapters.
-- CI does not yet build and execute a representative guest API scenario for every advertised language.
+- TinyGo is certified only as a WASI Preview 1 command entered through `_start`; WASI Preview 2/components, arbitrary reactor child exports, guest threads, and goroutine equivalence are outside the matrix. Rust and AssemblyScript fixtures are core Wasm modules using direct Lunatic imports.
 
 ## 3. Security Through Isolation
 
@@ -185,7 +187,7 @@ missing.
 ### Boundary
 
 - The automatic Supervisor adapter is host-side and local. Guest-Wasm supervisor trees, cross-node supervision, and distributed BEAM-like recovery remain unverified.
-- OTP1 is a low-level, language-neutral guest wire contract, not a complete high-level SDK. Rust, TinyGo, and AssemblyScript still need equivalent packaged guest APIs and CI build/run coverage; guest-side GenStatem, GenEvent, and Supervisor libraries remain follow-up work.
+- OTP1 is a low-level, language-neutral guest wire contract, not a complete high-level SDK. Rust, TinyGo, and AssemblyScript now have CI build/run coverage for primitive process and message imports, but they still need packaged OTP1 adapters; guest-side GenStatem, GenEvent, and Supervisor libraries remain follow-up work.
 - Named GenServer registration is node-local and requires an explicitly supplied runtime context for embedding. Cluster-quorum/global naming and name-based reconstruction of a typed handle are outside the synchronous adapter.
 
 ## Validation Scope
@@ -196,6 +198,7 @@ missing.
 | `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and reason-preserving monitor semantics, plus Supervisor restart after an immediate guest trap | Cross-node links or every possible host-future suspension point |
 | `cargo test -p lunatic-otp-patterns` | Native GenServer/GenStatem/GenEvent mailbox lifecycles, local named registration, and automatic Supervisor monitor/restart/escalation behavior | Guest-side supervisor trees, global naming, or distributed recovery |
 | `cargo test -p lunatic-runtime --test otp_guest_wasm` | Actual-Wasm OTP1 cast, correlated call/reply, timeout, and acknowledged stop over production message imports | Packaged language SDK ergonomics, guest-side Supervisor/GenStatem/GenEvent libraries, or cross-node OTP |
+| `LUNATIC_MULTILANGUAGE_GUESTS_REQUIRED=1 cargo test --test multilanguage_guest_e2e` after the pinned compiler builds | Rust, TinyGo, and AssemblyScript artifacts all exercise process spawn, tagged message round trip, timeout, and child permission denial through registered production imports | Stable/public guest SDKs, full host-API parity, language-level concurrency equivalence, OTP adapters, WASI Preview 2/components, or distributed behavior |
 | TLS listener/provider-handle tests | Version-2 address-plus-handle serialization, environment/process/capability scope, capability-before-quota ordering, existence-hiding audit classes, single-use/revocation/expiry/capacity behavior, provider unwind containment and rollback-failure promotion, stable fail-closed errors, actual guest Wasm bind/accept/TLS traffic, key-marker-free guest/resource snapshots and audit output, provider-backed rebind, legacy rejection, and live listener transfer without provider lookup | Panic-hook or provider-owned log redaction, persistent-provider implementation, host restart, cross-node restoration/reissue, host crash-dump/remanence guarantees, provider-specific reconciliation after a failed revoke, or distributed signer migration |
 | Legacy TLS bind production-import test | The const guest key-input range remains reusable on the exercised invalid-input path, the temporary host copy is zeroized by implementation, and the audit record omits the marker | Guest-managed erasure, `MemorySnapshot` key absence, successful-bind crash-dump/remanence guarantees, or raw distributed CA/signing imports |
 | Registry/QUIC + guest integration tests | Real localhost mTLS transport, framing, quorum behavior, two actual Wasm guest lookup-to-mailbox request/reply, typed missing-target errors, and owner cleanup | Cross-host deployment, cross-environment handles, partitioned guest owner exit, distributed process recovery |
@@ -223,7 +226,7 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 3. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
 4. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
 5. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
-6. Package the OTP1 contract as equivalent Rust, TinyGo, and AssemblyScript guest APIs, including guest-side Supervisor/GenStatem/GenEvent libraries, and build/run representative scenarios in CI.
+6. Build on the now-verified primitive Rust, TinyGo, and AssemblyScript matrix by packaging equivalent OTP1 guest APIs, including guest-side Supervisor/GenStatem/GenEvent libraries.
 7. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
 
 ## Related Resources

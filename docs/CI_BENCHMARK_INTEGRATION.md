@@ -1,325 +1,84 @@
-# CI Benchmark Integration Recommendations
+# CI Benchmark Integration
 
-**Date**: October 6, 2025
-**Status**: Recommendation Document
-**Priority**: Medium
+Reviewed against the repository on 2026-07-22.
 
----
+Lunatic keeps Criterion benchmarks in the repository-root [`benches/`](../benches/)
+directory. The Linux leg of [the main CI workflow](../.github/workflows/ci.yml)
+runs them, uploads the textual output for the commit under test, and then runs
+the executable threshold checker.
 
-## Executive Summary
+## Current benchmark targets
 
-Lunatic has comprehensive benchmarks for critical performance paths but lacks automated CI integration to detect performance regressions. This document outlines a phased approach to integrate benchmarks into CI while maintaining fast feedback loops.
+| Target | Measured boundary |
+| --- | --- |
+| `spawn` | Local runtime process-spawn path |
+| `mailbox` | Local mailbox queue operations |
+| `hot_reload` | In-process hot-reload component paths |
+| `memory_profile` | Local runtime memory workloads |
+| `instance_pool` | Wasm instance-pool operations |
+| `messaging` | Local signal-ingress and mailbox operations |
+| `distributed_messaging` | Distributed request encoding/decoding and QUIC dispatch fixtures |
+| `distributed_latency` | Control lookup and confirmed QUIC-to-live-mailbox round trip |
 
----
+These targets do not all measure the same boundary. In particular, `mailbox`
+and `messaging` are local microbenchmarks and must not be described as
+end-to-end process-delivery latency. The distributed targets use local test
+nodes and are not substitutes for a multi-host production benchmark.
 
-## Current State
+## CI behavior
 
-### ✅ Existing Benchmarks
+On Linux, `test_or_release` performs three distinct actions:
 
-**Location**: `crates/lunatic-process/benches/`
+1. runs every benchmark target listed above and writes `benchmark_output.txt`;
+2. uploads that file as `benchmark-results-<commit SHA>`; and
+3. executes [`scripts/check_bench_thresholds.py`](../scripts/check_bench_thresholds.py).
 
-1. **`process_spawn.rs`** - Process spawning performance
-   - Target: <10μs (currently 23μs, acceptable for WASM)
-   - Critical for scalability to millions of processes
+The threshold checker reruns its configured Criterion workloads, parses their
+confidence intervals, and fails when an upper bound exceeds the checked-in
+limit. It currently covers `spawn`, `messaging`, `distributed_messaging`, and
+`distributed_latency`. The separate pull-request summary still describes
+manual baseline comparison; CI does not yet maintain a historical trend store
+or automatically compare a pull request with its base commit.
 
-2. **`messaging.rs`** - Message passing latency
-   - Target: <1μs (currently 353ns - **exceeds target**)
-   - Core communication primitive
+## Local commands
 
-3. **`instance_pool.rs`** - Instance pooling efficiency
-   - Measures hit rate and overhead
-   - Important for hot reload performance
+Run one target directly:
 
-### ❌ Missing CI Integration
-
-- No automated regression detection
-- Manual benchmark runs only
-- No historical performance tracking
-- No alerting on degradation
-
----
-
-## Recommended Approach
-
-### Phase 1: Baseline Establishment (Week 1)
-
-**Goal**: Capture current performance baseline
-
-```yaml
-# .github/workflows/benchmark-baseline.yml
-name: Performance Baseline
-
-on:
-  workflow_dispatch:  # Manual trigger only
-
-jobs:
-  benchmark:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run critical benchmarks
-        run: |
-          cargo bench --bench process_spawn -- --save-baseline main
-          cargo bench --bench messaging -- --save-baseline main
-
-      - name: Upload baseline
-        uses: actions/upload-artifact@v3
-        with:
-          name: performance-baseline
-          path: target/criterion/
+```bash
+cargo bench --bench spawn
+cargo bench --bench distributed_latency
 ```
 
-**Action Items**:
-1. Run benchmarks on `main` branch
-2. Save results as baseline artifact
-3. Document baseline metrics in `docs/benchmarks/BASELINE.md`
+Run the same hard-threshold gate used by CI:
 
----
-
-### Phase 2: Pull Request Checks (Week 2-3)
-
-**Goal**: Compare PR performance against baseline
-
-```yaml
-# .github/workflows/benchmark-pr.yml
-name: Performance Regression Check
-
-on:
-  pull_request:
-    paths:
-      - 'crates/lunatic-process/**'
-      - 'crates/lunatic-networking-api/**'
-
-jobs:
-  benchmark-comparison:
-    runs-on: ubuntu-latest
-
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download baseline
-        uses: dawidd6/action-download-artifact@v2
-        with:
-          workflow: benchmark-baseline.yml
-          name: performance-baseline
-          path: target/criterion/
-
-      - name: Run PR benchmarks
-        run: |
-          cargo bench --bench process_spawn -- --baseline main
-          cargo bench --bench messaging -- --baseline main
-
-      - name: Check for regressions
-        run: |
-          # Parse Criterion output for significant changes (>10%)
-          python scripts/check_benchmark_regression.py
-
-      - name: Comment on PR
-        uses: actions/github-script@v6
-        with:
-          script: |
-            // Post benchmark comparison as PR comment
+```bash
+./scripts/check_bench_thresholds.py
 ```
 
-**Regression Thresholds**:
-- **Critical** (fail PR): >25% degradation
-- **Warning** (comment only): >10% degradation
-- **Info**: Any measurable change
+Criterion writes detailed local output below `target/criterion/`. Generated
+results are not source-controlled and a number copied from one run is not a
+portable performance guarantee.
 
----
+## Claim requirements
 
-### Phase 3: Continuous Monitoring (Month 2)
+A performance report should identify:
 
-**Goal**: Track performance trends over time
+- the commit, benchmark target, and exact workload;
+- whether the path is a local microbenchmark or production-path E2E;
+- toolchain, operating system, CPU, and runner class;
+- sample count and the reported distribution or confidence interval; and
+- the comparison baseline and permitted variance.
 
-**Integration Options**:
+Do not infer cross-process, cross-node, or application latency from a queue
+operation. Do not publish a nanosecond or microsecond value as a current
+contract unless the referenced executable benchmark measures that exact path
+on the stated commit.
 
-#### Option A: Criterion.rs + GitHub Pages
-```yaml
-- name: Generate report
-  run: |
-    cargo bench --bench process_spawn -- --output-format bencher | \
-    tee output.txt
+## Adding a benchmark
 
-- name: Store benchmark result
-  uses: benchmark-action/github-action-benchmark@v1
-  with:
-    tool: 'cargo'
-    output-file-path: output.txt
-    github-token: ${{ secrets.GITHUB_TOKEN }}
-    auto-push: true
-```
-
-**Pros**: Native Rust, simple integration
-**Cons**: Limited visualization
-
-#### Option B: Bencher.dev (Recommended)
-```yaml
-- name: Track with Bencher
-  uses: bencherdev/bencher@main
-  with:
-    bencher-api-token: ${{ secrets.BENCHER_API_TOKEN }}
-    bencher-project: lunatic
-    bencher-adapter: rust_criterion
-```
-
-**Pros**:
-- Purpose-built for performance tracking
-- Historical graphs and alerting
-- Free for open source
-- Multi-metric tracking
-
-**Cons**: External dependency
-
----
-
-## Implementation Plan
-
-### Week 1: Setup
-- [ ] Create baseline workflow
-- [ ] Run baselines on `main`
-- [ ] Document current performance metrics
-
-### Week 2-3: PR Integration
-- [ ] Implement benchmark comparison workflow
-- [ ] Create regression detection script
-- [ ] Add PR commenting bot
-- [ ] Test on non-critical PRs
-
-### Week 4: Refinement
-- [ ] Tune regression thresholds
-- [ ] Add benchmark variance analysis
-- [ ] Document benchmark running guide
-
-### Month 2: Monitoring
-- [ ] Set up Bencher.dev or GitHub Pages
-- [ ] Configure alerting for critical paths
-- [ ] Create performance dashboard
-
----
-
-## Benchmark Selection Criteria
-
-### Always Run (Every PR touching these paths)
-- `process_spawn` - Core scalability metric
-- `messaging` - Core communication primitive
-
-### Run on Main Only (Nightly/Weekly)
-- `instance_pool` - Complex, less critical
-- Future: distributed messaging, hot reload latency
-
-### Never Run in CI
-- Micro-benchmarks (<1μs operations)
-- Benchmarks requiring special hardware
-- Exploratory/development benchmarks
-
----
-
-## Cost Analysis
-
-### Compute Resources
-- **Baseline**: ~2 minutes per run (manual)
-- **PR Check**: ~5 minutes per PR
-- **Nightly**: ~10 minutes per night
-
-**Estimated Monthly Cost**:
-- GitHub Actions: ~500 minutes/month = **FREE** (within limits)
-- Bencher.dev: **FREE** for open source
-
-### Maintenance Effort
-- **Initial Setup**: 8-16 hours
-- **Ongoing Maintenance**: 2-4 hours/month
-- **Threshold Tuning**: 4 hours (one-time)
-
----
-
-## Failure Modes & Mitigation
-
-### False Positives (Flaky Benchmarks)
-**Problem**: Variance causes spurious regression alerts
-
-**Mitigation**:
-1. Run benchmarks 3x, use median
-2. Use statistical significance tests
-3. Require >2 consecutive failures
-
-### CI Queue Congestion
-**Problem**: Long benchmark runs block other checks
-
-**Mitigation**:
-1. Run benchmarks in parallel workflow
-2. Mark as non-blocking (advisory only)
-3. Only run for performance-critical paths
-
-### Baseline Drift
-**Problem**: Hardware changes invalidate comparisons
-
-**Mitigation**:
-1. Update baseline monthly
-2. Track hardware specs in metadata
-3. Use relative (%) not absolute metrics
-
----
-
-## Alternative: Manual Benchmark Gates
-
-If full CI integration is too complex, consider:
-
-```markdown
-## PR Checklist (for performance-critical changes)
-
-- [ ] Ran `cargo bench --bench process_spawn` locally
-- [ ] Verified no >10% regression vs main
-- [ ] Posted benchmark results in PR description
-```
-
-**Pros**: Zero infrastructure cost
-**Cons**: Relies on developer discipline
-
----
-
-## Recommendations
-
-### Immediate (This Week)
-1. ✅ **Document Current Baselines**
-   - Run benchmarks on `main`
-   - Record results in `docs/benchmarks/BASELINE.md`
-   - Establish "golden" metrics
-
-### Short-term (Next Month)
-2. **Implement PR Benchmark Comparison**
-   - Start with `messaging` bench only (fastest)
-   - Advisory-only (don't block PRs)
-   - Gather data on variance/flakiness
-
-### Long-term (Quarter 2)
-3. **Full CI Integration with Monitoring**
-   - Integrate Bencher.dev for trending
-   - Expand to all critical benchmarks
-   - Add automated alerting
-
----
-
-## Success Metrics
-
-- ✅ Zero performance regressions merged unknowingly
-- ✅ Performance trends visible to all contributors
-- ✅ Optimization PRs can demonstrate improvements
-- ✅ <5% false positive rate on regression detection
-
----
-
-## References
-
-- Current Benchmarks: `crates/lunatic-process/benches/`
-- Performance Analysis: `docs/benchmarks/PERFORMANCE_ANALYSIS.md`
-- Core Values Metrics: `CORE_VALUES.md` (lines 323-346)
-- Criterion.rs Docs: https://bheisler.github.io/criterion.rs/
-- Bencher.dev: https://bencher.dev/
-
----
-
-**Next Steps**: Review this proposal with core team and select Option A or B for Phase 3.
+1. Add `benches/<name>.rs` and a matching `[[bench]]` entry in `Cargo.toml`.
+2. Add the target to the Linux benchmark step in `.github/workflows/ci.yml`.
+3. Add it to `scripts/check_bench_thresholds.py` only when a justified,
+   runner-tolerant hard limit exists.
+4. Document the measured boundary and what the result does not establish.
+5. Verify both `cargo bench --bench <name>` and the threshold checker.

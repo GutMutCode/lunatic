@@ -75,6 +75,68 @@ jobs:
       - name: Compile the locked 0.14 Rust examples
         run: cargo check --locked --manifest-path examples/rust/Cargo.toml
 
+  multilanguage_guests:
+    name: Multi-language guest E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Install pinned Rust and core Wasm target
+        uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install pinned Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.25.5"
+          cache-dependency-path: examples/go/go.mod
+      - name: Install pinned TinyGo
+        shell: bash
+        run: |
+          curl --fail --location --silent --show-error --retry 3 --retry-all-errors \
+            --output tinygo.deb \
+            https://github.com/tinygo-org/tinygo/releases/download/v0.41.1/tinygo_0.41.1_amd64.deb
+          echo "901fbccffc61adb111656d1f907dfc21b6c499ca841b115866a0d6de2d835fbe  tinygo.deb" \
+            | sha256sum --check -
+          sudo dpkg --install tinygo.deb
+          tinygo version | grep -F "tinygo version 0.41.1 "
+          "$(tinygo env TINYGOROOT)/bin/wasm-opt" --version | grep -Fx "wasm-opt version 116"
+      - name: Install pinned Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24.4.1"
+          cache: npm
+          cache-dependency-path: examples/assemblyscript/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the Rust guest from source
+        run: |
+          cargo +1.94.0 build --locked \
+            --manifest-path examples/rust/guest-e2e/Cargo.toml \
+            --target wasm32-unknown-unknown \
+            --release
+      - name: Build the TinyGo guest from source
+        run: make -C examples/go guest-e2e
+      - name: Build the AssemblyScript guest from source
+        run: |
+          npm ci --prefix examples/assemblyscript
+          npm run --prefix examples/assemblyscript build:guest-e2e
+      - name: Build the Lunatic CLI
+        run: cargo +1.94.0 build --locked --bin lunatic
+      - name: Run every compiler artifact through the public CLI
+        shell: bash
+        run: |
+          timeout 30s ./target/debug/lunatic run \
+            examples/rust/guest-e2e/target/wasm32-unknown-unknown/release/lunatic_rust_guest_e2e.wasm
+          timeout 30s ./target/debug/lunatic run examples/go/build/guest_e2e.wasm
+          timeout 30s ./target/debug/lunatic run examples/assemblyscript/build/guest_e2e.wasm
+      - name: Run the strict shared runtime oracle
+        env:
+          LUNATIC_MULTILANGUAGE_GUESTS_REQUIRED: "1"
+        run: cargo +1.94.0 test --test multilanguage_guest_e2e -- --nocapture
+
   test_or_release:
     name: Test & (release)
     runs-on: ${{ matrix.os }}
@@ -184,7 +246,7 @@ jobs:
   release:
     name: Publish draft release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [public_api, release_contract, test_or_release]
+    needs: [public_api, release_contract, multilanguage_guests, test_or_release]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -33,13 +33,9 @@ export function set_count(value: i32): void {
   counter = value;
 }
 
-// Simple print function using WASI
+// Placeholder for a future Lunatic logging binding. This function deliberately
+// emits no WASI or JavaScript `env` import.
 function print(message: string): void {
-  // In a real implementation, this would use WASI fd_write
-  // For now, this is a placeholder that demonstrates the API
-  // The actual implementation would need to interface with Lunatic's
-  // logging facilities
+  // Keep the parameter referenced so the example stays warning-free.
+  if (message.length == 0) return;
 }
-
-// Memory exports for Lunatic
-export { memory };

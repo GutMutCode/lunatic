@@ -1,18 +1,25 @@
 # Hot Reload Integration Test Results
 
+> Historical component-test record. The timing below was not captured with a
+> reproducible benchmark protocol and is not a current live `--watch` latency
+> result. See [`../core_values/status.md`](../core_values/status.md) for the
+> current evidence boundary.
+
 **Date**: October 5, 2025  
 **Status**: ✅ **PASSED**
 
 ## Test Overview
 
-Successfully demonstrated end-to-end hot reload with state preservation using real WebAssembly modules.
+The component test manually replaces one Wasmtime module with another and
+checks compatible linear-memory restoration. It is not the live `--watch`
+execution path.
 
 ## Test Execution
 
 ### Test File
 `crates/lunatic-process/tests/hot_reload_integration.rs`
 
-### Test Case: `test_basic_memory_snapshot_and_restore`
+### Test Case: `memory_state_survives_module_replacement`
 
 **Purpose**: Verify that memory state is preserved across module hot reload
 
@@ -49,11 +56,11 @@ Successfully demonstrated end-to-end hot reload with state preservation using re
 ✓ Reset works correctly (5 → 0)
 ```
 
-## Performance
+## Scope
 
 - **Memory snapshot**: 65,536 bytes captured
-- **Test execution time**: < 10ms
-- **Zero data loss**: All counter state preserved
+- **Execution latency**: not benchmarked by this component test
+- **State result**: the fixture's counter bytes were preserved
 
 ## Key Achievements
 
@@ -82,7 +89,7 @@ Counter value in memory after increment: 1
 ✓ Counter value preserved: 3
 ✓ V2 increment works correctly (added 2): 5
 ✓ V2 reset function works: 0
-test test_basic_memory_snapshot_and_restore ... ok
+test memory_state_survives_module_replacement ... ok
 
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```

@@ -1,5 +1,12 @@
 # Hot Reloading Architecture for Lunatic
 
+> **Historical design document.** This file records the original proposal and
+> is not a current CLI or API reference. The supported file-triggered command is
+> `lunatic run --watch <module.wasm>`. For implemented behavior, executable
+> evidence, and remaining limits, see
+> [Core Values Status](../core_values/status.md) and
+> [Watch-Mode Hot Reload](HOT_RELOAD_MVP.md).
+
 ## Executive Summary
 
 This document proposes an architecture for adding Hot Code Reloading functionality to the Lunatic runtime. It is inspired by Erlang/BEAM's hot code loading mechanism and designed considering WebAssembly's characteristics and Lunatic's current architecture.
@@ -395,17 +402,10 @@ fn main() {
 
 ```bash
 # 개발 모드로 실행 (자동 hot reload)
-lunatic run --hot-reload myapp.wasm
-
-# 특정 프로세스 reload
-lunatic-ctl reload-process <process_id>
-
-# 모듈 reload
-lunatic-ctl reload-module <module_id>
-
-# Reload 상태 확인
-lunatic-ctl module-versions
+lunatic run --watch myapp.wasm
 ```
+
+이 설계에서 제안했던 별도 수동 reload/status 명령은 구현된 CLI가 아니다.
 
 ## 8. 보안 고려사항
 
@@ -432,7 +432,7 @@ lunatic-ctl module-versions
 - 단점: 구현 복잡, 상태 직렬화 필요
 
 ### 10.3 Strategy C: Blue-Green Deployment
-- 장점: Zero-downtime, 롤백 쉬움
+- 장점: 중단 시간을 줄이는 배포와 롤백을 설계하기 쉬움(현재 보장 아님)
 - 단점: 메모리 2배 사용, 상태 동기화 필요
 
 **권장**: Strategy B (In-place Module Swap)

@@ -305,22 +305,22 @@ test result: ok. 3 passed; 0 failed; 0 ignored
 
 ## Performance Impact
 
-### ✅ Negligible Overhead
+### Overhead Not Quantified in This Phase
 
 **Memory per Process**:
 - Added fields: 2 × `u32` = 8 bytes per process
-- Negligible compared to typical process memory (KB-MB range)
+- Relative impact was not measured in this phase
 
 **CPU Overhead**:
 - Table growing: Changed from hardcoded constant check to config lookup
   - Before: `desired < 100_000` (1 comparison)
   - After: `desired <= self.config().get_max_table_elements()` (1 pointer + 1 comparison)
-  - Impact: <1ns difference, completely negligible
+  - Impact: Not measured in this phase; use a production-path Criterion benchmark
 
 **File/Network Operations** (when integrated):
 - Pre-check: 1 comparison + 1 increment per open
 - Post-check: 1 decrement per close
-- Impact: <10ns, negligible compared to actual I/O (μs-ms range)
+- Impact: Not measured in this phase
 
 ---
 

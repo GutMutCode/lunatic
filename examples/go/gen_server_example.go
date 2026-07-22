@@ -4,8 +4,9 @@ import (
 	"fmt"
 )
 
-// GenServer pattern implementation in Go for Lunatic
-// This demonstrates OTP-style message passing using channels
+// EDUCATIONAL IN-MODULE SIMULATION ONLY.
+// This file uses Go channels and has no Lunatic imports, processes, mailboxes,
+// or OTP1 adapter. It is not part of the runtime certification build.
 
 // Message types for GenServer communication
 type CounterRequest struct {

@@ -1,134 +1,74 @@
-# AssemblyScript Examples for Lunatic
+# AssemblyScript guest example
 
-This directory contains examples demonstrating how to use Lunatic runtime with AssemblyScript/TypeScript compiled to WebAssembly.
+This directory contains a minimal AssemblyScript module that is compiled and
+executed against Lunatic's production guest imports. It is an ABI fixture, not a
+complete AssemblyScript SDK.
 
-## Prerequisites
+## Supported toolchain
 
-- Node.js (v16 or later)
-- npm or yarn
-- Lunatic runtime (built from this repo)
+- Node.js 18 or newer
+- npm 10 or newer
+- AssemblyScript 0.27.37, pinned by `package-lock.json`
+- the Lunatic runtime built from this repository
 
-## Setup
+The generated module is core WebAssembly. The fixture imports
+`lunatic::process`, `lunatic::message`, and `lunatic::error` directly and does
+not import WASI. Lunatic registers WASI preview0 (`wasi_unstable`) and preview1
+(`wasi_snapshot_preview1`) for languages that emit those ABIs; component-model
+WASI and arbitrary JavaScript `env` imports are outside this example's contract.
+
+AssemblyScript normally emits imports such as `env.abort`, and `console.log`
+emits `env.console.log`. Lunatic does not provide those JavaScript host objects.
+The E2E fixture therefore uses fixed raw-memory buffers, the stub runtime, and
+explicit traps, and it does not generate ESM bindings.
+
+## Build and run the E2E
+
+From this directory:
 
 ```bash
-cd examples/assemblyscript
-npm install
+npm ci
+npm test
 ```
 
-## Building Examples
+`npm test` builds `build/guest_e2e.wasm` and executes it through the repository's
+`lunatic run` command. A contract mismatch traps the guest and fails the command.
+The module verifies all of the following over real host imports:
 
-### Counter Example
+- `create_config` returns a least-privilege child configuration;
+- the parent spawns the exported `child(i64)` function from the same module;
+- the child is denied a nested spawn, receives a guest-visible error handle,
+  inspects it, and releases it;
+- a tagged request carrying `41` receives the correlated tag/value `42`;
+- both send/receive and direct receive timeout paths return status `9027`;
+- `parent(i64)` sends observer completion tag `4203` when an observer is supplied.
 
-A simple counter demonstrating state management in WASM:
+The exported `_start()` runs the same parent/child scenario without an external
+observer, so it can also be invoked directly:
 
 ```bash
 npm run build
+cargo run --locked --manifest-path ../../Cargo.toml --bin lunatic -- \
+  run build/guest_e2e.wasm
 ```
 
-This will generate `build/counter.wasm`.
+The fixture exports linear memory under the standard `memory` name by default;
+an explicit `export { memory }` declaration is neither required nor supported by
+current AssemblyScript as a normal value export.
 
-## Running Examples
+## Other source files
 
-### Basic Counter
+- `assembly/counter.ts` is a computation-only example. It has no Lunatic host
+  API coverage and can be compiled separately with `npm run build:counter`.
+- `assembly/gen_server_example.ts` is an educational direct-object simulation.
+  Its handle calls methods on an in-memory object; it is not a Lunatic process or
+  OTP1 guest adapter.
+- `assembly/supervisor_example.ts` is an educational `WorkerHandle` simulation.
+  It manually invokes failure handling and does not spawn, link, or monitor
+  Lunatic processes.
 
-```bash
-# From the lunatic repo root
-./target/debug/lunatic run examples/assemblyscript/build/counter.wasm
-```
-
-### With Watch Mode (Hot Reload)
-
-```bash
-# Terminal 1: Run with watch mode
-./target/debug/lunatic run --watch examples/assemblyscript/build/counter.wasm
-
-# Terminal 2: Modify and rebuild
-# Edit assembly/counter.ts
-npm run build
-# Watch mode will automatically reload!
-```
-
-## Example Structure
-
-- `assembly/counter.ts` - Simple counter with increment/reset operations
-- `package.json` - NPM dependencies and build scripts
-- `build/` - Compiled WASM output (generated)
-
-## Key Concepts Demonstrated
-
-### 1. WebAssembly Exports
-
-```typescript
-export function _start(): void {
-  // Initialization function called by Lunatic
-}
-
-export function increment(): i32 {
-  // Function exported to be called from Lunatic
-}
-```
-
-### 2. State Management
-
-```typescript
-let counter: i32 = 0;  // Module-level state
-
-export function increment(): i32 {
-  counter += 1;
-  return counter;
-}
-```
-
-### 3. Memory Exports
-
-```typescript
-export { memory };  // Required for Lunatic to access WASM memory
-```
-
-## Language-Specific Considerations
-
-### AssemblyScript vs Rust
-
-**Pros:**
-- Familiar TypeScript syntax
-- Easy for JavaScript/TypeScript developers
-- Good WebAssembly support
-
-**Cons:**
-- Limited access to Lunatic-specific APIs
-- Smaller ecosystem for WASM than Rust
-- Manual bindings needed for host functions
-
-### Recommended Use Cases
-
-- ✅ Computational modules
-- ✅ State machines
-- ✅ Simple services
-- ⚠️ Complex networking (better in Rust)
-- ⚠️ Process spawning (better in Rust)
-
-## Testing
-
-AssemblyScript code can be tested with standard JavaScript testing tools before compilation:
-
-```bash
-# Add to package.json
-{
-  "scripts": {
-    "test": "node --experimental-wasm-modules tests/counter.test.js"
-  }
-}
-```
-
-## Next Steps
-
-1. Explore more complex examples in other languages
-2. See `examples/rust/` for full-featured Lunatic applications
-3. Read `examples/go/` for Go/TinyGo examples
-4. Check main documentation for Lunatic APIs
-
-## Resources
-
-- [AssemblyScript Documentation](https://www.assemblyscript.org/)
-- [Lunatic Documentation](https://lunatic.solutions/)
-- [WebAssembly Specification](https://webassembly.org/)
+Those simulations are intentionally excluded from `npm run build` and
+`npm test`. High-level AssemblyScript GenServer/Supervisor bindings, networking,
+WASI filesystem use, distributed OTP, and live hot reload remain unsupported by
+this fixture. The finite E2E module exits after validation, so it is not a useful
+`--watch` demonstration.

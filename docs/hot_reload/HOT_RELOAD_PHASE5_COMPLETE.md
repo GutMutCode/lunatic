@@ -1,8 +1,17 @@
 # Hot Reload Phase 5: Production Readiness - COMPLETE
 
+> **Historical phase record (2025-10-05).** The title and completion label refer
+> to the Phase 5 checklist, not a current production-readiness guarantee. The
+> phase's timing estimates were not backed by a reproducible production-path
+> benchmark and are retracted below. See
+> [Core Values Status](../core_values/status.md) for current evidence and open
+> limitations.
+
 ## Summary
 
-Phase 5 enhances the hot reload system with production-ready features including signature validation, improved Environment integration, and broadcast messaging for coordinated reloads.
+Phase 5 recorded additions for signature validation, Environment integration,
+and coordinated signal broadcasting. Current readiness must be evaluated from
+the repository's executable tests and status document, not this phase label.
 
 ## Completed Work
 
@@ -136,7 +145,7 @@ where
 - Pre-reload signature validation
 - Early rejection of incompatible modules
 - Detailed error reporting
-- Zero risk of runtime crashes from type mismatches
+- Early rejection reduces the type-mismatch risk on the validated path
 
 ## Architectural Improvements
 
@@ -228,14 +237,14 @@ cargo test --lib -p lunatic-process
 ## Performance Impact
 
 ### Validation Overhead
-- Signature validation: ~1-5ms (one-time per reload)
 - Module comparison: O(n) where n = number of exports
-- **Total overhead: < 10ms** (negligible compared to 40-180ms reload time)
+- No production-path validation-latency bound was established by this phase.
+  The former millisecond estimates are retracted.
 
 ### Memory Impact
-- ValidationError: ~80 bytes per error
-- Validation results: typically 0-10 errors
-- **Memory overhead: < 1KB per validation**
+
+This phase did not attach a reproducible memory benchmark for validation. Its
+former per-error and per-validation size estimates are retracted.
 
 ## Error Handling
 
@@ -256,7 +265,8 @@ If validation fails:
 - ✅ Process ID unchanged
 - ✅ Mailbox intact
 
-**Zero risk** - validation happens before any state changes.
+Validation happens before state changes on this path. That ordering reduces
+risk but is not a universal zero-risk guarantee.
 
 ## Success Criteria (Phase 5)
 
@@ -268,7 +278,7 @@ If validation fails:
 | 4. Memory size validation | ✅ | Ensures new >= old minimum |
 | 5. Export presence check | ✅ | All old exports must exist in new |
 | 6. Clear error messages | ✅ | Actionable error reporting |
-| 7. Zero false positives | ✅ | Conservative validation rules |
+| 7. Conservative compatibility checks | ✅ | Conservative validation rules |
 | 8. Integration with reload flow | ✅ | Validation before state migration |
 
 **All criteria met!** ✅
@@ -296,19 +306,19 @@ If validation fails:
 ## Known Limitations
 
 ### 1. ModuleRegistry Storage
-**Current:** ModuleRegistry available via `get_module_registry()` but requires manual setup
-**Future:** Auto-initialization in Environment creation
+**Historical Phase 5 status:** ModuleRegistry was available via `get_module_registry()`
+but required manual setup. Later watch-mode integration closed this gap.
 
 ### 2. Watch Mode Integration
-**Current:** Watch mode still uses process restart (safe fallback)
-**Future:** Direct HotReload signal in watch mode (requires registry setup)
+**Historical Phase 5 status:** Watch mode still used a process-restart fallback.
+The current local CLI path performs coordinated live reload under `--watch`.
 
 ### 3. Advanced Type Coercion
-**Current:** Strict type matching only
+**Historical Phase 5 status:** Strict type matching only
 **Future:** Safe type coercions (e.g., i32 -> i64 where applicable)
 
 ### 4. Partial Validation
-**Current:** Validates all exports
+**Historical Phase 5 status:** Validates all exports
 **Future:** Validate only used exports for faster checks
 
 ## Comparison with Phase 4
@@ -321,7 +331,7 @@ If validation fails:
 | Signature Validation | ❌ | ✅ |
 | Broadcast Signals | ❌ | ✅ |
 | Error Prevention | Partial | Complete |
-| Production Ready | Development | **Production** |
+| Historical phase label | Development | Phase checklist complete |
 
 ## Usage Example
 
@@ -403,15 +413,16 @@ env.send_to_all(Signal::Kill);
 
 ## Conclusion
 
-Phase 5 successfully transforms the hot reload system into a **production-ready** feature with:
+Phase 5 recorded the following milestones:
 
 ✅ **Safety:** Signature validation prevents incompatible reloads
-✅ **Reliability:** Zero-risk validation before state changes  
+✅ **Reliability:** Validation before state changes on the covered path
 ✅ **Usability:** Clear error messages and broadcast APIs
-✅ **Performance:** < 10ms validation overhead
+📋 **Performance:** No production-path latency bound was established
 ✅ **Compatibility:** Fully backward compatible with Phase 4
 
-The system is now ready for production use in local process scenarios.
+This historical completion statement does not establish production readiness.
+Use [Core Values Status](../core_values/status.md) for the current boundary.
 
 **Phase 5 Status: COMPLETE** 🎉
 

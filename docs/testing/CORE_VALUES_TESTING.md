@@ -80,25 +80,37 @@ including known gaps, is `docs/core_values/status.md`.
 
 ## Known Gaps
 
-- The QUIC benchmark and transport E2E stop at request dispatch; a live
-  cross-node process-mailbox round trip is not benchmarked.
+- `distributed_messaging` and the QUIC transport E2E stop at decoded request
+  dispatch. `distributed_latency` separately measures a persistent two-node
+  path from global-registry lookup through confirmed QUIC delivery into a live
+  native-process mailbox and a confirmed reply; it excludes guest-Wasm host
+  calls, multi-host deployment, and partitions.
 - Cluster-wide process, memory, and network quota stress tests are not present.
 - Cross-node hot reload and node-crash recovery do not yet have production-path
   E2E coverage.
-- The current TLS guest ABI accepts raw private-key bytes through a const buffer that must remain
-  reusable for SDK address fallback. The host zeroizes its temporary PEM copy but does not erase
-  the original guest buffer or duplicates elsewhere in Wasm memory, so it cannot establish that an
-  entire `MemorySnapshot` is key-free. Intentional distributed credential delivery is a separate boundary;
-  complete avoidance requires a future provider-handle guest ABI.
-- The default TLS listener credential provider is process-local and cannot prove persisted or
-  restart restoration. That scenario requires an explicitly injected provider plus dedicated
-  reprovisioning, expiry, revocation, and recovery tests.
+- New guests can keep listener private-key bytes out of Wasm by using
+  `tls_bind_with_credential`. Actual-Wasm tests cover bind, accept, TLS traffic,
+  fail-closed capability and scope checks, and marker-free guest memory and
+  audit output. Deprecated raw-key `tls_bind` remains and cannot establish
+  key-free guest memory; raw distributed CA/signing imports also remain an
+  unresolved privileged boundary.
+- Version-2 listener snapshots contain the local address plus an opaque handle
+  and can rebind while that scoped handle remains resolvable. The default
+  provider is process-local and does not survive restart; persisted recovery
+  requires an injected reprovisioning provider. Same-runtime listener and
+  stream transfer is tested, while serialized active streams, restart, and
+  cross-node restoration remain unsupported.
 - Cloud CLI lifecycle tests inject a deterministic fake credential store. CI compiles each native
   provider, but it does not prove that Keychain, Credential Manager, or Secret Service is available
   and unlocked in a representative user session; release validation needs platform smoke tests.
+- `tests/multilanguage_guest_e2e.rs` verifies pinned Rust, TinyGo, and
+  AssemblyScript compiler artifacts against process spawn, tagged messaging,
+  timeout, and permission-denial imports. These are low-level compatibility
+  fixtures, not stable SDK packages.
 - OTP1 remains a low-level wire contract. Packaged Rust, TinyGo, and
-  AssemblyScript guest SDKs, guest-side Supervisor/GenStatem/GenEvent libraries,
-  global named GenServers, and distributed supervision remain follow-up work.
+  AssemblyScript OTP adapters, guest-side Supervisor/GenStatem/GenEvent
+  libraries, global named GenServers, and distributed supervision remain
+  follow-up work.
 
 ## Adding Evidence
 

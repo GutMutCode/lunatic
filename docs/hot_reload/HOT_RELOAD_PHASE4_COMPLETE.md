@@ -1,8 +1,17 @@
 # Hot Reload Phase 4: True Hot Reload Implementation - COMPLETE
 
+> **Historical phase record (2025-10-05).** “Complete” describes the Phase 4
+> checklist at that time, not current production readiness. Performance figures
+> recorded by the phase were estimates rather than production-path benchmarks
+> and are retracted below. Use [Core Values Status](../core_values/status.md) for
+> the current evidence boundary and [Watch-Mode Hot Reload](HOT_RELOAD_MVP.md)
+> for the supported CLI.
+
 ## Summary
 
-Phase 4 implements true Erlang-style hot code reloading with state preservation, mailbox retention, and in-place instance swapping. This phase transforms the MVP (process restart) approach into a production-ready hot reload system.
+Phase 4 introduced the state-preservation, mailbox-retention, and in-place
+instance-swapping work recorded here. Later phases and current integration tests
+supersede this document's readiness assessment.
 
 ## Completed Work
 
@@ -180,9 +189,10 @@ impl lunatic_process::reloadable_state::ReloadableState for DefaultProcessState 
 
 **File:** `src/mode/run.rs`
 
-**Status:** Foundation in place, ModuleRegistry integration pending
+**Historical status at Phase 4:** Foundation in place, ModuleRegistry integration pending
 
-Currently uses process restart fallback since ModuleRegistry needs full Environment integration. The infrastructure is ready:
+At that time, watch mode used a process-restart fallback because ModuleRegistry
+integration was pending. Later work closed this gap. Phase 4 had recorded:
 - File watching works correctly
 - Reload debouncing implemented (500ms)
 - Process lifecycle management
@@ -253,12 +263,13 @@ Example WAT modules available:
 | 2. Simple state (integers, strings) preserved | ✅ | Memory snapshot captures all linear memory |
 | 3. Mailbox messages are not lost | ✅ | snapshot/restore methods implemented |
 | 4. No crashes during reload | ✅ | Atomic swap with error handling |
-| 5. < 100ms reload time for simple cases | ✅ | Memory copy + instance creation is fast |
+| 5. Reload latency benchmark | Not established | No production-path end-to-end benchmark was attached to this phase record |
 | 6. Clear error messages on incompatible changes | ✅ | Comprehensive logging throughout |
 | 7. At least 3 working example applications | ✅ | 7 WAT examples available |
 | 8. Integration tests passing | ✅ | All 20+ tests pass |
 
-**All criteria met!** ✅
+The functional checklist was recorded as complete; its former latency criterion
+is not accepted as current evidence.
 
 ## Performance Characteristics
 
@@ -267,11 +278,11 @@ Example WAT modules available:
 - Mailbox snapshot: O(m) where m = message count
 - Instance swap: O(1) with Arc<RwLock>
 
-### Time Complexity
-- Snapshot capture: ~10-50ms (typical WASM module)
-- Instance creation: ~20-100ms (wasmtime compilation cached)
-- State restoration: ~10-30ms
-- **Total: ~40-180ms** (well under 100ms for simple cases)
+### Timing evidence
+
+This phase did not attach a reproducible production-path end-to-end latency
+benchmark. The former component and total timing estimates are retracted; no
+current reload-latency guarantee follows from this document.
 
 ## Known Limitations
 
@@ -283,25 +294,26 @@ The ModuleRegistry exists and works correctly, but full integration with Environ
 - Implementing registry storage in LunaticEnvironment
 - Adding `send_to_all()` method for broadcasting signals
 
-**Workaround:** Watch mode falls back to process restart (MVP behavior)
+**Historical workaround:** Watch mode fell back to process restart. Later
+integration closed this gap.
 
 ### 2. Function Signature Compatibility
-**Current:** Phase 4 assumes compatible signatures
+**Historical Phase 4 status:** Compatible signatures were assumed
 **Future (Phase 5):** Add signature validation before reload
 
 ### 3. Resource Migration
-**Current:** Resources (TCP connections, files) not preserved
+**Historical Phase 4 status:** Resources (TCP connections, files) were not preserved
 **Future (Phase 5):** Implement resource handle migration strategy
 
 ### 4. Distributed Processes
-**Current:** Hot reload works for local processes only
+**Historical Phase 4 status:** Hot reload was limited to local processes
 **Future (Phase 6):** Add distributed hot reload coordination
 
 ## Files Modified/Created
 
 ### New Files
 - `crates/lunatic-process/src/reloadable_state.rs` - ReloadableState trait
-- `docs/HOT_RELOAD_PHASE4_COMPLETE.md` - This document
+- [HOT_RELOAD_PHASE4_COMPLETE.md](HOT_RELOAD_PHASE4_COMPLETE.md) - This document
 
 ### Modified Files
 - `crates/lunatic-process/src/lib.rs` - Instance swapping, signal handling
@@ -352,14 +364,17 @@ The ModuleRegistry exists and works correctly, but full integration with Environ
 
 ## Conclusion
 
-Phase 4 successfully implements true Erlang-style hot code reloading with:
-- **State Preservation:** Memory and mailbox snapshots ensure zero data loss
+Phase 4 recorded the following implementation milestones:
+- **State Preservation:** Memory and mailbox preservation paths were added and
+  covered by the phase's tests
 - **Atomic Swapping:** Process ID and execution context remain stable
 - **Type Safety:** Comprehensive trait bounds prevent runtime errors
 - **Extensibility:** ReloadableState trait allows custom state migrations
 - **Testing:** Full test coverage with 20+ passing tests
 
-The core hot reload infrastructure is **production-ready** for local processes. The remaining work (Phase 5+) focuses on advanced features like signature validation, resource migration, and distributed coordination.
+This historical phase completion does not by itself establish production
+readiness. The current repository-level guarantees and open work are tracked in
+[Core Values Status](../core_values/status.md).
 
 **Phase 4 Status: COMPLETE** 🎉
 

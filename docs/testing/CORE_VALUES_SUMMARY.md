@@ -17,6 +17,7 @@ cargo test --all
 
 | Claim | Evidence | Boundary |
 | --- | --- | --- |
+| Three source languages reach the same primitive guest actor ABI | Pinned Rust, TinyGo, and AssemblyScript builds feed `tests/multilanguage_guest_e2e.rs`; CI also executes each `_start` with `lunatic run` | Low-level process/message/timeout/permission compatibility only; no stable SDK, full API parity, or language-specific OTP adapter |
 | OTP adapters work on Lunatic processes and the guest message ABI | `lunatic-otp-patterns`, `tests/wasm_link_death.rs`, and `tests/otp_guest_wasm.rs` cover late/intake-safe Supervisor monitoring including an actual Wasm trap, named GenServer cleanup, one-worker-safe GenStatem/GenEvent lifecycles, and enveloped guest call/reply/timeout/stop | Packaged cross-language guest SDKs and distributed supervision remain open |
 | Hot reload preserves Wasm memory across module replacement | Embedded v1/v2 Wasmtime integration test | This test covers memory replacement, not every runtime resource |
 | Live in-process TLS sessions survive hot reload | Real handshake and traffic after state transfer | Serialized, restarted, and cross-process TLS restoration is intentionally unsupported |

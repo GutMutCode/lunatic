@@ -3,13 +3,16 @@
   "version": "1.0.0",
   "description": "AssemblyScript examples for Lunatic runtime",
   "scripts": {
-    "build:counter": "asc assembly/counter.ts --target release --bindings esm --exportRuntime --optimize --outFile build/counter.wasm",
-    "build:gen_server": "asc assembly/gen_server_example.ts --target release --bindings esm --exportRuntime --optimize --outFile build/gen_server_example.wasm",
-    "build:supervisor": "asc assembly/supervisor_example.ts --target release --bindings esm --exportRuntime --optimize --outFile build/supervisor_example.wasm",
-    "build": "npm run build:counter && npm run build:gen_server && npm run build:supervisor",
-    "test": "node test.js"
+    "build": "npm run build:guest-e2e",
+    "build:guest-e2e": "asc assembly/guest_e2e.ts --target release --runtime stub --noAssert --optimize --outFile build/guest_e2e.wasm",
+    "build:counter": "asc assembly/counter.ts --target release --runtime stub --noAssert --optimize --outFile build/counter.wasm",
+    "test": "npm run build && cargo run --locked --quiet --manifest-path ../../Cargo.toml --bin lunatic -- run build/guest_e2e.wasm"
+  },
+  "engines": {
+    "node": ">=18",
+    "npm": ">=10"
   },
   "devDependencies": {
-    "assemblyscript": "^0.27.0"
+    "assemblyscript": "0.27.37"
   }
 }

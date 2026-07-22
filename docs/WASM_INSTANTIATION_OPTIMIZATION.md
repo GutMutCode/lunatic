@@ -1,5 +1,11 @@
 # WASM Instantiation Optimization Strategy
 
+> **Historical measurement note:** The October 2025 record did not preserve the
+> tested commit, dirty state, hardware profile, or complete toolchain. The values
+> below are archival observations, not a current performance baseline or release
+> guarantee. Re-run the checked-in Criterion benchmarks before making a current
+> claim.
+
 **Date**: October 6, 2025  
 **Baseline**: 23.055μs (15μs instantiation)  
 **Phase 1**: 14.238μs (-38.2% improvement) ✅  
@@ -304,10 +310,10 @@ The pooling allocator provides better-than-expected performance gains by pre-all
 
 ---
 
-### Phase 2: Instance Pool ✅ COMPLETE (Not Required)
+### Phase 2: Instance Pool ✅ IMPLEMENTED (Historical Experiment)
 
 **Goal**: Implement high-level instance pooling  
-**Status**: Implemented but **not needed** - Phase 1 was sufficient!
+**Status**: Implemented; the unpinned historical snapshot did not show a benefit beyond Phase 1.
 
 **Implementation** (crates/lunatic-process/src/instance_pool.rs):
 
@@ -365,7 +371,7 @@ instance_pool_cold_path: 3.67μs  (no pool, creating new instances)
 ```
 
 **Analysis**:
-The instance pool provides **negligible benefit** (~120ns difference) because:
+The instance pool showed **no meaningful benefit in this unpinned historical snapshot** because:
 1. Wasmtime's pooling allocator (Phase 1) already optimized memory allocation
 2. Instance creation is now only **3.7μs** (down from 15μs baseline)
 3. The remaining spawn overhead (10.5μs) comes from:
@@ -374,7 +380,10 @@ The instance pool provides **negligible benefit** (~120ns difference) because:
    - Environment registration (~2μs)
    - Async overhead (~3.5μs)
 
-**Conclusion**: Phase 1 alone achieved the performance goals. Application-level instance pooling is **not necessary** when using Wasmtime's pooling allocator.
+**Conclusion**: Phase 1 met the recorded target in this historical fixture, and
+the application-level pool did not show a benefit in its two recorded samples.
+Rebenchmark the current code and representative workloads before deciding
+whether application-level pooling is useful.
 
 ---
 
@@ -387,11 +396,11 @@ The instance pool provides **negligible benefit** (~120ns difference) because:
 - Reduced instance creation: **~15μs → 3.7μs** (-75%)
 - **Single configuration change** delivered massive performance gains
 
-**Phase 2 (Application Instance Pool)**: ⚠️ **NOT NEEDED**
+**Phase 2 (Application Instance Pool)**: ⚠️ **HISTORICAL RESULT**
 - Implemented fully functional instance pool
-- Measured benefit: **~120ns** (3.79μs vs 3.67μs)
-- Wasmtime's pooling allocator already handles memory reuse efficiently
-- Application-level pooling adds complexity without meaningful benefit
+- Historical samples were effectively tied (3.79μs vs 3.67μs); the record is not precise enough to claim a current sub-microsecond delta
+- Wasmtime's pooling allocator handled memory reuse efficiently in this fixture
+- The complexity/benefit tradeoff requires a current, reproducible benchmark
 
 ### Path to <10μs Target
 
@@ -415,7 +424,7 @@ To reach the <10μs target, we need to optimize the **10.5μs of non-instantiati
 
 ---
 
-### Phase 3: Benchmark & Tune (DEPRECATED - Not Required)
+### Phase 3: Benchmark & Tune (Historical Follow-up Plan)
 
 **Goals**:
 1. Measure actual speedup
@@ -465,7 +474,7 @@ fn bench_pooled_spawn(c: &mut Criterion) {
 - Async overhead: ~3.5μs (25%)
 
 **Phase 1 Status**: ✅ Exceeded expectations  
-**Phase 2 Status**: ⚠️ Implemented but **not beneficial** (only 120ns improvement)
+**Phase 2 Status**: ⚠️ Implemented but **not beneficial in the unpinned historical snapshot**
 
 ---
 
@@ -579,9 +588,10 @@ fn bench_pooled_spawn(c: &mut Criterion) {
 
 - [Wasmtime Pooling Allocator](https://docs.wasmtime.dev/api/wasmtime/struct.Config.html#method.allocation_strategy)
 - [InstancePre Documentation](https://docs.wasmtime.dev/api/wasmtime/struct.InstancePre.html)
-- [PERFORMANCE_ANALYSIS.md](PERFORMANCE_ANALYSIS.md)
-- [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md)
+- [PERFORMANCE_ANALYSIS.md](benchmarks/PERFORMANCE_ANALYSIS.md)
+- [BENCHMARK_RESULTS.md](benchmarks/BENCHMARK_RESULTS.md)
 
 ---
 
-**Next**: Implement Phase 1 (Wasmtime pooling allocator)
+**Next**: Re-run the checked-in benchmarks with reproducibility metadata before
+making a current pooling decision.

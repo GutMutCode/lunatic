@@ -1,10 +1,18 @@
 # Hot Reload Phase 6: Integration & Future Roadmap - COMPLETE
 
+> **Historical phase record (2025-10-05).** “Complete” refers to the Phase 6
+> documentation checklist. Readiness, performance, and limitation statements in
+> the original record are not current guarantees. Unsupported latency and
+> zero-interruption claims are retracted below. See
+> [Core Values Status](../core_values/status.md) for current evidence and
+> [Watch-Mode Hot Reload](HOT_RELOAD_MVP.md) for current usage.
+
 ## Summary
 
-Phase 6 focuses on documenting the complete hot reload system, outlining known limitations, and providing a clear roadmap for future enhancements. The core hot reload functionality from Phases 4-5 is production-ready for local processes.
+Phase 6 documented the implementation state and roadmap as understood at the
+time. Later integration work and tests supersede its readiness assessment.
 
-## Current State Assessment
+## Historical State Assessment
 
 ### ✅ What Works (Phases 4-5)
 
@@ -21,9 +29,9 @@ Phase 6 focuses on documenting the complete hot reload system, outlining known l
 - Type-safe signal broadcasting
 
 **Performance:**
-- 40-180ms reload time (< 100ms typical)
-- < 10ms validation overhead
-- Efficient memory operations
+- No reproducible production-path end-to-end reload-latency bound was attached
+  to this phase record.
+- The former reload and validation timing estimates are retracted.
 
 ### 📋 Known Limitations
 
@@ -74,37 +82,25 @@ impl MyState {
 - Monitor relationship preservation
 - Configurable persistence policy
 
-#### 3. Watch Mode Integration
-**Status:** Manual ModuleRegistry setup required
+#### 3. Watch Mode Integration (current correction)
+**Status:** Integrated for the local CLI path
 
-**Current:**
+**Current CLI contract:**
 ```rust
-// Watch mode uses process restart (safe fallback)
+// --watch is the sole file-triggered reload mode flag.
 lunatic run --watch app.wasm
-// → File change → Process restart → State lost
 ```
 
-**Desired:**
-```rust
-// Watch mode with true hot reload
-lunatic run --watch --hot-reload app.wasm  
-// → File change → HotReload signal → State preserved
-```
-
-**Blocker:** ModuleRegistry needs environment-level initialization
-
-**Future (Phase 6.5):**
-```rust
-// In run_with_watch()
-let module_registry = Arc::new(ModuleRegistry::new());
-// ... auto-register modules ...
-// → File change → HotReload signal
-```
+The original manual-registry blocker was closed by later integration work. The
+current local watch path creates the registry and reload coordinator, compiles
+the changed module, and applies the coordinated update. See
+[Watch-Mode Hot Reload](HOT_RELOAD_MVP.md) for its tested limits.
 
 #### 4. Distributed Hot Reload
 **Status:** Local processes only
 
-**Current:** Single-node hot reload works perfectly
+**Current correction:** Production-path tests cover the local reload transaction;
+distributed and cross-node behavior remains unverified.
 
 **Future (Phase 9):**
 - Distributed module registry
@@ -232,12 +228,8 @@ wat2wasm app_v1.wat -o app.wasm
 # Run with watch mode
 lunatic run --watch app.wasm
 
-# Modify app_v1.wat → app_v2.wat
-# → Process restarts (safe fallback)
-
-# Future: With --hot-reload flag
-lunatic run --watch --hot-reload app.wasm
-# → True hot reload, state preserved
+# Modify app_v1.wat → app_v2.wat. The existing --watch mode is the only
+# file-triggered reload entry point.
 ```
 
 ### For Runtime Developers
@@ -287,38 +279,16 @@ if !errors.is_empty() {
 **Total: 21+ tests passing**
 
 ### Manual Testing
-```bash
-# 1. Basic hot reload test
-cd examples
-wat2wasm counter_v1.wat -o counter.wasm
 
-# 2. Modify and observe (currently restarts)
-# Edit counter_v1.wat, save
-# → Process restarts
+Use the current [demo instructions](../../examples/DEMO_INSTRUCTIONS.md), which
+exercise the supported `lunatic run --watch` spelling.
 
-# 3. Future: True hot reload
-# → State preserved, process continues
-```
+## Retracted Performance Estimates
 
-## Performance Benchmarks
-
-| Operation | Time | Notes |
-|-----------|------|-------|
-| Memory snapshot | 10-50ms | Depends on memory size |
-| Mailbox snapshot | < 1ms | Depends on message count |
-| Signature validation | 1-5ms | Depends on export count |
-| Instance creation | 20-100ms | Wasmtime compilation |
-| State restoration | 10-30ms | Memory copy |
-| **Total reload** | **40-180ms** | ✅ < 100ms typical |
-
-### Memory Usage
-
-| Component | Per-Process | Per-Version |
-|-----------|-------------|-------------|
-| MemorySnapshot | ~Same as WASM memory | N/A |
-| ModuleRegistry | Minimal | ~5-10MB |
-| ProcessContext | ~1KB | N/A |
-| Total overhead | **< 1% of process memory** | **~10MB/version** |
+The original phase document listed component timings, total reload latency, and
+per-process/per-version memory estimates without a reproducible
+production-path benchmark. Those figures are removed and must not be used as
+current performance or capacity claims.
 
 ## Future Roadmap
 
@@ -348,13 +318,11 @@ pub trait ResourceMigration {
 - [ ] Atomic link update
 - [ ] Death notification replay
 
-### Phase 9: Watch Mode Full Integration (1-2 weeks)
-**Priority: High**
+### Phase 9: Watch Mode Full Integration (historical roadmap item)
 
-- [ ] Auto-create ModuleRegistry
-- [ ] Direct HotReload on file change
-- [ ] Remove process restart fallback
-- [ ] `--hot-reload` CLI flag
+Later work integrated the registry and reload coordinator under the existing
+`--watch` flag. The implementation sketch below is retained only as historical
+design context.
 
 **Implementation:**
 ```rust
@@ -401,11 +369,10 @@ lunatic run --watch app.wasm
 // Programmatic hot reload via ModuleRegistry
 ```
 
-**Future (Phase 9):**
+**Integrated CLI spelling:**
 ```rust
-// Full watch mode integration
-lunatic run --watch --hot-reload app.wasm
-// Automatic hot reload, zero config
+// Full watch mode integration uses the existing flag.
+lunatic run --watch app.wasm
 ```
 
 ### Preparing Apps for Hot Reload
@@ -461,9 +428,9 @@ fn code_change(&mut self, old: u32, new: u32) -> Result<()> {
 
 ### Achievements (Phases 4-6)
 
-✅ **Complete hot reload infrastructure** for local processes
-✅ **Production-ready** state preservation and validation
-✅ **Zero-downtime** code updates (40-180ms reload time)
+✅ Local hot-reload infrastructure milestones recorded by the phase
+✅ State-preservation and validation paths recorded by the phase
+📋 No end-to-end latency or zero-interruption guarantee established
 ✅ **Type-safe** signature validation
 ✅ **Comprehensive** test coverage (21+ tests)
 ✅ **Well-documented** API and usage patterns
@@ -472,25 +439,19 @@ fn code_change(&mut self, old: u32, new: u32) -> Result<()> {
 
 📋 Resource migration (workaround: reconnect pattern)
 📋 Link/monitor persistence (low impact)
-📋 Watch mode requires manual setup (Phase 9)
+✅ Watch mode is integrated under the existing `--watch` flag
 📋 Local processes only (distributed in Phase 10)
 
 ### Recommendation
 
-**For Production Use:**
-- ✅ Use for local, stateful processes
-- ✅ Implement reconnection for resources
-- ✅ Test signature compatibility before deploy
-- ⚠️  Manual ModuleRegistry setup for now
-
-**For Development:**
-- ✅ Use watch mode (process restart fallback)
-- ✅ Plan for Phase 9 (auto hot reload)
-- ✅ Design state to be reloadable
+Use the current [watch-mode guide](HOT_RELOAD_MVP.md) and
+[Core Values Status](../core_values/status.md) when deciding whether the
+documented local behavior is suitable for a workload.
 
 **Phase 6 Status: COMPLETE** 🎉
 
-The hot reload system is **production-ready for local processes** with clear documentation of limitations and future roadmap.
+This phase record does not establish production readiness; the current status
+document defines the verified boundary.
 
 ---
 
