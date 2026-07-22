@@ -40,6 +40,7 @@ enforces the configured thresholds in `scripts/check_bench_thresholds.py`.
 | QUIC framing | Production chunk framing, multi-chunk reassembly, MessagePack decode and dispatch callback | `cargo test -p lunatic-distributed --test quic_transport` |
 | Host import inventory | Runtime linker exports compared with `wat/all_imports.wat` | `cargo test -p lunatic-runtime --test imports_match` |
 | Resource limits | Runtime memory, table, file and network limit contracts | `cargo test -p lunatic-runtime --test resource_limits` |
+| Cloud CLI credential lifecycle | Injected protected-store boundary plus production CLI/config/request paths for login, sanitized cookie reuse, local expiry, redirect refusal, persistent worker affinity, verified tombstone logout/retry, linked-config rejection, unavailable-store failure, legacy plaintext migration, and secret-marker absence | `cargo test --bin lunatic mode::credential_store::tests`<br>`cargo test --bin lunatic mode::config::tests`<br>`cargo test --bin lunatic mode::login::tests`<br>`cargo test --bin lunatic mode::execution::tests::logout_subcommand_parses` |
 
 The full workspace command is the release gate because it also catches
 cross-crate compilation and integration failures that targeted commands can miss.
@@ -91,6 +92,9 @@ including known gaps, is `docs/core_values/status.md`.
 - The default TLS listener credential provider is process-local and cannot prove persisted or
   restart restoration. That scenario requires an explicitly injected provider plus dedicated
   reprovisioning, expiry, revocation, and recovery tests.
+- Cloud CLI lifecycle tests inject a deterministic fake credential store. CI compiles each native
+  provider, but it does not prove that Keychain, Credential Manager, or Secret Service is available
+  and unlocked in a representative user session; release validation needs platform smoke tests.
 - Supervisor monitor-event intake and process-runtime adapters for GenStatem and
   GenEvent remain follow-up work.
 

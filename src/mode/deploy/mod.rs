@@ -40,7 +40,8 @@ struct NewAppInstance {
 
 pub(crate) async fn start() -> Result<()> {
     let cwd = std::env::current_dir()?;
-    let mut config = ConfigManager::new().map_err(|e| anyhow!("Failed to load config {e:?}"))?;
+    let mut config =
+        ConfigManager::new().map_err(|error| anyhow!("Failed to load config: {error}"))?;
     let project_config = config
         .project_config
         .as_ref()

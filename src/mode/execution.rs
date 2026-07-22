@@ -29,6 +29,8 @@ enum Commands {
     Node(super::node::Args),
     /// Login to Lunatic cloud
     Login(super::login::Args),
+    /// Remove the local Lunatic cloud login
+    Logout(super::logout::Args),
     /// Manage lunatic applications
     App(super::app::Args),
     /// Deploy Lunatic app to cloud
@@ -50,7 +52,19 @@ pub(crate) async fn execute(augmented_args: Option<Vec<String>>) -> Result<()> {
         Commands::Control(a) => super::control::start(a).await,
         Commands::Node(a) => super::node::start(a).await,
         Commands::Login(a) => super::login::start(a).await,
+        Commands::Logout(a) => super::logout::start(a),
         Commands::App(a) => super::app::start(a).await,
         Commands::Deploy => super::deploy::start().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logout_subcommand_parses() {
+        let args = Args::try_parse_from(["lunatic", "logout"]).unwrap();
+        assert!(matches!(args.command, Commands::Logout(_)));
     }
 }

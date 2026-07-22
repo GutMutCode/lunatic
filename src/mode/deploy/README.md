@@ -20,6 +20,22 @@ This platform-related subset of lunatic CLI app is a command-line interface tool
 
     Follow instructions displayed in Your terminal and authorize the CLI.
 
+    The CLI stores the resulting credential in Keychain (macOS), Credential
+    Manager with local persistence (Windows), or Secret Service (Linux). The global `lunatic.toml`
+    contains only an opaque reference. Headless Linux sessions must provide a
+    working user session D-Bus and unlocked Secret Service collection; the CLI
+    fails closed and has no plaintext fallback.
+
+    To remove the local credential and its reference:
+
+    ```
+    lunatic logout
+    ```
+
+    Logout is local only; it does not revoke the provider-side session. See
+    [`docs/security/CLI_CREDENTIAL_STORAGE.md`](../../../docs/security/CLI_CREDENTIAL_STORAGE.md)
+    for migration, recovery, and verification details.
+
 
 3. Create a new Lunatic Rust project (skip if you have an existing one).
 

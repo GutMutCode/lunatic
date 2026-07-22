@@ -81,7 +81,7 @@ The event schema never accepts:
 - message, SQL, HTTP, or Wasm payload bytes;
 - raw diagnostic errors.
 
-Related runtime `Debug` implementations redact credential-bearing configuration and migration data. This does not turn general diagnostic logging into an audit sink; operators must still protect all runtime logs.
+Related runtime `Debug` implementations redact credential-bearing configuration and migration data. Lunatic Cloud CLI login material is stored behind an opaque reference in the native OS credential store; its authentication path does not emit an `audit` event or put response bodies, response headers, login identifiers, or cookies into diagnostic errors. See [CLI Credential Storage](./CLI_CREDENTIAL_STORAGE.md). This does not turn general diagnostic logging into an audit sink; operators must still protect all runtime logs.
 
 Audit redaction is separate from the TLS listener snapshot contract. Version-2 listener entries
 contain only a local address and an opaque provider handle, while the certificate and raw private

@@ -15,6 +15,15 @@ These public Rust API and wire-contract changes require the next published Lunat
 
 ### Added
 
+- Lunatic Cloud CLI credentials now use macOS Keychain, Windows Credential Manager, or Linux
+  Secret Service behind an opaque configuration reference. Legacy plaintext login records migrate
+  only after protected-store read-back verification, credentials are bound to the configured
+  provider origin and CLI installation, authenticated requests reject expired cookies and
+  redirects, unavailable stores fail closed, concurrent mutations and native backend access are
+  serialized, first login stages a crash-recoverable deletion tombstone before its protected
+  write, and `lunatic logout` uses that retryable opaque tombstone without migrating legacy
+  plaintext first.
+
 - Hot reload Phase 4: True Erlang-style hot code reloading
   - `ReloadableState` trait for custom state serialization/migration
   - Enhanced memory snapshots with stack/heap pointer preservation

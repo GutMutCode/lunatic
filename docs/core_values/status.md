@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-22
 
-Reviewed working tree based on: `54b3cced8142a0e9a3f71b3689019c7fbea96c29` plus the reviewed working-tree changes for Hanary #1677
+Reviewed working tree based on: `2bff20678eb90cef083075d58e63cff663e546c7` plus the reviewed working-tree changes for Hanary #1678
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -21,7 +21,7 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and acknowledged atomic reload/rollback/in-doubt behavior are production-path tested. Cross-node recovery remains incomplete. |
 | Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
-| Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. Version-2 TLS listener snapshots exclude raw private-key bytes, and typed/redacted V1 audit events cover major privileged boundaries, but the guest TLS ABI still accepts raw key input, complete resource accounting and receiver path policy remain open, and audit delivery is not durable/required. |
+| Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. Version-2 TLS listener snapshots exclude raw private-key bytes, Cloud CLI credentials use native protected stores, and typed/redacted V1 audit events cover major privileged boundaries, but the guest TLS ABI still accepts raw key input, complete resource accounting and receiver path policy remain open, and audit delivery is not durable/required. |
 | Fault Tolerance & HA | Partial | Actual-Wasm links and monitors, process-local live reload, host-side OTP components, snapshots, and registry quorum components exist. Distributed recovery paths remain incomplete. |
 | Async by Default | Partial | Wasmtime preemption, bounded actor ingress, and several async host paths exist. Unverified blocking host calls and scheduler fairness prevent a stronger claim. |
 | Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
@@ -97,6 +97,16 @@ missing.
 - Version-2 `ResourceMigrationSnapshot` TLS listener entries serialize only a local address and an opaque 128-bit handle, never a certificate or raw private key. Provider access is authorized against both environment and process identity. The default provider is process-local, five-minute, single-use, and capped at 1,024 unexpired entries; missing, expired, wrong-scope, capacity, and provider-error paths fail closed with stable secret-free errors. Unversioned, missing-version, unknown-version, and trailing-data snapshots are rejected without an automatic importer (`crates/lunatic-process/src/resource_migration.rs`, `src/tls_credentials.rs`, `src/state.rs`).
 - The `tls_bind` host path zeroizes its temporary host PEM copy while preserving the const guest input required by SDK multi-address fallback. The production-import test checks that ABI behavior and audit-event redaction on an invalid-key path (`crates/lunatic-networking-api/src/tls_tcp.rs`, `tests/capability_attenuation.rs`).
 - A directly tested same-runtime helper transfers supported live network resource maps, including the bound TLS listener/acceptor and active TLS sessions, without provider lookup or snapshot serialization. Serialized active TLS stream restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
+- Lunatic Cloud CLI credentials are held in macOS Keychain, Windows Credential Manager, or Linux
+  Secret Service behind an opaque config reference. The production config/login/request/logout
+  paths fail closed without a backend, atomically migrate legacy plaintext after store/read-back
+  verification, reject expired or partial credentials, send one sensitive cookie header without
+  redirects, serialize native operations on one lifetime-owning worker, stage an opaque deletion
+  tombstone before the first protected write, and retain it across logout failures so interrupted
+  login or migration copies remain recoverable.
+  Linked global config files are rejected and errors remain stable and secret-free
+  (`src/mode/credential_store.rs`,
+  `src/mode/config.rs`, `src/mode/login.rs`, `src/mode/logout.rs`).
 
 ### Boundary
 
@@ -107,6 +117,10 @@ missing.
 - Audit delivery is best-effort and fail-open: a dedicated writer uses a bounded 1,024-record queue, drops newest on saturation, opens a health circuit on sink failure, exposes counters, and waits at most 250 ms at graceful shutdown. The default sink ends at the enabled Rust `log` facade; it does not prove disk/remote persistence, action-plus-audit atomicity, retention, or tamper evidence. An explicit `RUST_LOG` can still disable `audit=info`, and remaining non-privileged host calls are outside the event inventory.
 - The current guest TLS bind ABI still receives raw private-key bytes through a const buffer that SDKs may reuse for multi-address fallback. The host zeroizes only its temporary copy and deliberately does not mutate guest memory, so the original or duplicates can appear in a `MemorySnapshot`. Intentional distributed credential-delivery APIs are also outside this resource-snapshot guarantee. Avoiding guest key bytes altogether requires a future provider-handle guest ABI.
 - The running-Wasm reload transaction invokes the same-runtime live-resource transfer after its fallible preparation steps. Exact TLS session/ID preservation is tested at that transfer boundary, not yet by a guest-driven reload E2E. Serialized snapshots, host restarts, and cross-node migration cannot restore active TCP/TLS streams. A TLS listener can be rebound from a version-2 snapshot only while its scoped handle is resolvable; the default provider does not survive restart, a consumed or failed-attempt handle must not be replayed, and persisted/restart recovery requires an explicitly injected reprovisioning provider.
+- Cloud CLI tests inject a fake credential store and loopback provider. CI compiles native backends
+  on each supported OS, but availability, unlock prompts, desktop-session policy, and Linux session
+  D-Bus behavior still require representative platform smoke tests. Logout deletes local material
+  only because the provider API exposes no remote revocation endpoint.
 
 ## 4. Fault Tolerance and High Availability
 
@@ -167,6 +181,7 @@ missing.
 | Criterion mailbox benchmark | Local queue-operation cost for its configured workload | End-to-end process message latency or backpressure |
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
 | Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
+| Cloud CLI credential lifecycle tests | Production config/login/request/logout flow around an injected protected-store boundary, including plaintext migration and fail-closed errors | A configured/unlocked native store in a representative macOS, Windows, or Linux user session, or remote session revocation |
 
 The reviewed working tree must pass the complete local Rust build/test/lint/format gate and the repository's Linux and Windows GitHub Actions checks. Historical green runs do not establish the current audit, quota, reload, or Windows behavior; the exact reviewed commit and CI run are the acceptance evidence.
 

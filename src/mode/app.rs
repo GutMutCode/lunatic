@@ -51,7 +51,7 @@ pub struct ProjectDetails {
 pub(crate) async fn start(args: Args) -> Result<()> {
     match args.app {
         AppArgs::Create { name } => {
-            let mut config_manager = ConfigManager::new().unwrap();
+            let mut config_manager = ConfigManager::new()?;
             if config_manager.project_config.is_some() {
                 return Err(anyhow!(
                     "Project is already initialized, `lunatic.toml` exists in current directory."
