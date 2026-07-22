@@ -257,13 +257,7 @@ where
 
     let env_id = match &msg {
         Request::Spawn(spawn) => Some(spawn.environment_id),
-        Request::Message {
-            environment_id,
-            process_id: _,
-            tag: _,
-            data: _,
-            ..
-        } => Some(*environment_id),
+        Request::Message { environment_id, .. } => Some(*environment_id),
         Request::Response(_) => None,
         Request::Registry { .. } => None,
     };
