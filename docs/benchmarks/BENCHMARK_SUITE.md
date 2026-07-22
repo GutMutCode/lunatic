@@ -1,6 +1,6 @@
 # Lunatic Benchmark Suite
 
-Evidence review: 2026-07-21
+Evidence review: 2026-07-22
 
 Canonical implementation status: [`docs/core_values/status.md`](../core_values/status.md)
 
@@ -32,6 +32,8 @@ Historical numeric results in the companion documents are from 2025-10-06. They 
 | `instance_pool.rs` | Component harness | Pool acquire/release and hit/miss behavior | Does not establish whole-process spawn behavior under production load |
 | `distributed_messaging.rs` | Micro + transport boundary | Encode/decode and real loopback mTLS QUIC framing/reassembly/dispatch | Stops at decoded callback; no registry-to-live-mailbox delivery |
 | `distributed_latency.rs` | Component + production E2E | Control-plane node lookup; global registry lookup followed by a confirmed two-node mTLS QUIC request/reply through live Lunatic native-process mailboxes | Cluster creation, quorum registration, and connection warm-up are outside measurement; no guest-Wasm host-call boundary |
+| `congestion::tests::adversarial_slow_destination_fairness_benchmark` | Adversarial transport gate | Holds one 128 KiB logical lane above the 64 KiB QUIC stream window while sampling an independent lane 16 times | Loopback mTLS and scheduler-to-peer receipt only; no destination mailbox or production-network latency claim |
+| `distributed_registry_e2e::replayed_message_executes_server_side_effect_once_across_reconnect` | Production replay E2E | Reconnects an authenticated peer with the same transport ID and proves the real destination mailbox observes the side effect once | Deterministic correctness gate, not a throughput measurement |
 
 `distributed_registry_live_mailbox_round_trip` is the production-path measurement. Its persistent two-node harness resolves the live echo process from the global registry on node 1, sends through the production distributed client and full node server to node 2, receives the request in a real Lunatic mailbox, sends a confirmed reply, and observes that reply in a live node-1 mailbox. By contrast, `distributed_quic_message_dispatch_2kb` in `distributed_messaging.rs` deliberately stops at the decoded callback boundary and is transport-boundary evidence only.
 
@@ -57,6 +59,24 @@ cargo bench --bench distributed_latency
 ```
 
 Criterion HTML reports are written below `target/criterion/`.
+
+Run the deterministic adversarial backpressure gate separately:
+
+```bash
+cargo test -p lunatic-distributed congestion::tests::adversarial_slow_destination_fairness_benchmark -- --nocapture
+```
+
+The gate first proves that the stalled lane retains its only admission slot, then requires all 16 independent-lane samples—and therefore the nearest-rank p99—to reach the peer within 100 ms. It also verifies that the stalled message keeps its outbound byte lease until cancellation and that every lease is released afterward. The threshold is a same-host regression guard, not a general production latency objective.
+
+Run the production side-effect replay gate separately:
+
+```bash
+cargo test --test distributed_registry_e2e replayed_message_executes_server_side_effect_once_across_reconnect -- --nocapture
+```
+
+The outbound scheduler reserves lane 0 and a separate 64-message/1 MiB budget for responses and registry control traffic. Data routes use the remaining lanes, with exact retained-allocation accounting at each lane and node plus the shared 1,024-message/32 MiB outbound ceiling. A transport-complete data message remains owned until its authenticated application response arrives; a response from an earlier attempt cancels an unfinished replay.
+
+Replay protection is deliberately finite and fail-closed. Application retries have a 45-second absolute window once the first attempt can reach the peer. Receivers retain at most 16,384 terminal fingerprints and bounded responses for 180 seconds, which is longer than the retry window plus the 60-second message-reassembly deadline and three 10-second stream-idle margins. At the hard entry ceiling, new side effects are rejected with delivery backpressure instead of evicting a live tombstone. Consequently, a sustained rate above roughly 91 new replay-protected requests per second per node can reach that ceiling before expiry; this is a correctness and memory bound, not a throughput target. A fenced acknowledgement protocol or configurable larger cache is required before claiming a higher sustained replay-protected rate.
 
 ## Historical Observation Summary
 

@@ -655,3 +655,82 @@ async fn spawn_response_waiter_accepts_only_the_intended_mtls_peer() -> Result<(
     drop(intended_transport_guard);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn replayed_message_executes_server_side_effect_once_across_reconnect() -> Result<()> {
+    let _test_guard = TEST_CLUSTER_LOCK.lock().await;
+    let mut cluster = TestCluster::new(2).await?;
+    let target_environment = cluster.create_environment(1).await?;
+    let (target, mut delivered_tags) = add_observer(&target_environment)?;
+
+    // Keep node 1's QUIC endpoint alive while stopping its application accept loop. Node 2 can
+    // enqueue responses, but node 1 cannot consume them, so no response can end the replay test
+    // before the same transport ID is resent on a fresh mTLS connection.
+    cluster.stall_node_server(0).await;
+    let original = Request::Message {
+        node_id: 1,
+        environment_id: ENVIRONMENT_ID,
+        process_id: target.id(),
+        tag: Some(70),
+        data: vec![1, 2, 3, 4],
+    };
+    let first_transport = cluster
+        .send_requests_as(
+            0,
+            1,
+            vec![
+                (9_001, original.clone()),
+                (
+                    9_002,
+                    Request::Message {
+                        node_id: 1,
+                        environment_id: ENVIRONMENT_ID,
+                        process_id: target.id(),
+                        tag: Some(71),
+                        data: Vec::new(),
+                    },
+                ),
+            ],
+        )
+        .await?;
+    let first = timeout(TEST_TIMEOUT, delivered_tags.recv())
+        .await
+        .context("original replay-test message was not delivered")?
+        .ok_or_else(|| anyhow!("replay-test observer closed after the original"))?;
+    let first_barrier = timeout(TEST_TIMEOUT, delivered_tags.recv())
+        .await
+        .context("original replay-test barrier was not delivered")?
+        .ok_or_else(|| anyhow!("replay-test observer closed before the first barrier"))?;
+    assert_eq!((first, first_barrier), (70, 71));
+    drop(first_transport);
+
+    let replay_transport = cluster
+        .send_requests_as(
+            0,
+            1,
+            vec![
+                (9_001, original),
+                (
+                    9_003,
+                    Request::Message {
+                        node_id: 1,
+                        environment_id: ENVIRONMENT_ID,
+                        process_id: target.id(),
+                        tag: Some(72),
+                        data: Vec::new(),
+                    },
+                ),
+            ],
+        )
+        .await?;
+    let replay_barrier = timeout(TEST_TIMEOUT, delivered_tags.recv())
+        .await
+        .context("replay-test reconnect barrier was not delivered")?
+        .ok_or_else(|| anyhow!("replay-test observer closed before the reconnect barrier"))?;
+    assert_eq!(
+        replay_barrier, 72,
+        "the duplicate transport ID executed its mailbox side effect again"
+    );
+    drop(replay_transport);
+    Ok(())
+}

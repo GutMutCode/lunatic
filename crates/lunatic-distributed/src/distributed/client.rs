@@ -1,9 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     sync::{
         atomic::{self, AtomicBool, AtomicU64, AtomicUsize},
-        Arc, Mutex,
+        Arc, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
@@ -11,17 +11,21 @@ use std::{
 use anyhow::{anyhow, Result};
 use async_cell::sync::AsyncCell;
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use crate::distributed::message;
 use dashmap::mapref::entry::Entry as DashEntry;
 use dashmap::DashMap;
 use tokio::sync::{
     mpsc::{error::TrySendError, Receiver, Sender},
-    Mutex as AsyncMutex, Notify, RwLock,
+    watch, Mutex as AsyncMutex, Notify, OwnedMutexGuard, RwLock,
 };
 
 use crate::{
-    congestion::{self, node_connection_manager, MessageChunk, NodeConnectionManager},
+    congestion::{
+        self, fair_node_connection_manager, node_queue_channels, AdmissionResult, AdmittedMessage,
+        FairNodeConnectionManager, NodeQueueSender,
+    },
     control,
     distributed::audit_verified_peer_protocol_denial,
     distributed::message::{Request, ResponseContent, Spawn},
@@ -78,28 +82,64 @@ pub struct MessageCtx {
     pub chunk_id: AtomicU64,
     pub offset: AtomicUsize,
     pub data: Bytes,
+    pub(crate) retained_bytes: usize,
+    pub(crate) class: OutboundClass,
+    pub(crate) application_ack: Option<ApplicationAckHandle>,
     pub(crate) outbound_lease: OutboundMessageLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutboundClass {
+    Data,
+    Control,
+}
+
+struct NewMessageParams {
+    message_id: MessageId,
+    env: EnvironmentId,
+    src: ProcessId,
+    node: NodeId,
+    dest: ProcessId,
+    class: OutboundClass,
+    data: Vec<u8>,
+}
+
+/// Stable production queue identity for one source-to-destination process pair.
+///
+/// Keeping the destination in the key prevents a saturated route from hiding another logical
+/// stream behind the source process's FIFO. FIFO is still preserved within each exact pair.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct ProcessQueueRoute {
+    pub(crate) src: ProcessId,
+    pub(crate) node: NodeId,
+    pub(crate) dest: ProcessId,
+}
+
+impl ProcessQueueRoute {
+    fn new(src: ProcessId, node: NodeId, dest: ProcessId) -> Self {
+        Self { src, node, dest }
+    }
 }
 
 pub(crate) struct ProcessQueueSender {
     pub(crate) generation: u64,
-    pub(crate) sender: Sender<MessageCtx>,
+    pub(crate) sender: Sender<AdmittedMessage>,
     pub(crate) admission_gate: Arc<AsyncMutex<()>>,
 }
 
 pub(crate) struct ProcessQueueReceiver {
     pub(crate) generation: u64,
-    pub(crate) receiver: RwLock<Receiver<MessageCtx>>,
+    pub(crate) receiver: RwLock<Receiver<AdmittedMessage>>,
     pub(crate) admission_gate: Arc<AsyncMutex<()>>,
 }
 
 pub(crate) struct NodeQueue {
-    sender: Sender<MessageChunk>,
+    sender: NodeQueueSender,
     manager: tokio::task::AbortHandle,
 }
 
 impl NodeQueue {
-    pub(crate) fn sender(&self) -> Sender<MessageChunk> {
+    pub(crate) fn sender(&self) -> NodeQueueSender {
         self.sender.clone()
     }
 
@@ -118,6 +158,20 @@ pub const MAX_OUTBOUND_IN_FLIGHT_MESSAGES: usize = 1_024;
 pub const MAX_OUTBOUND_IN_FLIGHT_BYTES: usize = 32 * 1024 * 1024;
 pub const OUTBOUND_PROCESS_QUEUE_CAPACITY: usize = 64;
 pub const OUTBOUND_NODE_QUEUE_CAPACITY: usize = 256;
+const MAX_CONTROL_OUTBOUND_MESSAGES: usize = 64;
+const MAX_CONTROL_OUTBOUND_BYTES: usize = 1024 * 1024;
+const MAX_APPLICATION_ACKS: usize = MAX_OUTBOUND_IN_FLIGHT_MESSAGES;
+const MAX_INBOUND_REPLAY_ENTRIES: usize = 16_384;
+// Keep terminal results beyond the complete replay window plus receiver reassembly and transport
+// idle margins. A replay that was already in flight when its deadline elapsed must still encounter
+// the tombstone instead of executing the side effect again after a slow or partitioned stream
+// resumes.
+const INBOUND_REPLAY_TTL: Duration = Duration::from_secs(180);
+// Once the first send attempt can emit bytes, retries remain finite so the bounded receiver
+// tombstone can outlive every attempt. Messages waiting for a connection or local admission do not
+// start this deadline because they cannot yet have caused a remote side effect.
+const APPLICATION_ACK_REPLAY_DEADLINE: Duration = Duration::from_secs(45);
+const MAX_REPLAY_ERROR_BYTES: usize = 1024;
 const MAX_REGISTRY_CLEANUP_IN_FLIGHT: usize = 8;
 const REGISTRY_CLEANUP_RETRY_TICK: Duration = Duration::from_millis(100);
 const MAX_REGISTRY_CLEANUP_BACKOFF: Duration = Duration::from_secs(5);
@@ -456,6 +510,481 @@ pub(crate) fn test_outbound_lease(bytes: usize) -> (OutboundMessageLease, Outbou
     (lease, OutboundBudgetProbe { budget })
 }
 
+struct ApplicationAckEntry {
+    expected_node: NodeId,
+    acknowledged: watch::Sender<bool>,
+}
+
+struct ApplicationAckRegistry {
+    entries: Mutex<HashMap<MessageId, ApplicationAckEntry>>,
+    max_entries: usize,
+}
+
+impl ApplicationAckRegistry {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_entries,
+        }
+    }
+
+    fn try_register(
+        self: &Arc<Self>,
+        message_id: MessageId,
+        expected_node: NodeId,
+    ) -> std::result::Result<ApplicationAckHandle, OutboundEnqueueError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= self.max_entries {
+            return Err(OutboundEnqueueError::new(
+                SendErrorKind::Backpressure,
+                format!(
+                    "Distributed application acknowledgement limit reached ({})",
+                    self.max_entries
+                ),
+            ));
+        }
+        let (acknowledged, receiver) = watch::channel(false);
+        let previous = entries.insert(
+            message_id,
+            ApplicationAckEntry {
+                expected_node,
+                acknowledged,
+            },
+        );
+        debug_assert!(previous.is_none(), "distributed message IDs must be unique");
+        drop(entries);
+        Ok(ApplicationAckHandle {
+            message_id,
+            acknowledged: receiver,
+            registry: self.clone(),
+            deadline: None,
+        })
+    }
+
+    fn expected_node(&self, message_id: MessageId) -> Option<NodeId> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&message_id)
+            .map(|entry| entry.expected_node)
+    }
+
+    fn acknowledge(&self, message_id: MessageId, source_node: NodeId) -> bool {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(entry) = entries.get(&message_id) else {
+            return false;
+        };
+        if entry.expected_node != source_node {
+            return false;
+        }
+        entry.acknowledged.send_replace(true);
+        true
+    }
+}
+
+pub(crate) struct ApplicationAckHandle {
+    message_id: MessageId,
+    acknowledged: watch::Receiver<bool>,
+    registry: Arc<ApplicationAckRegistry>,
+    deadline: Option<Instant>,
+}
+
+impl ApplicationAckHandle {
+    pub(crate) async fn wait(&mut self) -> bool {
+        loop {
+            if *self.acknowledged.borrow() {
+                return true;
+            }
+            if self.acknowledged.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    pub(crate) fn is_acknowledged(&self) -> bool {
+        *self.acknowledged.borrow()
+    }
+
+    pub(crate) fn is_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(APPLICATION_ACK_REPLAY_DEADLINE)
+    }
+
+    pub(crate) fn replay_deadline_remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    pub(crate) fn start_replay_window(&mut self) {
+        self.deadline
+            .get_or_insert_with(|| Instant::now() + APPLICATION_ACK_REPLAY_DEADLINE);
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<bool> {
+        self.acknowledged.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_replay_deadline_after(&mut self, duration: Duration) {
+        self.deadline = Some(Instant::now() + duration);
+    }
+}
+
+impl Drop for ApplicationAckHandle {
+    fn drop(&mut self) {
+        self.registry
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.message_id);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ApplicationAckProbe {
+    registry: Arc<ApplicationAckRegistry>,
+    message_id: MessageId,
+    node: NodeId,
+}
+
+#[cfg(test)]
+impl ApplicationAckProbe {
+    pub(crate) fn acknowledge(&self) -> bool {
+        self.registry.acknowledge(self.message_id, self.node)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_application_ack(
+    message_id: MessageId,
+    node: NodeId,
+) -> (ApplicationAckHandle, ApplicationAckProbe) {
+    let registry = Arc::new(ApplicationAckRegistry::new(1));
+    let handle = registry
+        .try_register(message_id, node)
+        .expect("test application ACK must fit");
+    (
+        handle,
+        ApplicationAckProbe {
+            registry,
+            message_id,
+            node,
+        },
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ReplayKey {
+    peer_node_id: u64,
+    message_id: u64,
+}
+
+pub(crate) struct ReplayEntry {
+    fingerprint: [u8; 32],
+    completed: watch::Sender<Option<(ResponseContent, Instant)>>,
+}
+
+impl ReplayEntry {
+    pub(crate) async fn wait(&self) -> ResponseContent {
+        let mut completed = self.completed.subscribe();
+        loop {
+            if let Some((response, _)) = completed.borrow().as_ref() {
+                return response.clone();
+            }
+            if completed.changed().await.is_err() {
+                return ResponseContent::Error(
+                    crate::distributed::message::ClientError::ResponseTimeout,
+                );
+            }
+        }
+    }
+}
+
+struct ReplayCacheState {
+    entries: HashMap<ReplayKey, Arc<ReplayEntry>>,
+    completed_order: VecDeque<(ReplayKey, Weak<ReplayEntry>)>,
+}
+
+struct ReplayCache {
+    state: Mutex<ReplayCacheState>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl ReplayCache {
+    fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            state: Mutex::new(ReplayCacheState {
+                entries: HashMap::new(),
+                completed_order: VecDeque::new(),
+            }),
+            max_entries,
+            ttl,
+        }
+    }
+
+    fn begin(self: &Arc<Self>, key: ReplayKey, fingerprint: [u8; 32]) -> ReplayDecision {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some((oldest, recorded)) = state.completed_order.front().cloned() {
+            let Some(recorded) = recorded.upgrade() else {
+                state.completed_order.pop_front();
+                continue;
+            };
+            let is_current_generation = state
+                .entries
+                .get(&oldest)
+                .is_some_and(|current| Arc::ptr_eq(current, &recorded));
+            if !is_current_generation {
+                state.completed_order.pop_front();
+                continue;
+            }
+            let expired = recorded
+                .completed
+                .borrow()
+                .as_ref()
+                .is_some_and(|(_, completed_at)| {
+                    now.saturating_duration_since(*completed_at) >= self.ttl
+                });
+            if !expired {
+                break;
+            }
+            state.completed_order.pop_front();
+            state.entries.remove(&oldest);
+        }
+
+        if let Some(entry) = state.entries.get(&key).cloned() {
+            if entry.fingerprint != fingerprint {
+                return ReplayDecision::Conflict;
+            }
+            let cached_response = entry
+                .completed
+                .borrow()
+                .as_ref()
+                .map(|(response, _)| response.clone());
+            if let Some(response) = cached_response {
+                entry.completed.send_if_modified(|completed| {
+                    let Some((_, completed_at)) = completed else {
+                        return false;
+                    };
+                    *completed_at = now;
+                    true
+                });
+                state.completed_order.retain(|(recorded_key, recorded)| {
+                    if *recorded_key != key {
+                        return true;
+                    }
+                    recorded
+                        .upgrade()
+                        .is_some_and(|recorded| !Arc::ptr_eq(&recorded, &entry))
+                });
+                state
+                    .completed_order
+                    .push_back((key, Arc::downgrade(&entry)));
+                return ReplayDecision::Cached(response);
+            }
+            return ReplayDecision::Wait(entry);
+        }
+        if state.entries.len() >= self.max_entries {
+            return ReplayDecision::Saturated;
+        }
+
+        let (completed, _) = watch::channel(None);
+        let entry = Arc::new(ReplayEntry {
+            fingerprint,
+            completed,
+        });
+        state.entries.insert(key, entry.clone());
+        ReplayDecision::Execute(ReplayExecutionGuard {
+            cache: self.clone(),
+            key,
+            entry,
+            finished: false,
+        })
+    }
+
+    fn finish(&self, key: ReplayKey, entry: &Arc<ReplayEntry>, response: ResponseContent) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state
+            .entries
+            .get(&key)
+            .is_some_and(|current| Arc::ptr_eq(current, entry))
+        {
+            return;
+        }
+        if !entry.completed.send_if_modified(|completed| {
+            if completed.is_some() {
+                return false;
+            }
+            *completed = Some((response.clone(), Instant::now()));
+            true
+        }) {
+            return;
+        }
+        state
+            .completed_order
+            .push_back((key, Arc::downgrade(entry)));
+    }
+}
+
+pub(crate) enum ReplayDecision {
+    Execute(ReplayExecutionGuard),
+    Wait(Arc<ReplayEntry>),
+    Cached(ResponseContent),
+    Conflict,
+    Saturated,
+}
+
+pub(crate) struct ReplayExecutionGuard {
+    cache: Arc<ReplayCache>,
+    key: ReplayKey,
+    entry: Arc<ReplayEntry>,
+    finished: bool,
+}
+
+impl ReplayExecutionGuard {
+    pub(crate) fn finish(mut self, response: ResponseContent) -> ResponseContent {
+        let response = bounded_replay_response(response);
+        self.cache.finish(self.key, &self.entry, response.clone());
+        self.finished = true;
+        response
+    }
+}
+
+fn bounded_replay_response(response: ResponseContent) -> ResponseContent {
+    fn truncate(mut message: String) -> String {
+        if message.len() <= MAX_REPLAY_ERROR_BYTES {
+            return message;
+        }
+        let mut end = MAX_REPLAY_ERROR_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message
+    }
+
+    match response {
+        ResponseContent::Error(error) => ResponseContent::Error(match error {
+            crate::distributed::message::ClientError::Unexpected(message) => {
+                crate::distributed::message::ClientError::Unexpected(truncate(message))
+            }
+            crate::distributed::message::ClientError::Connection(message) => {
+                crate::distributed::message::ClientError::Connection(truncate(message))
+            }
+            crate::distributed::message::ClientError::DeliveryBackpressure(message) => {
+                crate::distributed::message::ClientError::DeliveryBackpressure(truncate(message))
+            }
+            crate::distributed::message::ClientError::DeliveryTooLarge(message) => {
+                crate::distributed::message::ClientError::DeliveryTooLarge(truncate(message))
+            }
+            crate::distributed::message::ClientError::DeliveryRejected(message) => {
+                crate::distributed::message::ClientError::DeliveryRejected(truncate(message))
+            }
+            other => other,
+        }),
+        other => other,
+    }
+}
+
+impl Drop for ReplayExecutionGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cache.finish(
+                self.key,
+                &self.entry,
+                ResponseContent::Error(crate::distributed::message::ClientError::ResponseTimeout),
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct InboundRouteKey {
+    peer_node_id: u64,
+    environment_id: u64,
+    process_id: u64,
+}
+
+struct InboundRouteSequencer {
+    routes: Mutex<HashMap<InboundRouteKey, Weak<AsyncMutex<()>>>>,
+}
+
+impl InboundRouteSequencer {
+    fn new() -> Self {
+        Self {
+            routes: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>, key: InboundRouteKey) -> InboundRouteExecutionGuard {
+        let route = {
+            let mut routes = self
+                .routes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match routes.get(&key).and_then(Weak::upgrade) {
+                Some(route) => route,
+                None => {
+                    let route = Arc::new(AsyncMutex::new(()));
+                    routes.insert(key, Arc::downgrade(&route));
+                    route
+                }
+            }
+        };
+        let lock = route.clone().lock_owned().await;
+        InboundRouteExecutionGuard {
+            sequencer: self.clone(),
+            key,
+            route,
+            lock: Some(lock),
+        }
+    }
+}
+
+pub(crate) struct InboundRouteExecutionGuard {
+    sequencer: Arc<InboundRouteSequencer>,
+    key: InboundRouteKey,
+    route: Arc<AsyncMutex<()>>,
+    lock: Option<OwnedMutexGuard<()>>,
+}
+
+impl Drop for InboundRouteExecutionGuard {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        let mut routes = self
+            .sequencer
+            .routes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if Arc::strong_count(&self.route) == 1
+            && routes
+                .get(&self.key)
+                .is_some_and(|route| Weak::ptr_eq(route, &Arc::downgrade(&self.route)))
+        {
+            routes.remove(&self.key);
+        }
+    }
+}
+
 struct IncomingResponse {
     expected_node: NodeId,
     response: AsyncCell<ResponseContent>,
@@ -609,11 +1138,13 @@ pub struct Inner {
     pub next_message_id: AtomicU64,
     next_process_queue_generation: AtomicU64,
     // Across Environments and ProcessId's track message queues
-    pub(crate) buf_rx: DashMap<EnvironmentId, DashMap<ProcessId, ProcessQueueReceiver>>,
+    pub(crate) buf_rx: DashMap<EnvironmentId, DashMap<ProcessQueueRoute, ProcessQueueReceiver>>,
     // Sending part of the message queue
-    pub(crate) buf_tx: DashMap<(EnvironmentId, ProcessId), ProcessQueueSender>,
-    // Holds the message while its being chunked
+    pub(crate) buf_tx: DashMap<(EnvironmentId, ProcessQueueRoute), ProcessQueueSender>,
+    // Kept for public API compatibility with the legacy source-keyed scheduler.
     pub in_progress: DashMap<(EnvironmentId, ProcessId), MessageCtx>,
+    // Holds one admitted message per exact source-to-destination route.
+    pub(crate) route_in_progress: DashMap<(EnvironmentId, ProcessQueueRoute), AdmittedMessage>,
     pub(crate) nodes_queues: DashMap<NodeId, NodeQueue>,
     responses: DashMap<MessageId, Arc<IncomingResponse>>,
     pub response_tx: Sender<(MessageId, ResponseContent)>,
@@ -621,6 +1152,10 @@ pub struct Inner {
     registry_cleanup_pending: Mutex<HashMap<super::GlobalProcessId, RegistryCleanupRetry>>,
     pub has_messages: Arc<Notify>,
     outbound_budget: Arc<OutboundBudget>,
+    control_outbound_budget: Arc<OutboundBudget>,
+    application_acks: Arc<ApplicationAckRegistry>,
+    replay_cache: Arc<ReplayCache>,
+    inbound_routes: Arc<InboundRouteSequencer>,
     node_queue_admission: AsyncMutex<()>,
     topology_nodes: Mutex<HashSet<u64>>,
     limits: DistributedLimits,
@@ -631,14 +1166,13 @@ pub struct Inner {
 }
 
 fn process_queue_is_current(
-    queues: &DashMap<(EnvironmentId, ProcessId), ProcessQueueSender>,
-    env: EnvironmentId,
-    src: ProcessId,
+    queues: &DashMap<(EnvironmentId, ProcessQueueRoute), ProcessQueueSender>,
+    key: (EnvironmentId, ProcessQueueRoute),
     generation: u64,
-    sender: &Sender<MessageCtx>,
+    sender: &Sender<AdmittedMessage>,
 ) -> bool {
     queues
-        .get(&(env, src))
+        .get(&key)
         .map(|queue| queue.generation == generation && queue.sender.same_channel(sender))
         .unwrap_or(false)
 }
@@ -671,17 +1205,21 @@ impl Client {
             .collect::<HashSet<_>>();
         topology_nodes.insert(node_id);
         let outbound = limits.outbound;
+        // A random incarnation prefix prevents a restarted node from colliding with the receiver's
+        // bounded replay cache while preserving a monotonically increasing counter per process.
+        let message_id_epoch = (uuid::Uuid::new_v4().as_u128() as u64) & 0xffff_ffff_0000_0000;
 
         let client = Self {
             node_id: NodeId(node_id),
             inner: Arc::new(Inner {
                 control_client,
                 node_client,
-                next_message_id: AtomicU64::new(1),
+                next_message_id: AtomicU64::new(message_id_epoch | 1),
                 next_process_queue_generation: AtomicU64::new(1),
                 buf_rx: DashMap::new(),
                 buf_tx: DashMap::new(),
                 in_progress: DashMap::new(),
+                route_in_progress: DashMap::new(),
                 nodes_queues: DashMap::new(),
                 responses: DashMap::new(),
                 response_tx: send,
@@ -692,6 +1230,16 @@ impl Client {
                     outbound.max_messages,
                     outbound.max_bytes,
                 )),
+                control_outbound_budget: Arc::new(OutboundBudget::new(
+                    MAX_CONTROL_OUTBOUND_MESSAGES,
+                    MAX_CONTROL_OUTBOUND_BYTES,
+                )),
+                application_acks: Arc::new(ApplicationAckRegistry::new(MAX_APPLICATION_ACKS)),
+                replay_cache: Arc::new(ReplayCache::new(
+                    MAX_INBOUND_REPLAY_ENTRIES,
+                    INBOUND_REPLAY_TTL,
+                )),
+                inbound_routes: Arc::new(InboundRouteSequencer::new()),
                 node_queue_admission: AsyncMutex::new(()),
                 topology_nodes: Mutex::new(topology_nodes),
                 limits,
@@ -822,10 +1370,57 @@ impl Client {
         )
     }
 
+    pub(crate) fn begin_inbound_replay(
+        &self,
+        peer_node_id: u64,
+        message_id: u64,
+        request: &Request,
+    ) -> Result<ReplayDecision> {
+        struct DigestWriter(Sha256);
+
+        impl std::io::Write for DigestWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.update(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut digest = DigestWriter(Sha256::new());
+        rmp_serde::encode::write(&mut digest, request)?;
+        let fingerprint: [u8; 32] = digest.0.finalize().into();
+        Ok(self.inner.replay_cache.begin(
+            ReplayKey {
+                peer_node_id,
+                message_id,
+            },
+            fingerprint,
+        ))
+    }
+
+    pub(crate) async fn lock_inbound_route(
+        &self,
+        peer_node_id: u64,
+        environment_id: u64,
+        process_id: u64,
+    ) -> InboundRouteExecutionGuard {
+        self.inner
+            .inbound_routes
+            .acquire(InboundRouteKey {
+                peer_node_id,
+                environment_id,
+                process_id,
+            })
+            .await
+    }
+
     pub(crate) async fn ensure_node_queue(
         &self,
         node: NodeId,
-    ) -> std::result::Result<Sender<MessageChunk>, OutboundEnqueueError> {
+    ) -> std::result::Result<NodeQueueSender, OutboundEnqueueError> {
         if let Some(queue_ref) = self.inner.nodes_queues.get(&node) {
             let sender = queue_ref.sender();
             drop(queue_ref);
@@ -883,12 +1478,11 @@ impl Client {
             ));
         }
 
-        let (send, recv) = tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
-        let task = tokio::spawn(node_connection_manager(NodeConnectionManager {
-            streams: 10,
+        let (send, streams) = node_queue_channels(10);
+        let task = tokio::spawn(fair_node_connection_manager(FairNodeConnectionManager {
             node_info,
             client: self.inner.node_client.clone(),
-            message_chunks: recv,
+            message_streams: streams,
         }));
         self.inner.nodes_queues.insert(
             node,
@@ -947,13 +1541,17 @@ impl Client {
 
     async fn new_message(
         &self,
-        message_id: MessageId,
-        env: EnvironmentId,
-        src: ProcessId,
-        node: NodeId,
-        dest: ProcessId,
-        data: Vec<u8>,
+        params: NewMessageParams,
     ) -> std::result::Result<MessageId, OutboundEnqueueError> {
+        let NewMessageParams {
+            message_id,
+            env,
+            src,
+            node,
+            dest,
+            class,
+            data,
+        } = params;
         if data.len() > quic::MAX_WIRE_MESSAGE_BYTES {
             return Err(OutboundEnqueueError::new(
                 SendErrorKind::MessageTooLarge,
@@ -964,22 +1562,31 @@ impl Client {
                 ),
             ));
         }
-        let outbound_lease = self
-            .inner
-            .outbound_budget
-            .try_reserve(data.capacity())
-            .map_err(|error| {
-                OutboundEnqueueError::new(SendErrorKind::Backpressure, error.to_string())
-            })?;
+        let retained_bytes = data.capacity().max(1);
+        let budget = match class {
+            OutboundClass::Data => &self.inner.outbound_budget,
+            OutboundClass::Control => &self.inner.control_outbound_budget,
+        };
+        let outbound_lease = budget.try_reserve(retained_bytes).map_err(|error| {
+            OutboundEnqueueError::new(SendErrorKind::Backpressure, error.to_string())
+        })?;
+        let application_ack = match class {
+            OutboundClass::Data => {
+                Some(self.inner.application_acks.try_register(message_id, node)?)
+            }
+            OutboundClass::Control => None,
+        };
 
-        self.ensure_node_queue(node).await?;
+        let node_queue = self.ensure_node_queue(node).await?;
+        let route = ProcessQueueRoute::new(src, node, dest);
+        let queue_key = (env, route);
 
         // Lazy-initialize exactly one process queue/receiver pair under the sender-map entry lock.
         // The worker can win the admission gate and retire a newly observed empty queue before
         // this producer reaches it. That is a benign internal race, so retry with a fresh
         // generation without surfacing QueueClosed to the guest.
         loop {
-            let (queue_generation, tx, admission_gate) = match self.inner.buf_tx.entry((env, src)) {
+            let (queue_generation, tx, admission_gate) = match self.inner.buf_tx.entry(queue_key) {
                 DashEntry::Occupied(entry) => (
                     entry.get().generation,
                     entry.get().sender.clone(),
@@ -995,7 +1602,7 @@ impl Client {
                     match self.inner.buf_rx.entry(env) {
                         DashEntry::Occupied(env_queue) => {
                             env_queue.get().insert(
-                                src,
+                                route,
                                 ProcessQueueReceiver {
                                     generation,
                                     receiver: RwLock::new(recv),
@@ -1006,7 +1613,7 @@ impl Client {
                         DashEntry::Vacant(env_queue) => {
                             let queue = DashMap::new();
                             queue.insert(
-                                src,
+                                route,
                                 ProcessQueueReceiver {
                                     generation,
                                     receiver: RwLock::new(recv),
@@ -1027,7 +1634,7 @@ impl Client {
 
             let admission_guard = admission_gate.lock().await;
             let current_generation =
-                process_queue_is_current(&self.inner.buf_tx, env, src, queue_generation, &tx);
+                process_queue_is_current(&self.inner.buf_tx, queue_key, queue_generation, &tx);
             if !current_generation {
                 drop(admission_guard);
                 continue;
@@ -1043,9 +1650,27 @@ impl Client {
                 offset: AtomicUsize::new(0),
                 chunk_id: AtomicU64::new(0),
                 data: data.into(),
+                retained_bytes,
+                class,
+                application_ack,
                 outbound_lease,
             };
-            match tx.try_send(message) {
+            let admitted = match node_queue.try_admit(message) {
+                AdmissionResult::Admitted(admitted) => admitted,
+                AdmissionResult::Full(_message) => {
+                    return Err(OutboundEnqueueError::new(
+                        SendErrorKind::Backpressure,
+                        "Distributed outbound stream memory limit reached",
+                    ));
+                }
+                AdmissionResult::Closed(_message) => {
+                    return Err(OutboundEnqueueError::new(
+                        SendErrorKind::QueueClosed,
+                        "Distributed outbound node queue is closed",
+                    ));
+                }
+            };
+            match tx.try_send(admitted) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_message)) => {
                     return Err(OutboundEnqueueError::new(
@@ -1058,7 +1683,7 @@ impl Client {
                 }
                 Err(TrySendError::Closed(_message)) => {
                     drop(admission_guard);
-                    self.remove_process_resources_if_generation(env, src, queue_generation);
+                    self.remove_process_resources_if_generation(env, route, queue_generation);
                     return Err(OutboundEnqueueError::new(
                         SendErrorKind::QueueClosed,
                         "Distributed outbound process queue is closed",
@@ -1071,73 +1696,87 @@ impl Client {
     }
 
     pub fn remove_process_resources(&self, env: EnvironmentId, process_id: ProcessId) {
-        self.inner.buf_tx.remove(&(env, process_id));
-        self.inner.in_progress.remove(&(env, process_id));
+        let mut routes = self
+            .inner
+            .buf_tx
+            .iter()
+            .filter_map(|entry| {
+                let (queue_env, route) = *entry.key();
+                (queue_env == env && route.src == process_id).then_some(route)
+            })
+            .collect::<HashSet<_>>();
+        routes.extend(self.inner.route_in_progress.iter().filter_map(|entry| {
+            let (queue_env, route) = *entry.key();
+            (queue_env == env && route.src == process_id).then_some(route)
+        }));
         if let Some(env_queue) = self.inner.buf_rx.get(&env) {
-            env_queue.remove(&process_id);
-            let remove_environment = env_queue.is_empty();
-            drop(env_queue);
-            if remove_environment {
-                self.inner
-                    .buf_rx
-                    .remove_if(&env, |_, queue| queue.is_empty());
+            routes.extend(
+                env_queue
+                    .iter()
+                    .filter_map(|entry| (entry.key().src == process_id).then_some(*entry.key())),
+            );
+        }
+        for route in routes {
+            self.inner.buf_tx.remove(&(env, route));
+            self.inner.route_in_progress.remove(&(env, route));
+            if let Some(env_queue) = self.inner.buf_rx.get(&env) {
+                env_queue.remove(&route);
             }
         }
+        self.inner
+            .buf_rx
+            .remove_if(&env, |_, queue| queue.is_empty());
     }
 
     pub(crate) fn remove_process_resources_if_generation(
         &self,
         env: EnvironmentId,
-        process_id: ProcessId,
+        route: ProcessQueueRoute,
         generation: u64,
     ) -> bool {
         if self
             .inner
             .buf_tx
-            .remove_if(&(env, process_id), |_, queue| {
-                queue.generation == generation
-            })
+            .remove_if(&(env, route), |_, queue| queue.generation == generation)
             .is_none()
         {
             return false;
         }
-        self.cleanup_process_generation(env, process_id, generation);
+        self.cleanup_process_generation(env, route, generation);
         true
     }
 
     pub(crate) fn remove_idle_process_resources_if_generation(
         &self,
         env: EnvironmentId,
-        process_id: ProcessId,
+        route: ProcessQueueRoute,
         generation: u64,
     ) -> bool {
         if self
             .inner
             .buf_tx
-            .remove_if(&(env, process_id), |_, queue| {
-                queue.generation == generation
-            })
+            .remove_if(&(env, route), |_, queue| queue.generation == generation)
             .is_none()
         {
             return false;
         }
-        self.cleanup_process_generation(env, process_id, generation);
+        self.cleanup_process_generation(env, route, generation);
         true
     }
 
     fn cleanup_process_generation(
         &self,
         env: EnvironmentId,
-        process_id: ProcessId,
+        route: ProcessQueueRoute,
         generation: u64,
     ) {
         self.inner
-            .in_progress
-            .remove_if(&(env, process_id), |_, message| {
+            .route_in_progress
+            .remove_if(&(env, route), |_, message| {
                 message.queue_generation == generation
             });
         if let Some(env_queue) = self.inner.buf_rx.get(&env) {
-            env_queue.remove_if(&process_id, |_, receiver| receiver.generation == generation);
+            env_queue.remove_if(&route, |_, receiver| receiver.generation == generation);
             let remove_environment = env_queue.is_empty();
             drop(env_queue);
             if remove_environment {
@@ -1203,7 +1842,15 @@ impl Client {
         // otherwise return the mailbox result before this node can correlate it.
         let _waiter = ResponseWaiterGuard::insert(&self.inner.responses, message_id, node);
         if let Err(error) = self
-            .new_message(message_id, source_env, src, node, dest, serialized)
+            .new_message(NewMessageParams {
+                message_id,
+                env: source_env,
+                src,
+                node,
+                dest,
+                class: OutboundClass::Data,
+                data: serialized,
+            })
             .await
         {
             let Request::Message { data, .. } = message else {
@@ -1262,14 +1909,15 @@ impl Client {
             .responses
             .insert(message_id, Arc::new(IncomingResponse::new(params.node)));
         if let Err(error) = self
-            .new_message(
+            .new_message(NewMessageParams {
                 message_id,
-                params.env,
-                params.src,
-                params.node,
-                ProcessId(0),
+                env: params.env,
+                src: params.src,
+                node: params.node,
+                dest: ProcessId(0),
+                class: OutboundClass::Data,
                 data,
-            )
+            })
             .await
         {
             self.inner.responses.remove(&message_id);
@@ -1285,14 +1933,15 @@ impl Client {
             unreachable!("lunatic::distributed::client::send_response serialize_message")
         });
         let message_id = self.next_message_id();
-        self.new_message(
+        self.new_message(NewMessageParams {
             message_id,
-            EnvironmentId(0),
-            ProcessId(0),
-            params.node_id,
-            ProcessId(0),
+            env: EnvironmentId(0),
+            src: ProcessId(0),
+            node: params.node_id,
+            dest: ProcessId(0),
+            class: OutboundClass::Control,
             data,
-        )
+        })
         .await
         .map_err(anyhow::Error::new)
     }
@@ -1304,21 +1953,34 @@ impl Client {
         response: Response,
     ) -> Result<()> {
         let message_id = MessageId(response.message_id);
-        let Some(waiter) = self.inner.responses.get(&message_id) else {
+        let source_node = NodeId(source_node_id.get());
+        let ack_expected = self.inner.application_acks.expected_node(message_id);
+        let waiter_expected = self
+            .inner
+            .responses
+            .get(&message_id)
+            .map(|waiter| waiter.expected_node);
+        let Some(expected_node) = ack_expected.or(waiter_expected) else {
             log::warn!(
                 "Dropping distributed response for unknown message {}",
                 message_id.0
             );
             return Ok(());
         };
-        if waiter.expected_node.0 != source_node_id.get() {
-            drop(waiter);
+        if expected_node != source_node {
             audit_verified_peer_protocol_denial(source_node_id);
             return Err(anyhow!(
                 "Distributed response source did not match the expected authenticated peer"
             ));
         }
-        drop(waiter);
+        self.inner
+            .application_acks
+            .acknowledge(message_id, source_node);
+        if waiter_expected.is_none() {
+            // The public caller may already have timed out or been cancelled. The independent
+            // scheduler ACK still commits the retained message and releases every permit.
+            return Ok(());
+        }
         if let Err(error) = self
             .inner
             .response_tx
@@ -1580,6 +2242,7 @@ mod tests {
                 buf_rx: DashMap::new(),
                 buf_tx: DashMap::new(),
                 in_progress: DashMap::new(),
+                route_in_progress: DashMap::new(),
                 nodes_queues: DashMap::new(),
                 responses: DashMap::new(),
                 response_tx,
@@ -1590,6 +2253,16 @@ mod tests {
                     limits.outbound.max_messages,
                     limits.outbound.max_bytes,
                 )),
+                control_outbound_budget: Arc::new(OutboundBudget::new(
+                    MAX_CONTROL_OUTBOUND_MESSAGES,
+                    MAX_CONTROL_OUTBOUND_BYTES,
+                )),
+                application_acks: Arc::new(ApplicationAckRegistry::new(MAX_APPLICATION_ACKS)),
+                replay_cache: Arc::new(ReplayCache::new(
+                    MAX_INBOUND_REPLAY_ENTRIES,
+                    INBOUND_REPLAY_TTL,
+                )),
+                inbound_routes: Arc::new(InboundRouteSequencer::new()),
                 node_queue_admission: AsyncMutex::new(()),
                 topology_nodes: Mutex::new(topology_nodes),
                 limits,
@@ -1606,10 +2279,14 @@ mod tests {
         source_env: EnvironmentId,
         source: ProcessId,
         node: NodeId,
-    ) -> (Arc<AsyncMutex<()>>, tokio::sync::mpsc::Receiver<MessageCtx>) {
-        let (node_sender, node_receiver) = tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
+        dest: ProcessId,
+    ) -> (
+        Arc<AsyncMutex<()>>,
+        tokio::sync::mpsc::Receiver<AdmittedMessage>,
+    ) {
+        let (node_sender, node_receivers) = node_queue_channels(10);
         let manager = tokio::spawn(async move {
-            let _node_receiver = node_receiver;
+            let _node_receivers = node_receivers;
             std::future::pending::<()>().await
         });
         client.inner.nodes_queues.insert(
@@ -1622,8 +2299,9 @@ mod tests {
         let (process_sender, process_receiver) =
             tokio::sync::mpsc::channel(OUTBOUND_PROCESS_QUEUE_CAPACITY);
         let admission_gate = Arc::new(AsyncMutex::new(()));
+        let route = ProcessQueueRoute::new(source, node, dest);
         client.inner.buf_tx.insert(
-            (source_env, source),
+            (source_env, route),
             ProcessQueueSender {
                 generation: 1,
                 sender: process_sender,
@@ -1782,10 +2460,11 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = HashSet::from([1, node_id]);
 
             let (lease, usage) = test_outbound_lease(8);
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let (sender, receivers) =
+                congestion::NodeQueueSender::with_limits(1, 1, quic::MAX_WIRE_MESSAGE_BYTES);
             let manager = tokio::spawn(async move {
                 let _lease = lease;
-                let _ = receiver.recv().await;
+                let _receivers = receivers;
                 std::future::pending::<()>().await;
             });
             client.inner.nodes_queues.insert(
@@ -1893,7 +2572,7 @@ mod tests {
         let source = ProcessId(6);
         let node = NodeId(2);
         let (admission_gate, process_receiver) =
-            install_send_route(&client, source_env, source, node);
+            install_send_route(&client, source_env, source, node, ProcessId(9));
         let admission_guard = admission_gate.clone().lock_owned().await;
 
         let mut data = Vec::with_capacity(128);
@@ -1956,7 +2635,7 @@ mod tests {
         let source = ProcessId(6);
         let node = NodeId(2);
         let (_admission_gate, mut process_receiver) =
-            install_send_route(&client, source_env, source, node);
+            install_send_route(&client, source_env, source, node, ProcessId(9));
         let sending_client = client.clone();
         let send_task = tokio::spawn(async move {
             sending_client
@@ -2020,7 +2699,7 @@ mod tests {
             let source = ProcessId(6);
             let node = NodeId(2);
             let (_admission_gate, mut process_receiver) =
-                install_send_route(&client, source_env, source, node);
+                install_send_route(&client, source_env, source, node, ProcessId(9));
             let sending_client = client.clone();
             let send_task = tokio::spawn(async move {
                 sending_client
@@ -2059,7 +2738,7 @@ mod tests {
         let source = ProcessId(6);
         let node = NodeId(2);
         let (_admission_gate, mut process_receiver) =
-            install_send_route(&client, source_env, source, node);
+            install_send_route(&client, source_env, source, node, ProcessId(9));
         let error = client
             .send_with_timeout(
                 SendParams {
@@ -2094,7 +2773,7 @@ mod tests {
         let source = ProcessId(6);
         let node = NodeId(2);
         let (admission_gate, process_receiver) =
-            install_send_route(&client, source_env, source, node);
+            install_send_route(&client, source_env, source, node, ProcessId(9));
         let admission_guard = admission_gate.clone().lock_owned().await;
         let sending_client = client.clone();
         let send_task = tokio::spawn(async move {
@@ -2133,12 +2812,13 @@ mod tests {
     async fn admission_gate_prevents_enqueue_after_idle_cleanup() {
         let env = EnvironmentId(7);
         let process = ProcessId(11);
+        let route = ProcessQueueRoute::new(process, NodeId(2), ProcessId(13));
         let generation = 3;
         let queues = Arc::new(DashMap::new());
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let admission_gate = Arc::new(AsyncMutex::new(()));
         queues.insert(
-            (env, process),
+            (env, route),
             ProcessQueueSender {
                 generation,
                 sender: sender.clone(),
@@ -2153,37 +2833,42 @@ mod tests {
         let producer_queues = queues.clone();
         let producer_gate = admission_gate.clone();
         let producer_sender = sender.clone();
+        let (node_sender, _node_receivers) = congestion::NodeQueueSender::with_limits(1, 1, 3);
         let (lease, usage) = test_outbound_lease(3);
         let producer = tokio::spawn(async move {
             let _admission_guard = producer_gate.lock().await;
             if !process_queue_is_current(
                 &producer_queues,
-                env,
-                process,
+                (env, route),
                 generation,
                 &producer_sender,
             ) {
                 return false;
             }
-            producer_sender
-                .try_send(MessageCtx {
-                    message_id: MessageId(1),
-                    env,
-                    src: process,
-                    node: NodeId(2),
-                    dest: ProcessId(13),
-                    queue_generation: generation,
-                    chunk_id: AtomicU64::new(0),
-                    offset: AtomicUsize::new(0),
-                    data: Bytes::from_static(b"abc"),
-                    outbound_lease: lease,
-                })
-                .is_ok()
+            let message = MessageCtx {
+                message_id: MessageId(1),
+                env,
+                src: process,
+                node: NodeId(2),
+                dest: ProcessId(13),
+                queue_generation: generation,
+                chunk_id: AtomicU64::new(0),
+                offset: AtomicUsize::new(0),
+                data: Bytes::from_static(b"abc"),
+                retained_bytes: 3,
+                class: OutboundClass::Data,
+                application_ack: None,
+                outbound_lease: lease,
+            };
+            let AdmissionResult::Admitted(admitted) = node_sender.try_admit(message) else {
+                return false;
+            };
+            producer_sender.try_send(admitted).is_ok()
         });
 
         tokio::task::yield_now().await;
         assert!(queues
-            .remove_if(&(env, process), |_, queue| queue.generation == generation)
+            .remove_if(&(env, route), |_, queue| queue.generation == generation)
             .is_some());
         drop(cleanup_guard);
 
@@ -2202,24 +2887,27 @@ mod tests {
         let env = EnvironmentId(7);
         let source = ProcessId(11);
         let node = NodeId(2);
-        let (admission_gate, old_receiver) = install_send_route(&client, env, source, node);
+        let route = ProcessQueueRoute::new(source, node, ProcessId(13));
+        let (admission_gate, old_receiver) =
+            install_send_route(&client, env, source, node, route.dest);
         let cleanup_guard = admission_gate.clone().lock_owned().await;
         let sending_client = client.clone();
         let send_task = tokio::spawn(async move {
             sending_client
-                .new_message(
-                    MessageId(9),
+                .new_message(NewMessageParams {
+                    message_id: MessageId(9),
                     env,
-                    source,
+                    src: source,
                     node,
-                    ProcessId(13),
-                    vec![1, 2, 3],
-                )
+                    dest: ProcessId(13),
+                    class: OutboundClass::Data,
+                    data: vec![1, 2, 3],
+                })
                 .await
         });
 
         tokio::task::yield_now().await;
-        assert!(client.inner.buf_tx.remove(&(env, source)).is_some());
+        assert!(client.inner.buf_tx.remove(&(env, route)).is_some());
         drop(cleanup_guard);
         let admitted = tokio::time::timeout(Duration::from_secs(1), send_task)
             .await
@@ -2229,7 +2917,7 @@ mod tests {
         assert_eq!(admitted, MessageId(9));
 
         let env_queue = client.inner.buf_rx.get(&env).unwrap();
-        let receiver = env_queue.get(&source).unwrap();
+        let receiver = env_queue.get(&route).unwrap();
         assert_ne!(receiver.generation, 1);
         let queued = receiver.receiver.write().await.try_recv().unwrap();
         drop(receiver);
@@ -2246,11 +2934,14 @@ mod tests {
         let env = EnvironmentId(5);
         let source = ProcessId(6);
         let node = NodeId(2);
+        let route = ProcessQueueRoute::new(source, node, ProcessId(0));
         let generation = 1;
 
-        let (node_sender, _node_receiver) =
-            tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
-        let manager = tokio::spawn(std::future::pending::<()>());
+        let (node_sender, node_receivers) = node_queue_channels(10);
+        let manager = tokio::spawn(async move {
+            let _node_receivers = node_receivers;
+            std::future::pending::<()>().await
+        });
         client.inner.nodes_queues.insert(
             node,
             NodeQueue {
@@ -2262,7 +2953,7 @@ mod tests {
             tokio::sync::mpsc::channel(OUTBOUND_PROCESS_QUEUE_CAPACITY);
         let admission_gate = Arc::new(AsyncMutex::new(()));
         client.inner.buf_tx.insert(
-            (env, source),
+            (env, route),
             ProcessQueueSender {
                 generation,
                 sender: process_sender,
@@ -2391,5 +3082,172 @@ mod tests {
             ResponseContent::Spawned(42),
         ));
         assert!(waiter.response.is_set());
+    }
+
+    #[tokio::test]
+    async fn application_ack_is_independent_from_the_public_response_waiter() {
+        let registry = Arc::new(ApplicationAckRegistry::new(1));
+        let message_id = MessageId(91);
+        let mut handle = registry
+            .try_register(message_id, NodeId(2))
+            .expect("one acknowledgement fits");
+
+        assert!(!registry.acknowledge(message_id, NodeId(3)));
+        assert!(!handle.is_acknowledged());
+        assert!(registry.acknowledge(message_id, NodeId(2)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), handle.wait())
+                .await
+                .expect("ack wait must not lose its wakeup")
+        );
+        drop(handle);
+        assert!(registry
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_cache_deduplicates_waiters_and_expires_completed_entries() {
+        let cache = Arc::new(ReplayCache::new(2, Duration::from_secs(30)));
+        let key = ReplayKey {
+            peer_node_id: 2,
+            message_id: 7,
+        };
+        let guard = match cache.begin(key, [1; 32]) {
+            ReplayDecision::Execute(guard) => guard,
+            _ => panic!("first request must execute"),
+        };
+        let waiter = match cache.begin(key, [1; 32]) {
+            ReplayDecision::Wait(waiter) => waiter,
+            _ => panic!("concurrent duplicate must wait"),
+        };
+        assert!(matches!(
+            cache.begin(key, [2; 32]),
+            ReplayDecision::Conflict
+        ));
+
+        assert_eq!(guard.finish(ResponseContent::Sent), ResponseContent::Sent);
+        assert_eq!(waiter.wait().await, ResponseContent::Sent);
+        assert!(matches!(
+            cache.begin(key, [1; 32]),
+            ReplayDecision::Cached(ResponseContent::Sent)
+        ));
+        assert_eq!(
+            cache
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .completed_order
+                .len(),
+            1
+        );
+
+        let expiring = Arc::new(ReplayCache::new(2, Duration::ZERO));
+        let guard = match expiring.begin(key, [1; 32]) {
+            ReplayDecision::Execute(guard) => guard,
+            _ => panic!("fresh expiring entry must execute"),
+        };
+        guard.finish(ResponseContent::Sent);
+        let new_guard = match expiring.begin(key, [2; 32]) {
+            ReplayDecision::Execute(guard) => guard,
+            _ => panic!("expired entry must admit a new generation"),
+        };
+        assert!(matches!(
+            expiring.begin(key, [2; 32]),
+            ReplayDecision::Wait(_)
+        ));
+        drop(new_guard);
+    }
+
+    #[test]
+    fn replay_tombstone_outlives_the_complete_replay_delivery_window() {
+        assert!(
+            INBOUND_REPLAY_TTL
+                >= quic::REQUEST_MESSAGE_REASSEMBLY_TIMEOUT
+                    + quic::REQUEST_MESSAGE_REASSEMBLY_TIMEOUT
+        );
+        assert!(
+            INBOUND_REPLAY_TTL
+                > APPLICATION_ACK_REPLAY_DEADLINE
+                    + quic::REQUEST_MESSAGE_REASSEMBLY_TIMEOUT
+                    + quic::REQUEST_STREAM_IDLE_TIMEOUT * 3
+        );
+    }
+
+    #[tokio::test]
+    async fn production_route_scheduler_bypasses_a_saturated_sibling_lane() {
+        let client = test_client_without_workers();
+        let env = EnvironmentId(5);
+        let src = ProcessId(1);
+        let node = NodeId(2);
+        let (node_sender, mut receivers) = congestion::NodeQueueSender::with_limits(3, 1, 16);
+        let _control_receiver = receivers.remove(0);
+        let mut slow_receiver = receivers.remove(0);
+        let mut fast_receiver = receivers.remove(0);
+        let manager = tokio::spawn(std::future::pending::<()>());
+        client.inner.nodes_queues.insert(
+            node,
+            NodeQueue {
+                sender: node_sender,
+                manager: manager.abort_handle(),
+            },
+        );
+        let worker = tokio::spawn(congestion::congestion_control_worker(client.clone()));
+
+        client
+            .new_message(NewMessageParams {
+                message_id: MessageId(100),
+                env,
+                src,
+                node,
+                dest: ProcessId(1),
+                class: OutboundClass::Data,
+                data: vec![0; 4],
+            })
+            .await
+            .expect("slow route is initially admitted");
+        let slow = tokio::time::timeout(Duration::from_millis(100), slow_receiver.recv())
+            .await
+            .expect("slow route reaches its production lane")
+            .expect("slow lane remains open");
+
+        let saturated = client
+            .new_message(NewMessageParams {
+                message_id: MessageId(101),
+                env,
+                src,
+                node,
+                dest: ProcessId(1),
+                class: OutboundClass::Data,
+                data: vec![1; 4],
+            })
+            .await
+            .expect_err("the occupied lane must reject cap + 1");
+        assert_eq!(saturated.kind(), SendErrorKind::Backpressure);
+
+        client
+            .new_message(NewMessageParams {
+                message_id: MessageId(102),
+                env,
+                src,
+                node,
+                dest: ProcessId(2),
+                class: OutboundClass::Data,
+                data: vec![2; 4],
+            })
+            .await
+            .expect("sibling route retains independent admission");
+        let fast = tokio::time::timeout(Duration::from_millis(100), fast_receiver.recv())
+            .await
+            .expect("healthy production route must bypass the saturated route")
+            .expect("healthy lane remains open");
+        assert_eq!(fast.message_id, MessageId(102));
+
+        drop(fast);
+        drop(slow);
+        worker.abort();
+        let _ = worker.await;
     }
 }

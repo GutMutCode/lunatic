@@ -29,9 +29,68 @@ use crate::{
 };
 
 use super::{
-    client::{Client, NodeId, ResponseParams},
+    client::{Client, NodeId, ReplayDecision, ReplayExecutionGuard, ResponseParams},
     message::{ClientError, ResponseContent, Spawn},
 };
+
+async fn send_replay_response(
+    client: &Client,
+    peer_node_id: VerifiedNodeId,
+    message_id: u64,
+    content: ResponseContent,
+) -> Result<()> {
+    client
+        .send_response(ResponseParams {
+            node_id: NodeId(peer_node_id.get()),
+            response: Response {
+                message_id,
+                content,
+            },
+        })
+        .await?;
+    Ok(())
+}
+
+async fn begin_replay_execution(
+    client: &Client,
+    peer_node_id: VerifiedNodeId,
+    message_id: u64,
+    request: &Request,
+) -> Result<Option<ReplayExecutionGuard>> {
+    match client.begin_inbound_replay(peer_node_id.get(), message_id, request)? {
+        ReplayDecision::Execute(guard) => Ok(Some(guard)),
+        ReplayDecision::Cached(response) => {
+            send_replay_response(client, peer_node_id, message_id, response).await?;
+            Ok(None)
+        }
+        ReplayDecision::Wait(entry) => {
+            // A duplicate must observe the original terminal result. Returning a synthetic
+            // timeout while the original execution continues could report failure and then run
+            // the side effect successfully, inviting an unsafe application-level retry.
+            let response = entry.wait().await;
+            send_replay_response(client, peer_node_id, message_id, response).await?;
+            Ok(None)
+        }
+        ReplayDecision::Conflict => {
+            audit_verified_peer_protocol_denial(peer_node_id);
+            Err(anyhow!(
+                "Authenticated peer reused a distributed message ID with different content"
+            ))
+        }
+        ReplayDecision::Saturated => {
+            send_replay_response(
+                client,
+                peer_node_id,
+                message_id,
+                ResponseContent::Error(ClientError::DeliveryBackpressure(
+                    "Inbound replay cache is full".to_string(),
+                )),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
+}
 
 pub struct ServerCtx<T, E: Environment> {
     pub envs: Arc<dyn Environments<Env = E>>,
@@ -319,49 +378,37 @@ where
             AuditReason::PolicyAllowed,
         );
     }
+    let replay_guard = if matches!(&msg, Request::Spawn(_) | Request::Message { .. }) {
+        let Some(guard) =
+            begin_replay_execution(&ctx.node_client, peer_node_id, msg_id, &msg).await?
+        else {
+            return Ok(());
+        };
+        Some(guard)
+    } else {
+        None
+    };
     match msg {
         Request::Spawn(spawn) => {
             log::trace!("lunatic::distributed::server process Spawn");
-            match handle_spawn(ctx.clone(), spawn).await {
+            let response = match handle_spawn(ctx.clone(), spawn).await {
                 Ok(Ok(id)) => {
                     log::trace!("lunatic::distributed::server Spawned {id}");
-                    ctx.node_client
-                        .send_response(ResponseParams {
-                            node_id: NodeId(peer_node_id.get()),
-                            response: Response {
-                                message_id: msg_id,
-                                content: ResponseContent::Spawned(id),
-                            },
-                        })
-                        .await?;
+                    ResponseContent::Spawned(id)
                 }
                 Ok(Err(client_error)) => {
                     log::trace!("lunatic::distributed::server Spawn error: {client_error:?}");
-                    ctx.node_client
-                        .send_response(ResponseParams {
-                            node_id: NodeId(peer_node_id.get()),
-                            response: Response {
-                                message_id: msg_id,
-                                content: ResponseContent::Error(client_error),
-                            },
-                        })
-                        .await?;
+                    ResponseContent::Error(client_error)
                 }
                 Err(error) => {
                     log::trace!("lunatic::distributed::server Spawn error: {error}");
-                    ctx.node_client
-                        .send_response(ResponseParams {
-                            node_id: NodeId(peer_node_id.get()),
-                            response: Response {
-                                message_id: msg_id,
-                                content: ResponseContent::Error(ClientError::Unexpected(
-                                    error.to_string(),
-                                )),
-                            },
-                        })
-                        .await?;
+                    ResponseContent::Error(ClientError::Unexpected(error.to_string()))
                 }
             };
+            let response = replay_guard
+                .expect("spawn requests reserve replay execution")
+                .finish(response);
+            send_replay_response(&ctx.node_client, peer_node_id, msg_id, response).await?;
         }
         Request::Message {
             node_id: _,
@@ -371,30 +418,21 @@ where
             data,
         } => {
             log::trace!("distributed::server process Message");
-            match handle_process_message(ctx.clone(), environment_id, process_id, tag, data).await {
-                Ok(_) => {
-                    ctx.node_client
-                        .send_response(ResponseParams {
-                            node_id: NodeId(peer_node_id.get()),
-                            response: Response {
-                                message_id: msg_id,
-                                content: ResponseContent::Sent,
-                            },
-                        })
-                        .await?;
-                }
-                Err(error) => {
-                    ctx.node_client
-                        .send_response(ResponseParams {
-                            node_id: NodeId(peer_node_id.get()),
-                            response: Response {
-                                message_id: msg_id,
-                                content: ResponseContent::Error(error),
-                            },
-                        })
-                        .await?;
-                }
-            }
+            let _route_guard = ctx
+                .node_client
+                .lock_inbound_route(peer_node_id.get(), environment_id, process_id)
+                .await;
+            let response =
+                match handle_process_message(ctx.clone(), environment_id, process_id, tag, data)
+                    .await
+                {
+                    Ok(_) => ResponseContent::Sent,
+                    Err(error) => ResponseContent::Error(error),
+                };
+            let response = replay_guard
+                .expect("message requests reserve replay execution")
+                .finish(response);
+            send_replay_response(&ctx.node_client, peer_node_id, msg_id, response).await?;
         }
         Request::Response(response) => {
             log::trace!("distributed::server process Response");
