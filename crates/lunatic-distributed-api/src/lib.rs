@@ -1,6 +1,8 @@
 use std::{
-    future::Future,
+    future::{poll_fn, Future},
+    pin::Pin,
     sync::Arc,
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -690,6 +692,72 @@ fn distributed_send_error_status(kind: SendErrorKind) -> u32 {
     }
 }
 
+enum ConfirmedSendReceive<T, E> {
+    Reply(T),
+    SendFailed(E),
+    ReplyTimedOut,
+}
+
+async fn poll_once<F>(mut future: Pin<&mut F>) -> Option<F::Output>
+where
+    F: Future,
+{
+    poll_fn(|cx| {
+        Poll::Ready(match future.as_mut().poll(cx) {
+            Poll::Ready(output) => Some(output),
+            Poll::Pending => None,
+        })
+    })
+    .await
+}
+
+/// Arm the selective mailbox receive before the request can leave this node,
+/// then require the remote mailbox-admission acknowledgement before returning
+/// the reply. Once armed, the mailbox retains an early reply in its `found`
+/// slot while `send` is pending, including the admission permit that makes a
+/// cancelled receive lossless.
+async fn await_confirmed_send_and_reply<S, R, A, T, E>(
+    send: S,
+    reply: R,
+    reply_timeout: Option<Duration>,
+    wait_started: Instant,
+) -> ConfirmedSendReceive<T, E>
+where
+    S: Future<Output = std::result::Result<A, E>>,
+    R: Future<Output = T>,
+{
+    tokio::pin!(reply);
+
+    // `pop_skip_search` does not arm its mailbox waiter until its first poll.
+    // This poll completes synchronously with `None` in valid request/reply use,
+    // so `send` is first polled in the same executor tick and cannot race it.
+    let reply_before_send = poll_once(reply.as_mut()).await;
+    if let Err(error) = send.await {
+        return ConfirmedSendReceive::SendFailed(error);
+    }
+
+    if let Some(reply) = reply_before_send {
+        return ConfirmedSendReceive::Reply(reply);
+    }
+
+    // Prefer a reply that arrived before the acknowledgement even when the
+    // shared deadline has just elapsed. It was already retained by the armed
+    // mailbox future while the acknowledgement was in flight.
+    if let Some(reply) = poll_once(reply.as_mut()).await {
+        return ConfirmedSendReceive::Reply(reply);
+    }
+
+    match reply_timeout {
+        None => ConfirmedSendReceive::Reply(reply.await),
+        Some(reply_timeout) => {
+            match timeout(reply_timeout.saturating_sub(wait_started.elapsed()), reply).await {
+                Ok(reply) => ConfirmedSendReceive::Reply(reply),
+                Err(_) => ConfirmedSendReceive::ReplyTimedOut,
+            }
+        }
+    }
+}
+
 fn send<T, E>(
     mut caller: Caller<T>,
     node_id: u64,
@@ -854,43 +922,38 @@ where
             tag,
             data,
         };
+        let reply_timeout =
+            (timeout_duration != u64::MAX).then(|| Duration::from_millis(timeout_duration));
         let wait_started = Instant::now();
-        let send_result = if timeout_duration == u64::MAX {
-            node_client.send(send_params).await
-        } else {
-            node_client
-                .send_with_timeout(send_params, Duration::from_millis(timeout_duration))
-                .await
-        };
-        if let Err(error) = send_result {
-            let status = distributed_send_error_status(error.kind());
-            data_message.buffer = error.into_data();
-            caller
-                .data_mut()
-                .message_scratch_area()
-                .replace(Message::Data(data_message));
-            return Ok(status);
-        }
-
-        let tags = [wait_on_tag];
-        let pop_skip_search = caller.data_mut().mailbox().pop_skip_search(Some(&tags));
-        if let Ok(message) = match timeout_duration {
-            // Without timeout
-            u64::MAX => Ok(pop_skip_search.await),
-            // Delivery acknowledgement and reply share one caller budget.
-            t => {
-                timeout(
-                    Duration::from_millis(t).saturating_sub(wait_started.elapsed()),
-                    pop_skip_search,
-                )
-                .await
+        let send = async move {
+            match reply_timeout {
+                None => node_client.send(send_params).await,
+                Some(response_timeout) => {
+                    node_client
+                        .send_with_timeout(send_params, response_timeout)
+                        .await
+                }
             }
-        } {
-            // Put the message into the scratch area
-            caller.data_mut().message_scratch_area().replace(message);
-            Ok(0)
-        } else {
-            Ok(9027)
+        };
+        let mailbox = caller.data_mut().mailbox().clone();
+        let tags = [wait_on_tag];
+        let reply = mailbox.pop_skip_search(Some(&tags));
+        match await_confirmed_send_and_reply(send, reply, reply_timeout, wait_started).await {
+            ConfirmedSendReceive::Reply(message) => {
+                // Put the message into the scratch area
+                caller.data_mut().message_scratch_area().replace(message);
+                Ok(0)
+            }
+            ConfirmedSendReceive::SendFailed(error) => {
+                let status = distributed_send_error_status(error.kind());
+                data_message.buffer = error.into_data();
+                caller
+                    .data_mut()
+                    .message_scratch_area()
+                    .replace(Message::Data(data_message));
+                Ok(status)
+            }
+            ConfirmedSendReceive::ReplyTimedOut => Ok(9027),
         }
     })
 }
@@ -920,8 +983,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::distributed_send_error_status;
+    use std::{
+        future::{poll_fn, Future},
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Instant,
+    };
+
+    use super::{
+        await_confirmed_send_and_reply, distributed_send_error_status, ConfirmedSendReceive,
+    };
     use lunatic_distributed::distributed::client::SendErrorKind;
+    use tokio::sync::oneshot;
 
     #[test]
     fn delivery_error_status_preserves_the_existing_guest_abi() {
@@ -947,5 +1023,57 @@ mod tests {
         ] {
             assert_eq!(distributed_send_error_status(kind), 9027);
         }
+    }
+
+    #[tokio::test]
+    async fn reply_wait_is_armed_before_send_and_retains_reply_until_ack() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let reply_polls = Arc::new(AtomicUsize::new(0));
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let (reply_tx, mut reply_rx) = oneshot::channel::<u32>();
+
+        let reply = {
+            let armed = Arc::clone(&armed);
+            let reply_polls = Arc::clone(&reply_polls);
+            poll_fn(move |cx| {
+                armed.store(true, Ordering::SeqCst);
+                reply_polls.fetch_add(1, Ordering::SeqCst);
+                Pin::new(&mut reply_rx)
+                    .poll(cx)
+                    .map(|reply| reply.expect("reply sender must remain alive"))
+            })
+        };
+        let send = {
+            let armed = Arc::clone(&armed);
+            let reply_polls = Arc::clone(&reply_polls);
+            let acknowledged = Arc::clone(&acknowledged);
+            async move {
+                assert!(
+                    armed.load(Ordering::SeqCst),
+                    "mailbox reply wait must be armed before the send is polled"
+                );
+                reply_tx.send(21).expect("reply receiver must be armed");
+
+                // Model a fast process reply that reaches the requester before
+                // the server's confirmed-delivery acknowledgement.
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    reply_polls.load(Ordering::SeqCst),
+                    1,
+                    "the early reply must stay retained until send ACK completes"
+                );
+                acknowledged.store(true, Ordering::SeqCst);
+                Ok::<(), &'static str>(())
+            }
+        };
+
+        let result = await_confirmed_send_and_reply(send, reply, None, Instant::now()).await;
+        match result {
+            ConfirmedSendReceive::Reply(reply) => assert_eq!(reply, 21),
+            ConfirmedSendReceive::SendFailed(error) => panic!("send failed: {error}"),
+            ConfirmedSendReceive::ReplyTimedOut => panic!("reply timed out"),
+        }
+        assert!(acknowledged.load(Ordering::SeqCst));
+        assert_eq!(reply_polls.load(Ordering::SeqCst), 2);
     }
 }
