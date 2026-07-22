@@ -6,14 +6,18 @@
 //! ## Example
 //!
 //! ```ignore
-//! use lunatic_otp_patterns::{Supervisor, SupervisorSpec, RestartStrategy, ChildSpec};
+//! use lunatic_otp_patterns::{
+//!     ChildSpec, ChildType, RestartPolicy, RestartStrategy, ShutdownPolicy,
+//!     Supervisor, SupervisorSpec,
+//! };
 //! use lunatic_process::{env::Environment, spawn_native, Process};
 //! use std::{future, sync::Arc};
 //!
 //! fn start_worker(environment: Arc<dyn Environment>) -> Result<Arc<dyn Process>, String> {
 //!     let (_join, process) = spawn_native(environment, |_process, _mailbox| async move {
 //!         future::pending::<anyhow::Result<()>>().await
-//!     });
+//!     })
+//!     .map_err(|error| error.to_string())?;
 //!     Ok(Arc::new(process))
 //! }
 //!
@@ -27,38 +31,45 @@
 //!             start: start_worker,
 //!             restart: RestartPolicy::Permanent,
 //!             shutdown: ShutdownPolicy::Timeout(5000),
+//!             child_type: ChildType::Worker,
 //!         },
 //!         ChildSpec {
 //!             id: "worker2".to_string(),
 //!             start: start_worker,
 //!             restart: RestartPolicy::Transient,
 //!             shutdown: ShutdownPolicy::Brutal,
+//!             child_type: ChildType::Worker,
 //!         },
 //!     ],
 //! };
 //!
-//! let mut supervisor = Supervisor::new(spec);
-//! supervisor.start_children()?;
+//! let supervisor = Supervisor::spawn(spec)?;
+//! // Runtime ProcessDied events now drive restart strategies automatically.
+//! supervisor.shutdown()?;
 //! ```
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use lunatic_process::{
     env::{Environment, LunaticEnvironment},
-    Process, Signal,
+    message::Message,
+    spawn_native, DeathReason, NativeProcess, Process, Signal,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::{self, Debug},
-    sync::Arc,
+    panic::{catch_unwind, AssertUnwindSafe},
+    sync::{mpsc, Arc, Condvar, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 const BRUTAL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const MONITOR_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Function used to start a child in the supervisor's Lunatic environment.
 pub type ChildStart = fn(Arc<dyn Environment>) -> Result<Arc<dyn Process>, String>;
+type CleanupTracker = Arc<Mutex<Vec<Arc<dyn Process>>>>;
 
 /// Supervisor specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +199,46 @@ pub struct Supervisor {
     environment: Arc<dyn Environment>,
     children: HashMap<String, ChildState>,
     restart_history: Vec<RestartEvent>,
+    monitor: Option<Arc<dyn Process>>,
+    cleanup_tracker: Option<CleanupTracker>,
+}
+
+/// Handle to a process-backed supervisor.
+///
+/// The supervisor process owns all mutable child state and consumes runtime
+/// monitor notifications serially. Cloned handles observe snapshots and can
+/// request an orderly shutdown without racing the restart loop.
+#[derive(Clone)]
+pub struct SupervisorHandle {
+    process: NativeProcess,
+    environment: Arc<dyn Environment>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    shared: Arc<SupervisorShared>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SupervisorExitStatus {
+    Normal,
+    Failed(String),
+}
+
+#[derive(Clone)]
+struct SupervisorSnapshot {
+    children: Vec<ChildInfo>,
+    counts: ChildrenCount,
+    restart_history: Vec<(u64, String)>,
+}
+
+struct SupervisorShared {
+    snapshot: Mutex<SupervisorSnapshot>,
+    exit: (Mutex<Option<SupervisorExitStatus>>, Condvar),
+}
+
+/// Best-effort orphan prevention if the supervisor process itself is killed.
+/// Orderly shutdown still applies each child's configured shutdown policy.
+struct SupervisorProcessGuard {
+    children: CleanupTracker,
+    armed: bool,
 }
 
 /// Child process state
@@ -227,7 +278,112 @@ impl Debug for Supervisor {
             .field("environment_id", &self.environment.id())
             .field("children", &self.children)
             .field("restart_history", &self.restart_history)
+            .field(
+                "monitor_process_id",
+                &self.monitor.as_ref().map(|process| process.id()),
+            )
             .finish()
+    }
+}
+
+impl Debug for SupervisorHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupervisorHandle")
+            .field("process_id", &self.process.id())
+            .field("environment_id", &self.environment.id())
+            .field("alive", &self.is_alive())
+            .finish()
+    }
+}
+
+impl SupervisorShared {
+    fn new(supervisor: &Supervisor) -> Self {
+        Self {
+            snapshot: Mutex::new(SupervisorSnapshot::from_supervisor(supervisor)),
+            exit: (Mutex::new(None), Condvar::new()),
+        }
+    }
+
+    fn publish(&self, supervisor: &Supervisor) {
+        *self
+            .snapshot
+            .lock()
+            .expect("Supervisor snapshot mutex poisoned") =
+            SupervisorSnapshot::from_supervisor(supervisor);
+    }
+
+    fn finish(&self, status: SupervisorExitStatus) {
+        let (exit, condvar) = &self.exit;
+        let mut exit = exit.lock().expect("Supervisor exit mutex poisoned");
+        if exit.is_none() {
+            *exit = Some(status);
+            condvar.notify_all();
+        }
+    }
+
+    fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<SupervisorExitStatus, String> {
+        let (exit, condvar) = &self.exit;
+        let exit = exit.lock().expect("Supervisor exit mutex poisoned");
+        let exit = match timeout {
+            Some(timeout) => {
+                let (exit, wait) = condvar
+                    .wait_timeout_while(exit, timeout, |status| status.is_none())
+                    .expect("Supervisor exit mutex poisoned");
+                if wait.timed_out() && exit.is_none() {
+                    return Err("Timed out waiting for Supervisor to exit".to_string());
+                }
+                exit
+            }
+            None => condvar
+                .wait_while(exit, |status| status.is_none())
+                .expect("Supervisor exit mutex poisoned"),
+        };
+
+        exit.clone()
+            .ok_or_else(|| "Supervisor exit status unavailable".to_string())
+    }
+}
+
+impl SupervisorSnapshot {
+    fn from_supervisor(supervisor: &Supervisor) -> Self {
+        Self {
+            children: supervisor.which_children(),
+            counts: supervisor.count_children(),
+            restart_history: supervisor.restart_history(),
+        }
+    }
+}
+
+impl SupervisorProcessGuard {
+    fn new(children: CleanupTracker) -> Self {
+        Self {
+            children,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.children
+            .lock()
+            .expect("Supervisor cleanup tracker mutex poisoned")
+            .clear();
+    }
+}
+
+impl Drop for SupervisorProcessGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let children = self
+            .children
+            .lock()
+            .expect("Supervisor cleanup tracker mutex poisoned");
+        for child in children.iter().rev() {
+            let _ = child.send(Signal::Kill);
+        }
     }
 }
 
@@ -244,6 +400,103 @@ impl Supervisor {
             environment,
             children: HashMap::new(),
             restart_history: Vec::new(),
+            monitor: None,
+            cleanup_tracker: None,
+        }
+    }
+
+    /// Spawn a native Lunatic process that owns and runs a supervisor.
+    pub fn spawn(spec: SupervisorSpec) -> Result<SupervisorHandle, String> {
+        Self::spawn_with_environment(spec, Arc::new(LunaticEnvironment::new(0)))
+    }
+
+    /// Spawn a process-backed supervisor in `environment`.
+    ///
+    /// This is the automatic supervision entry point. It waits until every
+    /// initial child has been started and its monitor relation acknowledged.
+    pub fn spawn_with_environment(
+        spec: SupervisorSpec,
+        environment: Arc<dyn Environment>,
+    ) -> Result<SupervisorHandle, String> {
+        ensure_multi_thread_runtime()?;
+
+        let supervisor = Self::with_environment(spec, environment.clone());
+        let shared = Arc::new(SupervisorShared::new(&supervisor));
+        let process_shared = shared.clone();
+        let (shutdown, mut shutdown_request) = tokio::sync::watch::channel(false);
+        let (started_sender, started_receiver) = mpsc::sync_channel(1);
+
+        let (join, process) = spawn_native(environment.clone(), move |process, mailbox| async move {
+            let mut supervisor = supervisor;
+            let cleanup_tracker = Arc::new(Mutex::new(Vec::new()));
+            let mut process_guard = SupervisorProcessGuard::new(cleanup_tracker.clone());
+            supervisor.monitor = Some(Arc::new(process));
+            supervisor.cleanup_tracker = Some(cleanup_tracker);
+
+            let start_result = supervisor.start_children();
+            process_shared.publish(&supervisor);
+            let _ = started_sender.send(start_result.clone());
+            start_result.map_err(anyhow::Error::msg)?;
+
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = shutdown_request.changed() => {
+                        if changed.is_err() || *shutdown_request.borrow() {
+                            let result = supervisor.shutdown();
+                            process_shared.publish(&supervisor);
+                            result.map_err(anyhow::Error::msg)?;
+                            process_guard.disarm();
+                            return Ok(());
+                        }
+                    }
+                    message = mailbox.pop(None) => {
+                        let Message::ProcessDied { process_id, reason } = message else {
+                            continue;
+                        };
+                        if let Err(restart_error) = supervisor.handle_process_exit(process_id, reason) {
+                            let shutdown_error = supervisor.shutdown().err();
+                            process_shared.publish(&supervisor);
+                            let error = match shutdown_error {
+                                Some(shutdown_error) => format!(
+                                    "{restart_error}; failed to shut down remaining children during escalation: {shutdown_error}"
+                                ),
+                                None => restart_error,
+                            };
+                            return Err(anyhow!(error));
+                        }
+                        process_shared.publish(&supervisor);
+                    }
+                }
+            }
+        })
+        .map_err(|error| format!("Failed to spawn Supervisor process: {error}"))?;
+
+        let process_id = process.id();
+        let join_shared = shared.clone();
+        tokio::spawn(async move {
+            let status = match join.await {
+                Ok(Ok(())) => SupervisorExitStatus::Normal,
+                Ok(Err(error)) => SupervisorExitStatus::Failed(error.to_string()),
+                Err(error) => {
+                    SupervisorExitStatus::Failed(format!("Supervisor process task failed: {error}"))
+                }
+            };
+            join_shared.finish(status);
+        });
+
+        let started = run_blocking(|| started_receiver.recv());
+        match started {
+            Ok(Ok(())) => Ok(SupervisorHandle {
+                process,
+                environment,
+                shutdown,
+                shared,
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(format!(
+                "Supervisor process {process_id} exited before startup completed"
+            )),
         }
     }
 
@@ -262,6 +515,24 @@ impl Supervisor {
             started.push(child_id.clone());
         }
         Ok(())
+    }
+
+    fn refresh_cleanup_tracker(&self) {
+        let Some(tracker) = &self.cleanup_tracker else {
+            return;
+        };
+        *tracker
+            .lock()
+            .expect("Supervisor cleanup tracker mutex poisoned") = self
+            .spec
+            .children
+            .iter()
+            .filter_map(|child| {
+                self.children
+                    .get(&child.id)
+                    .and_then(|state| state.process.clone())
+            })
+            .collect();
     }
 
     /// Start a specific child process
@@ -292,12 +563,52 @@ impl Supervisor {
             }
             state.process = None;
         }
+        self.refresh_cleanup_tracker();
 
-        let process = (child_spec.start)(self.environment.clone())
-            .map_err(|error| format!("Failed to start child '{}': {}", child_id, error))?;
+        let process = catch_unwind(AssertUnwindSafe(|| {
+            (child_spec.start)(self.environment.clone())
+        }))
+        .map_err(|payload| {
+            format!(
+                "Failed to start child '{}': start function panicked: {}",
+                child_id,
+                panic_payload_message(payload)
+            )
+        })?
+        .map_err(|error| format!("Failed to start child '{}': {}", child_id, error))?;
         let process_id = process.id();
 
-        if self.environment.get_process(process_id).is_none() {
+        if let Some(monitor) = self.monitor.clone() {
+            let (acknowledgement, acknowledged) = mpsc::sync_channel(1);
+            if let Err(error) = process.send(Signal::Monitor {
+                process: monitor,
+                acknowledgement: Some(acknowledgement),
+            }) {
+                let _ = process.send(Signal::Kill);
+                let _ =
+                    self.wait_for_process_exit(child_id, process_id, Some(BRUTAL_SHUTDOWN_TIMEOUT));
+                return Err(format!(
+                    "Failed to monitor child '{}' process {}: {error}",
+                    child_id, process_id
+                ));
+            }
+            let monitor_result =
+                run_blocking(|| acknowledged.recv_timeout(MONITOR_REGISTRATION_TIMEOUT));
+            if let Err(error) = monitor_result {
+                let _ = process.send(Signal::Kill);
+                let _ =
+                    self.wait_for_process_exit(child_id, process_id, Some(BRUTAL_SHUTDOWN_TIMEOUT));
+                return Err(format!(
+                    "Timed out waiting for child '{}' process {} monitor registration: {error}",
+                    child_id, process_id
+                ));
+            }
+        }
+
+        if self.monitor.is_none()
+            && self.environment.get_process(process_id).is_none()
+            && process.terminal_reason().is_none()
+        {
             let _ = process.send(Signal::Kill);
             return Err(format!(
                 "Child '{}' start function returned unregistered process {}",
@@ -324,6 +635,7 @@ impl Supervisor {
                 );
             }
         }
+        self.refresh_cleanup_tracker();
 
         Ok(process_id)
     }
@@ -389,6 +701,28 @@ impl Supervisor {
         self.restart_children(&child_ids)
     }
 
+    fn handle_process_exit(&mut self, process_id: u64, reason: DeathReason) -> Result<(), String> {
+        let child_id = self.children.iter().find_map(|(child_id, state)| {
+            state
+                .process
+                .as_ref()
+                .filter(|process| process.id() == process_id)
+                .map(|_| child_id.clone())
+        });
+        let Some(child_id) = child_id else {
+            // Strategy restarts and shutdown intentionally terminate children.
+            // Their notifications can arrive after a replacement is installed;
+            // process identity, rather than child ID alone, makes them stale.
+            return Ok(());
+        };
+
+        let reason = match reason {
+            DeathReason::Normal => ExitReason::Normal,
+            DeathReason::Failure | DeathReason::NoProcess => ExitReason::Crash,
+        };
+        self.handle_child_exit(&child_id, reason)
+    }
+
     fn restart_children(&mut self, child_ids: &[String]) -> Result<(), String> {
         self.reserve_restart_events(child_ids)?;
 
@@ -430,6 +764,7 @@ impl Supervisor {
             if let Some(state) = self.children.get_mut(child_id) {
                 state.process = None;
             }
+            self.refresh_cleanup_tracker();
             return Ok(());
         }
 
@@ -446,6 +781,7 @@ impl Supervisor {
         if let Some(state) = self.children.get_mut(child_id) {
             state.process = None;
         }
+        self.refresh_cleanup_tracker();
         Ok(())
     }
 
@@ -455,17 +791,19 @@ impl Supervisor {
         process_id: u64,
         timeout: Option<Duration>,
     ) -> Result<(), String> {
-        let started = Instant::now();
-        while self.environment.get_process(process_id).is_some() {
-            if timeout.is_some_and(|limit| started.elapsed() >= limit) {
-                return Err(format!(
-                    "Timed out stopping child '{}' process {}",
-                    child_id, process_id
-                ));
+        run_blocking(|| {
+            let started = Instant::now();
+            while self.environment.get_process(process_id).is_some() {
+                if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    return Err(format!(
+                        "Timed out stopping child '{}' process {}",
+                        child_id, process_id
+                    ));
+                }
+                thread::sleep(Duration::from_millis(1));
             }
-            thread::sleep(Duration::from_millis(1));
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Stop every active child in reverse start order.
@@ -571,6 +909,81 @@ impl Supervisor {
     }
 }
 
+impl SupervisorHandle {
+    /// Return the native process ID of the supervisor.
+    pub fn id(&self) -> u64 {
+        self.process.id()
+    }
+
+    /// Borrow the native process handle for linking or monitoring the supervisor.
+    pub fn process(&self) -> &NativeProcess {
+        &self.process
+    }
+
+    /// Return whether the supervisor process is still registered and running.
+    pub fn is_alive(&self) -> bool {
+        if self
+            .shared
+            .exit
+            .0
+            .lock()
+            .expect("Supervisor exit mutex poisoned")
+            .is_some()
+        {
+            return false;
+        }
+        self.environment.get_process(self.process.id()).is_some()
+    }
+
+    /// Return the most recently published child snapshot.
+    pub fn which_children(&self) -> Vec<ChildInfo> {
+        self.shared
+            .snapshot
+            .lock()
+            .expect("Supervisor snapshot mutex poisoned")
+            .children
+            .clone()
+    }
+
+    /// Return child counts from the most recently published snapshot.
+    pub fn count_children(&self) -> ChildrenCount {
+        self.shared
+            .snapshot
+            .lock()
+            .expect("Supervisor snapshot mutex poisoned")
+            .counts
+            .clone()
+    }
+
+    /// Return restart events in chronological order.
+    pub fn restart_history(&self) -> Vec<(u64, String)> {
+        self.shared
+            .snapshot
+            .lock()
+            .expect("Supervisor snapshot mutex poisoned")
+            .restart_history
+            .clone()
+    }
+
+    /// Request orderly reverse-order child shutdown and wait for completion.
+    pub fn shutdown(&self) -> Result<(), String> {
+        let _ = self.shutdown.send(true);
+        self.wait_for_exit(None)
+    }
+
+    /// Wait until the supervisor exits.
+    ///
+    /// Restart-intensity exhaustion and restart failures are returned as
+    /// errors. An orderly shutdown returns `Ok(())`.
+    pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<(), String> {
+        let status = run_blocking(|| self.shared.wait_for_exit(timeout))?;
+        match status {
+            SupervisorExitStatus::Normal => Ok(()),
+            SupervisorExitStatus::Failed(error) => Err(error),
+        }
+    }
+}
+
 /// Exit reason for child process
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExitReason {
@@ -612,6 +1025,30 @@ fn ensure_multi_thread_runtime() -> Result<(), String> {
         return Err("Supervisor requires a multi-thread Tokio runtime".to_string());
     }
     Ok(())
+}
+
+fn run_blocking<T>(operation: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime)
+            if matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(operation)
+        }
+        _ => operation(),
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 fn current_timestamp_secs() -> u64 {

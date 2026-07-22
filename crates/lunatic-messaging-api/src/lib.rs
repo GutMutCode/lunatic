@@ -268,7 +268,7 @@ fn write_data<T: ProcessState + ProcessCtx<T>>(
             None => Err(anyhow!("Message size overflow")),
         },
         Message::LinkDied(_) => Err(anyhow!("Unexpected `Message::LinkDied` in scratch area")),
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -314,7 +314,7 @@ fn read_data<T: ProcessState + ProcessCtx<T>>(
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -341,7 +341,7 @@ fn seek_data<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, index: u64)
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -389,7 +389,7 @@ fn data_size<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>) -> Result<u
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -416,7 +416,7 @@ fn ensure_message_resource_capacity<T: ProcessState + ProcessCtx<T>>(
     match message {
         Message::Data(data) => reserve_message_resource_slot(data, max_resources),
         Message::LinkDied(_) => Err(anyhow!("Unexpected `Message::LinkDied` in scratch area")),
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     }
@@ -440,7 +440,7 @@ fn ensure_data_message<T: ProcessState + ProcessCtx<T>>(caller: &mut Caller<T>) 
     {
         Message::Data(_) => Ok(()),
         Message::LinkDied(_) => Err(anyhow!("Unexpected `Message::LinkDied` in scratch area")),
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     }
@@ -467,7 +467,7 @@ fn push_module<T: ProcessState + ProcessCtx<T> + NetworkingCtx + 'static>(
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -506,7 +506,7 @@ where
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -551,7 +551,7 @@ fn push_tcp_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -644,7 +644,7 @@ fn push_tls_stream<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
@@ -874,7 +874,7 @@ fn receive<T: ProcessState + ProcessCtx<T> + Send>(
             let result = match message {
                 Message::Data(_) => 0,
                 Message::LinkDied(_) => 1,
-                Message::ProcessDied(_) => 2,
+                Message::ProcessDied { .. } => 2,
             };
             // Put the message into the scratch area
             caller.data_mut().message_scratch_area().replace(message);
@@ -920,7 +920,7 @@ fn push_udp_socket<T: ProcessState + ProcessCtx<T> + NetworkingCtx>(
         Message::LinkDied(_) => {
             return Err(anyhow!("Unexpected `Message::LinkDied` in scratch area"))
         }
-        Message::ProcessDied(_) => {
+        Message::ProcessDied { .. } => {
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };

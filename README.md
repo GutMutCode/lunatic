@@ -25,13 +25,13 @@ If you would like to see other languages supported or just follow the discussion
 
 - [x] Creating, cancelling & waiting on processes
 - [ ] Capability and resource isolation (least-privilege config defaults and attenuation are implemented; complete FD/network/process/queue accounting remains open)
-- [ ] Process supervision (host-side GenServer/Supervisor process paths exist; automatic monitor intake and guest-WASM adapters are pending)
+- [ ] Process supervision (the native Supervisor automatically consumes acknowledged child monitor events and escalates restart exhaustion; guest-side supervisor trees and distributed supervision remain pending)
 - [x] Channel based message passing
 - [x] TCP networking
 - [x] Filesystem access
 - [ ] Distributed nodes (mTLS QUIC and registry coordination exist; live cross-node guest mailbox delivery is not yet proven end to end)
 - [ ] Hot reload (snapshot, validation, and resource-transfer components exist; the live running-Wasm reload path is not yet production-verified)
-- [ ] OTP patterns (host-side GenServer and Supervisor are integrated; GenStatem/GenEvent runtime adapters and guest bindings are pending)
+- [ ] OTP patterns (native GenServer/Supervisor/GenStatem/GenEvent adapters and an actual-Wasm OTP call/reply/timeout/stop contract are verified; high-level cross-language SDKs and distributed OTP remain pending)
 
 Unchecked entries are active implementation areas, not unavailable concepts. The canonical evidence and known gaps are maintained in [the core-values status](docs/core_values/status.md); historical phase and benchmark reports do not override it.
 

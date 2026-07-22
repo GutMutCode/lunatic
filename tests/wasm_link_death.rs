@@ -1,11 +1,18 @@
 use std::{
     collections::HashMap,
     future::pending,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+    },
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
+use lunatic_otp_patterns::{
+    ChildSpec, ChildType, RestartPolicy, RestartStrategy, ShutdownPolicy, Supervisor,
+    SupervisorSpec,
+};
 use lunatic_process::{
     env::{Environment, LunaticEnvironment},
     message::{DataMessage, Message},
@@ -110,6 +117,9 @@ const LIFECYCLE_GUEST: &str = r#"
 
     (func (export "fail_now")
         unreachable)
+
+    (func (export "supervised_wait")
+        (call $sleep_ms (i64.const 60000)))
 )
 "#;
 
@@ -124,6 +134,7 @@ enum Observed {
     },
     ProcessDied {
         process_id: u64,
+        reason: DeathReason,
         removed_before_notification: bool,
     },
 }
@@ -198,15 +209,16 @@ impl RecordingProcess {
             .filter_map(|event| match event {
                 Observed::ProcessDied {
                     process_id: observed_id,
+                    reason,
                     removed_before_notification,
-                } if *observed_id == process_id => Some(*removed_before_notification),
+                } if *observed_id == process_id => Some((*reason, *removed_before_notification)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             monitor_deaths,
-            vec![true],
-            "duplicate monitor registration must still notify exactly once after removal"
+            vec![(expected_reason, true)],
+            "duplicate monitor registration must preserve the reason and notify exactly once after removal"
         );
     }
 
@@ -235,8 +247,9 @@ impl Process for RecordingProcess {
                 reason,
                 removed_before_notification: self.removed(process_id),
             }),
-            Signal::ProcessDied(process_id) => Some(Observed::ProcessDied {
+            Signal::ProcessDied { process_id, reason } => Some(Observed::ProcessDied {
                 process_id,
+                reason,
                 removed_before_notification: self.removed(process_id),
             }),
             _ => None,
@@ -250,53 +263,30 @@ impl Process for RecordingProcess {
     }
 }
 
-struct MonitorRegistrationProbe {
-    observer: Arc<dyn Process>,
-    processed: Arc<Notify>,
-}
-
-impl Drop for MonitorRegistrationProbe {
-    fn drop(&mut self) {
-        self.processed.notify_one();
-    }
-}
-
-impl Process for MonitorRegistrationProbe {
-    fn id(&self) -> u64 {
-        self.observer.id()
-    }
-
-    fn send(
-        &self,
-        signal: Signal,
-    ) -> std::result::Result<(), lunatic_process::state::SignalSendError> {
-        self.observer.send(signal)
-    }
-}
-
 /// Registers the same monitor twice and waits until the second registration
-/// replaces the first in the target's relation map. This is an actual signal
-/// processing barrier, which is required before requesting an out-of-band
-/// Kill that intentionally preempts queued signals.
+/// replaces the first in the target's relation map. The acknowledgement is an
+/// actual signal-processing barrier, which is required before requesting an
+/// out-of-band Kill that intentionally preempts queued signals.
 async fn register_monitor_and_wait(
     process: &dyn Process,
     observer: Arc<dyn Process>,
 ) -> Result<()> {
-    let processed = Arc::new(Notify::new());
-    let notified = processed.notified();
-    let probe: Arc<dyn Process> = Arc::new(MonitorRegistrationProbe {
-        observer: observer.clone(),
-        processed: processed.clone(),
-    });
+    let (acknowledgement, registered) = std::sync::mpsc::sync_channel(1);
 
     process
-        .send(Signal::Monitor(probe))
+        .send(Signal::Monitor {
+            process: observer.clone(),
+            acknowledgement: None,
+        })
         .map_err(|error| anyhow!(error.to_string()))?;
     process
-        .send(Signal::Monitor(observer))
+        .send(Signal::Monitor {
+            process: observer,
+            acknowledgement: Some(acknowledgement),
+        })
         .map_err(|error| anyhow!(error.to_string()))?;
-    timeout(TEST_TIMEOUT, notified)
-        .await
+    registered
+        .recv_timeout(TEST_TIMEOUT)
         .context("target did not process the monitor registration barrier")?;
     Ok(())
 }
@@ -307,6 +297,9 @@ struct WasmHarness {
     module: Arc<WasmtimeCompiledModule<DefaultProcessState>>,
     registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
 }
+
+static SUPERVISED_WASM_HARNESS: OnceLock<WasmHarness> = OnceLock::new();
+static SUPERVISED_WASM_STARTS: AtomicUsize = AtomicUsize::new(0);
 
 impl WasmHarness {
     fn new() -> Result<Self> {
@@ -361,6 +354,56 @@ impl WasmHarness {
         )
         .await
     }
+}
+
+fn start_supervised_wasm(
+    environment: Arc<dyn Environment>,
+) -> std::result::Result<Arc<dyn Process>, String> {
+    let harness = SUPERVISED_WASM_HARNESS
+        .get()
+        .ok_or_else(|| "supervised Wasm harness was not initialized".to_string())?;
+    let function = if SUPERVISED_WASM_STARTS.fetch_add(1, Ordering::SeqCst) == 0 {
+        "fail_now"
+    } else {
+        "supervised_wait"
+    };
+    if environment.id() != harness.environment.id() {
+        return Err("Supervisor used an unexpected Wasm environment".to_string());
+    }
+    let state = DefaultProcessState::new(
+        harness.environment.clone(),
+        None,
+        harness.runtime.clone(),
+        harness.module.clone(),
+        Arc::new(DefaultProcessConfig::default()),
+        harness.registry.clone(),
+    )
+    .map_err(|error| error.to_string())?;
+
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let (join, process) = spawn_wasm(
+                environment,
+                harness.runtime.clone(),
+                &harness.module,
+                state,
+                function,
+                Vec::new(),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            if function == "fail_now" {
+                let result = join.await.map_err(|error| {
+                    format!("trapped Wasm task failed outside its runner: {error}")
+                })?;
+                if result.is_ok() {
+                    return Err("the supervised Wasm trap exited normally".to_string());
+                }
+            }
+            Ok(process)
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -600,6 +643,83 @@ async fn actual_wasm_peer_honors_default_and_trap_exit_link_modes() -> Result<()
     );
     trap_observer.assert_lifecycle(trap_peer_id, Some(202), DeathReason::Normal);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_wasm_trap_drives_supervisor_restart_policy() -> Result<()> {
+    let harness = WasmHarness::new()?;
+    let environment = harness.environment.clone();
+    SUPERVISED_WASM_HARNESS
+        .set(harness)
+        .map_err(|_| anyhow!("supervised Wasm harness was initialized more than once"))?;
+    SUPERVISED_WASM_STARTS.store(0, Ordering::SeqCst);
+
+    let supervisor = Supervisor::spawn_with_environment(
+        SupervisorSpec {
+            strategy: RestartStrategy::OneForOne,
+            max_restarts: 3,
+            max_seconds: 60,
+            children: vec![ChildSpec {
+                id: "wasm-worker".to_string(),
+                start: start_supervised_wasm,
+                restart: RestartPolicy::Permanent,
+                shutdown: ShutdownPolicy::Brutal,
+                child_type: ChildType::Worker,
+            }],
+        },
+        environment.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let supervisor_id = supervisor.id();
+
+    let replacement = timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some(child) = supervisor
+                .which_children()
+                .into_iter()
+                .find(|child| child.id == "wasm-worker" && child.restart_count == 1)
+            {
+                if let Some(process_id) = child.process_id {
+                    break process_id;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let replacement_id = match replacement {
+        Ok(process_id) => process_id,
+        Err(error) => {
+            let _ = supervisor.shutdown();
+            return Err(error).context("Supervisor did not restart the trapped Wasm child");
+        }
+    };
+    let replacement_was_active = environment.get_process(replacement_id).is_some();
+    let start_count = SUPERVISED_WASM_STARTS.load(Ordering::SeqCst);
+    let restart_history = supervisor.restart_history();
+
+    supervisor.shutdown().map_err(anyhow::Error::msg)?;
+    timeout(TEST_TIMEOUT, async {
+        while environment.get_process(supervisor_id).is_some()
+            || environment.get_process(replacement_id).is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .context("Supervisor or replacement Wasm child remained registered after shutdown")?;
+
+    assert_eq!(
+        start_count, 2,
+        "the immediate trap should cause exactly one replacement start"
+    );
+    assert!(
+        replacement_was_active,
+        "the replacement Wasm child should remain active until supervisor shutdown"
+    );
+    assert_eq!(restart_history.len(), 1);
+    assert_eq!(restart_history[0].1, "wasm-worker");
     Ok(())
 }
 

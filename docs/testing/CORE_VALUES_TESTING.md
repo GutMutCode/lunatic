@@ -25,8 +25,9 @@ enforces the configured thresholds in `scripts/check_bench_thresholds.py`.
 
 | Area | Production path exercised | Command |
 | --- | --- | --- |
-| Wasm failure propagation | Actual `spawn_wasm` normal/trap/host-panic/active-kill/missing-process exits, default and trapping-exit peers, monitor deduplication, and native-runner parity | `cargo test -p lunatic-runtime --test wasm_link_death` |
-| OTP GenServer and Supervisor | Native Lunatic processes, serialized mailbox messages, lifecycle, failure and restart policies | `cargo test -p lunatic-otp-patterns` |
+| Wasm failure propagation | Actual `spawn_wasm` normal/trap/host-panic/active-kill/missing-process exits, default and trapping-exit peers, monitor deduplication, native-runner parity, and Supervisor replacement after an immediate guest trap | `cargo test -p lunatic-runtime --test wasm_link_death` |
+| OTP runtime adapters | Native GenServer/GenStatem/GenEvent mailbox lifecycles including one-worker synchronous handles, local named GenServer registration/cleanup, and automatic Supervisor monitoring of immediate/ordinary exits, restart, shutdown, and escalation | `cargo test -p lunatic-otp-patterns` |
+| Guest-Wasm OTP wire contract | Rust-encoded probe plus actual Wasm client/server cast, correlated reply envelope, timeout, and acknowledged stop over the production message imports | `cargo test --test otp_guest_wasm` |
 | Hot reload component harness | Two manually orchestrated Wasmtime modules, memory snapshot, replacement module behavior and restored state | `cargo test -p lunatic-process --test hot_reload_integration` |
 | Live Wasm hot reload | Watch-equivalent compile/register/broadcast through `Signal::HotReload` and the execution driver; process identity, compatible memory, FIFO mailbox state, signature rejection, instantiation fallback, and rollback | `cargo test -p lunatic-runtime --test live_hot_reload` |
 | Live TLS hot reload | Real TLS handshake, live resource transfer, preserved resource ID/timeouts, post-transfer traffic | `cargo test -p lunatic-runtime --lib hot_reload_transfers_live_tls_stream_with_id_and_timeouts` |
@@ -95,8 +96,9 @@ including known gaps, is `docs/core_values/status.md`.
 - Cloud CLI lifecycle tests inject a deterministic fake credential store. CI compiles each native
   provider, but it does not prove that Keychain, Credential Manager, or Secret Service is available
   and unlocked in a representative user session; release validation needs platform smoke tests.
-- Supervisor monitor-event intake and process-runtime adapters for GenStatem and
-  GenEvent remain follow-up work.
+- OTP1 remains a low-level wire contract. Packaged Rust, TinyGo, and
+  AssemblyScript guest SDKs, guest-side Supervisor/GenStatem/GenEvent libraries,
+  global named GenServers, and distributed supervision remain follow-up work.
 
 ## Adding Evidence
 

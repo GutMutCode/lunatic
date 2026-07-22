@@ -1,6 +1,6 @@
 # Core Values Verification Summary
 
-**Last reviewed**: 2026-07-21
+**Last reviewed**: 2026-07-22
 
 The repository uses executable production-path tests instead of a synthetic
 compliance score.
@@ -17,7 +17,7 @@ cargo test --all
 
 | Claim | Evidence | Boundary |
 | --- | --- | --- |
-| OTP server/supervisor behavior works on Lunatic processes | 41 tests in `lunatic-otp-patterns`, including 9 dedicated actual-process integration tests | GenStatem/GenEvent runtime adapters and automatic Supervisor monitor intake remain open |
+| OTP adapters work on Lunatic processes and the guest message ABI | `lunatic-otp-patterns`, `tests/wasm_link_death.rs`, and `tests/otp_guest_wasm.rs` cover late/intake-safe Supervisor monitoring including an actual Wasm trap, named GenServer cleanup, one-worker-safe GenStatem/GenEvent lifecycles, and enveloped guest call/reply/timeout/stop | Packaged cross-language guest SDKs and distributed supervision remain open |
 | Hot reload preserves Wasm memory across module replacement | Embedded v1/v2 Wasmtime integration test | This test covers memory replacement, not every runtime resource |
 | Live in-process TLS sessions survive hot reload | Real handshake and traffic after state transfer | Serialized, restarted, and cross-process TLS restoration is intentionally unsupported |
 | Global registration coordinates across authenticated nodes | Real mTLS QUIC tests cover 2/3/5-node contention, request-ID uniqueness, quorum, resync, forged leader/snapshot rejection with no registry mutation, and expected-peer response correlation | Cluster-wide resource quotas and crash chaos are not covered |

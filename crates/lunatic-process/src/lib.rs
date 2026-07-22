@@ -24,12 +24,12 @@ use log::{debug, log_enabled, trace, warn, Level};
 use smallvec::SmallVec;
 use state::{
     default_mailboxes, MonitorNotification, MonitorNotificationError, ProcessState, SignalReceiver,
-    SignalSendError, SignalSender,
+    SignalReceiverGuard, SignalSendError, SignalSender,
 };
 use tokio::{
     sync::{
         mpsc::{channel, error::TrySendError, Receiver, Sender},
-        oneshot,
+        oneshot, OwnedSemaphorePermit,
     },
     task::JoinHandle,
 };
@@ -182,6 +182,11 @@ pub struct ReloadAcknowledgement {
 }
 
 pub type ReloadAckSender = oneshot::Sender<ReloadAcknowledgement>;
+/// Signals that a monitor relation has been installed in the target process.
+///
+/// Senders use `try_send`, so callers requesting acknowledgement must create a
+/// sync channel with capacity for at least one value.
+pub type MonitorAckSender = std::sync::mpsc::SyncSender<()>;
 
 pub(crate) fn acknowledge_reload(
     acknowledgement: Option<ReloadAckSender>,
@@ -474,11 +479,18 @@ pub enum Signal {
     /// A linked process died
     LinkDied(u64, Option<i64>, DeathReason),
     /// Monitor this process
-    Monitor(Arc<dyn Process>),
+    Monitor {
+        process: Arc<dyn Process>,
+        /// Optional processing barrier emitted after the relation is installed.
+        acknowledgement: Option<MonitorAckSender>,
+    },
     /// Stop monitoring this process
     StopMonitoring { process_id: u64 },
     /// A monitored process died
-    ProcessDied(u64),
+    ProcessDied {
+        process_id: u64,
+        reason: DeathReason,
+    },
     /// Kill the process
     Kill,
     /// Hot reload request. Coordinated callers provide an expected version and
@@ -528,6 +540,74 @@ pub trait Process: Send + Sync {
     ) -> std::result::Result<Option<MonitorNotification>, MonitorNotificationError> {
         Ok(None)
     }
+
+    /// Returns the terminal reason retained by built-in process handles.
+    ///
+    /// Custom process implementations may leave the default when they do not
+    /// retain lifecycle state after their signal receiver closes.
+    #[doc(hidden)]
+    fn terminal_reason(&self) -> Option<DeathReason> {
+        None
+    }
+}
+
+type MonitorRelations = HashMap<
+    u64,
+    (
+        Arc<dyn Process>,
+        OwnedSemaphorePermit,
+        Option<MonitorNotification>,
+    ),
+>;
+
+fn admit_monitor(
+    monitors: &mut MonitorRelations,
+    process: Arc<dyn Process>,
+    acknowledgement: Option<MonitorAckSender>,
+    monitor_permit: Option<OwnedSemaphorePermit>,
+    monitor_notification: Option<MonitorNotification>,
+) {
+    monitors.insert(
+        process.id(),
+        (
+            process,
+            monitor_permit.expect("monitor signal must reserve monitor capacity"),
+            monitor_notification,
+        ),
+    );
+    if let Some(acknowledgement) = acknowledgement {
+        let _ = acknowledgement.try_send(());
+    }
+}
+
+/// Publishes terminal state, closes ingress, and applies queued monitor
+/// relation changes in FIFO order. A target-aware sender that races with the
+/// close either leaves its envelope in this drain or completes it directly.
+fn close_signal_ingress(
+    signal_mailbox: &mut SignalReceiverGuard<'_>,
+    monitors: &mut MonitorRelations,
+    death_reason: DeathReason,
+) {
+    signal_mailbox.close_with_reason(death_reason);
+    while let Some(envelope) = signal_mailbox.try_recv() {
+        let (signal, _, _, monitor_permit, monitor_notification) = envelope.into_process_parts();
+        match signal {
+            Signal::Monitor {
+                process,
+                acknowledgement,
+            } => admit_monitor(
+                monitors,
+                process,
+                acknowledgement,
+                monitor_permit,
+                monitor_notification,
+            ),
+            Signal::StopMonitoring { process_id } => {
+                monitors.remove(&process_id);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn notify_linked_process(
@@ -573,13 +653,17 @@ impl Process for WasmProcess {
     }
 
     fn send(&self, signal: Signal) -> std::result::Result<(), SignalSendError> {
-        self.signal_sender.send(signal)
+        self.signal_sender.send_to_process(self.id, signal)
     }
 
     fn reserve_monitor_notification(
         &self,
     ) -> std::result::Result<Option<MonitorNotification>, MonitorNotificationError> {
         self.signal_sender.reserve_monitor_notification().map(Some)
+    }
+
+    fn terminal_reason(&self) -> Option<DeathReason> {
+        self.signal_sender.terminal_reason()
     }
 }
 
@@ -750,13 +834,17 @@ impl Process for NativeProcess {
         #[cfg(feature = "metrics")]
         metrics::increment_counter!("lunatic.process.signals.send", &labels);
 
-        self.signal_mailbox.send(signal)
+        self.signal_mailbox.send_to_process(self.id, signal)
     }
 
     fn reserve_monitor_notification(
         &self,
     ) -> std::result::Result<Option<MonitorNotification>, MonitorNotificationError> {
         self.signal_mailbox.reserve_monitor_notification().map(Some)
+    }
+
+    fn terminal_reason(&self) -> Option<DeathReason> {
+        self.signal_mailbox.terminal_reason()
     }
 }
 
@@ -899,24 +987,23 @@ where
                                 DeathReason::Normal => {}
                             }
                         }
-                        Signal::Monitor(process) => {
-                            monitors.insert(
-                                process.id(),
-                                (
-                                    process,
-                                    monitor_permit
-                                        .expect("monitor signal must reserve monitor capacity"),
-                                    monitor_notification,
-                                ),
-                            );
-                        }
+                        Signal::Monitor {
+                            process,
+                            acknowledgement,
+                        } => admit_monitor(
+                            &mut monitors,
+                            process,
+                            acknowledgement,
+                            monitor_permit,
+                            monitor_notification,
+                        ),
                         Signal::StopMonitoring { process_id } => {
                             monitors.remove(&process_id);
                         }
-                        Signal::ProcessDied(process_id) => {
+                        Signal::ProcessDied { process_id, reason } => {
                             message_mailbox
                                 .push_with_permit(
-                                    Message::ProcessDied(process_id),
+                                    Message::ProcessDied { process_id, reason },
                                     mailbox_permit.expect(
                                         "process-death signal must reserve mailbox capacity",
                                     ),
@@ -972,8 +1059,6 @@ where
         }
     };
 
-    registration.unregister();
-
     let (result, death_reason) = match result {
         Finished::Normal(Ok(())) => (Ok(()), DeathReason::Normal),
         Finished::Normal(Err(error)) => (Err(error), DeathReason::Failure),
@@ -984,12 +1069,18 @@ where
         ),
     };
 
+    registration.unregister();
+    close_signal_ingress(&mut signal_mailbox, &mut monitors, death_reason);
+
     for (_, (monitor, _, notification)) in monitors {
         if let Some(notification) = notification {
-            if let Err(error) = notification.deliver(id) {
+            if let Err(error) = notification.deliver(id, death_reason) {
                 warn!("Failed to deliver reserved monitor notification for process {id}: {error}");
             }
-        } else if let Err(error) = monitor.send(Signal::ProcessDied(id)) {
+        } else if let Err(error) = monitor.send(Signal::ProcessDied {
+            process_id: id,
+            reason: death_reason,
+        }) {
             warn!("Failed to notify custom monitor that process {id} died: {error}");
         }
     }
@@ -1197,25 +1288,31 @@ where
                         }
                     },
                     // Put process into list of monitor processes
-                    Signal::Monitor(proc) => {
-                        monitors.insert(
-                            proc.id(),
-                            (
-                                proc,
-                                monitor_permit.expect("monitor signal must reserve monitor capacity"),
-                                monitor_notification,
-                            ),
-                        );
-                    }
+                    Signal::Monitor {
+                        process: proc,
+                        acknowledgement,
+                    } => admit_monitor(
+                        &mut monitors,
+                        proc,
+                        acknowledgement,
+                        monitor_permit,
+                        monitor_notification,
+                    ),
                     // Remove process from monitor list
                     Signal::StopMonitoring { process_id } => {
                         monitors.remove(&process_id);
                     }
                     // Notify process that a monitored process died
-                    Signal::ProcessDied(id) => {
+                    Signal::ProcessDied {
+                        process_id: id,
+                        reason,
+                    } => {
                         message_mailbox
                             .push_with_permit(
-                                Message::ProcessDied(id),
+                                Message::ProcessDied {
+                                    process_id: id,
+                                    reason,
+                                },
                                 mailbox_permit.expect(
                                     "process-death signal must reserve mailbox capacity",
                                 ),
@@ -1372,7 +1469,6 @@ where
     if let Some(context) = &context {
         context.unregister_all_versions();
     }
-    registration.unregister();
 
     let (final_result, death_reason) = match result {
         Finished::Normal(result) => {
@@ -1419,13 +1515,19 @@ where
         }
     };
 
+    registration.unregister();
+    close_signal_ingress(&mut signal_mailbox, &mut monitors, death_reason);
+
     // Notify all monitors that this process died
     for (_, (monitor, _, notification)) in monitors {
         if let Some(notification) = notification {
-            if let Err(error) = notification.deliver(id) {
+            if let Err(error) = notification.deliver(id, death_reason) {
                 warn!("Failed to deliver reserved monitor notification for process {id}: {error}");
             }
-        } else if let Err(error) = monitor.send(Signal::ProcessDied(id)) {
+        } else if let Err(error) = monitor.send(Signal::ProcessDied {
+            process_id: id,
+            reason: death_reason,
+        }) {
             warn!("Failed to notify custom monitor that process {id} died: {error}");
         }
     }
@@ -1450,16 +1552,41 @@ fn format_panic_payload(payload: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod process_backpressure_tests {
-    use std::{future::pending, sync::Arc};
+    use std::{collections::HashMap, future::pending, sync::Arc, time::Duration};
 
     use crate::{
+        close_signal_ingress,
         env::{register_process, Environment, LunaticEnvironment},
         mailbox::DEFAULT_MESSAGE_MAILBOX_CAPACITY,
         message::Message,
         run_native_process, spawn_native,
         state::{mailboxes_with_capacity, SignalSendErrorKind},
-        NativeProcess, Process, Signal,
+        DeathReason, NativeProcess, Process, Signal, WasmProcess,
     };
+
+    struct OrderingObserver {
+        id: u64,
+        environment: Arc<dyn Environment>,
+        target_id: u64,
+        delivery: std::sync::mpsc::SyncSender<(bool, DeathReason)>,
+    }
+
+    impl Process for OrderingObserver {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn send(&self, signal: Signal) -> std::result::Result<(), crate::state::SignalSendError> {
+            let Signal::ProcessDied { process_id, reason } = signal else {
+                panic!("ordering observer received an unexpected signal");
+            };
+            assert_eq!(process_id, self.target_id);
+            self.delivery
+                .try_send((self.environment.get_process(process_id).is_none(), reason))
+                .unwrap();
+            Ok(())
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_spawn_rejects_at_quota_and_abort_restores_capacity() {
@@ -1503,18 +1630,30 @@ mod process_backpressure_tests {
 
         for process_id in 0..DEFAULT_MESSAGE_MAILBOX_CAPACITY as u64 {
             process
-                .send(Signal::Message(Message::ProcessDied(process_id)))
+                .send(Signal::Message(Message::ProcessDied {
+                    process_id,
+                    reason: DeathReason::Failure,
+                }))
                 .unwrap();
         }
 
         let error = process
-            .send(Signal::Message(Message::ProcessDied(u64::MAX)))
+            .send(Signal::Message(Message::ProcessDied {
+                process_id: u64::MAX,
+                reason: DeathReason::NoProcess,
+            }))
             .unwrap_err();
         assert_eq!(error.kind(), SignalSendErrorKind::MailboxFull);
         assert_eq!(mailbox.available_capacity(), 0);
 
         let recovered = error.into_signal();
-        assert!(matches!(mailbox.pop(None).await, Message::ProcessDied(0)));
+        assert!(matches!(
+            mailbox.pop(None).await,
+            Message::ProcessDied {
+                process_id: 0,
+                reason: DeathReason::Failure
+            }
+        ));
         process.send(recovered).unwrap();
         assert_eq!(mailbox.available_capacity(), 0);
 
@@ -1555,21 +1694,16 @@ mod process_backpressure_tests {
             registration,
         ));
 
-        target.send(Signal::Monitor(observer)).unwrap();
-
-        // A native hot-reload acknowledgement is a FIFO processing barrier:
-        // it is emitted only after the preceding Monitor has entered the
-        // relation map.
-        let (barrier_sender, barrier_receiver) = tokio::sync::oneshot::channel();
+        let (monitor_acknowledgement, monitor_registered) = std::sync::mpsc::sync_channel(1);
         target
-            .send(Signal::HotReload {
-                module_id: 0,
-                expected_version: None,
-                new_version: 0,
-                acknowledgement: Some(barrier_sender),
+            .send(Signal::Monitor {
+                process: observer,
+                acknowledgement: Some(monitor_acknowledgement),
             })
             .unwrap();
-        barrier_receiver.await.unwrap();
+        monitor_registered
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
 
         assert_eq!(observer_mailbox.available_capacity(), 0);
         observer_sender
@@ -1581,7 +1715,184 @@ mod process_backpressure_tests {
         assert!(join.await.unwrap().is_ok());
         assert!(matches!(
             observer_mailbox.pop(None).await,
-            Message::ProcessDied(id) if id == target_id
+            Message::ProcessDied {
+                process_id: id,
+                reason: DeathReason::Normal
+            } if id == target_id
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_monitor_after_exit_preserves_reason_and_acknowledges_once() {
+        for (node_id, expected_reason, fail) in [
+            (94, DeathReason::Normal, false),
+            (95, DeathReason::Failure, true),
+        ] {
+            let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(node_id));
+            let (join, target) = spawn_native(environment, move |_, _| async move {
+                if fail {
+                    Err(anyhow::anyhow!("expected test failure"))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+            let target_id = target.id();
+            assert_eq!(join.await.unwrap().is_err(), fail);
+
+            let ((observer_sender, _observer_receiver), observer_mailbox) =
+                mailboxes_with_capacity(1, 1);
+            let observer = Arc::new(NativeProcess {
+                id: 10_000 + node_id,
+                signal_mailbox: observer_sender,
+            });
+            let (acknowledgement, registered) = std::sync::mpsc::sync_channel(1);
+
+            target
+                .send(Signal::Monitor {
+                    process: observer,
+                    acknowledgement: Some(acknowledgement),
+                })
+                .unwrap();
+
+            registered.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(target.terminal_reason(), Some(expected_reason));
+            assert_eq!(observer_mailbox.len(), 1);
+            assert!(matches!(
+                observer_mailbox.pop(None).await,
+                Message::ProcessDied { process_id, reason }
+                    if process_id == target_id && reason == expected_reason
+            ));
+            assert!(observer_mailbox.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn wasm_handle_monitor_after_exit_preserves_failure_and_acknowledges_once() {
+        let ((target_sender, target_receiver), _target_mailbox) = mailboxes_with_capacity(1, 1);
+        let target = WasmProcess::new(123, target_sender);
+        {
+            let mut receiver = target_receiver.lock().await;
+            receiver.close_with_reason(DeathReason::Failure);
+        }
+
+        let ((observer_sender, _observer_receiver), observer_mailbox) =
+            mailboxes_with_capacity(1, 1);
+        let observer = Arc::new(NativeProcess {
+            id: 124,
+            signal_mailbox: observer_sender,
+        });
+        let (acknowledgement, registered) = std::sync::mpsc::sync_channel(1);
+
+        target
+            .send(Signal::Monitor {
+                process: observer,
+                acknowledgement: Some(acknowledgement),
+            })
+            .unwrap();
+
+        registered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(target.terminal_reason(), Some(DeathReason::Failure));
+        assert_eq!(observer_mailbox.len(), 1);
+        assert!(matches!(
+            observer_mailbox.pop(None).await,
+            Message::ProcessDied {
+                process_id: 123,
+                reason: DeathReason::Failure
+            }
+        ));
+        assert!(observer_mailbox.is_empty());
+    }
+
+    #[tokio::test]
+    async fn exit_drain_applies_pending_monitor_changes_in_fifo_order() {
+        let ((target_sender, target_receiver), _target_mailbox) = mailboxes_with_capacity(3, 1);
+        let ((observer_sender, _observer_receiver), observer_mailbox) =
+            mailboxes_with_capacity(1, 2);
+        let observer = Arc::new(NativeProcess {
+            id: 201,
+            signal_mailbox: observer_sender,
+        });
+        let (first_acknowledgement, first_registered) = std::sync::mpsc::sync_channel(1);
+        let (second_acknowledgement, second_registered) = std::sync::mpsc::sync_channel(1);
+
+        target_sender
+            .send(Signal::Monitor {
+                process: observer.clone(),
+                acknowledgement: Some(first_acknowledgement),
+            })
+            .unwrap();
+        target_sender
+            .send(Signal::StopMonitoring {
+                process_id: observer.id(),
+            })
+            .unwrap();
+        target_sender
+            .send(Signal::Monitor {
+                process: observer,
+                acknowledgement: Some(second_acknowledgement),
+            })
+            .unwrap();
+
+        let mut receiver = target_receiver.lock().await;
+        let mut monitors = HashMap::new();
+        close_signal_ingress(&mut receiver, &mut monitors, DeathReason::Failure);
+        first_registered
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        second_registered
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(monitors.len(), 1);
+
+        for (_, (_, _, notification)) in monitors {
+            notification
+                .expect("built-in observer reservation")
+                .deliver(200, DeathReason::Failure)
+                .unwrap();
+        }
+        assert_eq!(observer_mailbox.len(), 1);
+        assert!(matches!(
+            observer_mailbox.pop(None).await,
+            Message::ProcessDied {
+                process_id: 200,
+                reason: DeathReason::Failure
+            }
+        ));
+        assert!(observer_mailbox.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn monitor_ack_race_still_notifies_after_environment_removal() {
+        let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(96));
+        let (join, target) = spawn_native(environment.clone(), |_, _| async move {
+            tokio::task::yield_now().await;
+            Ok(())
+        })
+        .unwrap();
+        let target_id = target.id();
+        let (delivery, delivered) = std::sync::mpsc::sync_channel(1);
+        let observer = Arc::new(OrderingObserver {
+            id: 20_000,
+            environment: environment.clone(),
+            target_id,
+            delivery,
+        });
+        let (acknowledgement, registered) = std::sync::mpsc::sync_channel(1);
+
+        target
+            .send(Signal::Monitor {
+                process: observer,
+                acknowledgement: Some(acknowledgement),
+            })
+            .unwrap();
+        registered.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert!(join.await.unwrap().is_ok());
+        let (removed_before_notification, reason) =
+            delivered.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(removed_before_notification);
+        assert_eq!(reason, DeathReason::Normal);
+        assert_eq!(target.terminal_reason(), Some(DeathReason::Normal));
     }
 }

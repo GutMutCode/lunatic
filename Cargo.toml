@@ -44,6 +44,7 @@ lunatic-distributed-api = { workspace = true }
 lunatic-error-api = { workspace = true }
 lunatic-messaging-api = { workspace = true }
 lunatic-networking-api = { workspace = true }
+lunatic-otp-patterns = { workspace = true }
 lunatic-process = { workspace = true }
 lunatic-process-api = { workspace = true }
 lunatic-registry-api = { workspace = true, features = ["distributed"] }
@@ -170,6 +171,7 @@ lunatic-error-api = { path = "crates/lunatic-error-api", version = "0.13" }
 lunatic-messaging-api = { path = "crates/lunatic-messaging-api", version = "0.13" }
 lunatic-metrics-api = { path = "crates/lunatic-metrics-api", version = "0.13" }
 lunatic-networking-api = { path = "crates/lunatic-networking-api", version = "0.13" }
+lunatic-otp-patterns = { path = "crates/lunatic-otp-patterns", version = "0.1" }
 lunatic-process = { path = "crates/lunatic-process", version = "0.13" }
 lunatic-process-api = { path = "crates/lunatic-process-api", version = "0.13" }
 lunatic-registry-api = { path = "crates/lunatic-registry-api", version = "0.13" }

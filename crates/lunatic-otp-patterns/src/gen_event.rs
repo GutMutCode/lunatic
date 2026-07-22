@@ -8,10 +8,21 @@ use std::{
     any::Any,
     collections::{BTreeMap, HashMap},
     fmt::Display,
+    marker::PhantomData,
     panic::{catch_unwind, AssertUnwindSafe},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Condvar, Mutex, OnceLock,
+    },
+    time::Duration,
 };
 
+use anyhow::{anyhow, Context, Result};
+use lunatic_process::{
+    env::{Environment, LunaticEnvironment},
+    message::{DataMessage, Message},
+    spawn_native, Process, Signal,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -39,7 +50,7 @@ pub struct GenEvent<E: Event> {
 type EventHandler<E> = dyn Fn(E) -> Result<(), String> + Send + Sync + 'static;
 
 /// Result of delivering an event to one handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HandlerOutcome {
     /// The handler returned normally.
     Succeeded,
@@ -58,7 +69,7 @@ impl HandlerOutcome {
 }
 
 /// Outcomes for the handler snapshot used by one `notify` call.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyReport {
     outcomes: BTreeMap<String, HandlerOutcome>,
 }
@@ -177,6 +188,371 @@ impl<E: Event> GenEvent<E> {
     pub async fn count_handlers(&self) -> usize {
         let handlers = self.handlers.read().await;
         handlers.len()
+    }
+
+    /// Move this manager into a native Lunatic process.
+    ///
+    /// Add or remove handlers before spawning. The returned handle serializes
+    /// notifications through the process mailbox and reports the outcome from
+    /// the process-owned handler set.
+    pub fn spawn(self, config: GenEventConfig) -> Result<GenEventHandle<E>> {
+        ensure_multi_thread_runtime()?;
+
+        let environment = gen_event_environment();
+        let shared = Arc::new(GenEventShared::new(environment.clone()));
+        let process_shared = shared.clone();
+        let (join, process) = spawn_native(environment, move |_process, mailbox| async move {
+            let manager = self;
+            loop {
+                let data = match mailbox.pop(None).await {
+                    Message::Data(data) => data,
+                    Message::LinkDied(_) | Message::ProcessDied { .. } => continue,
+                };
+                let message: GenEventMessage<E> =
+                    bincode::deserialize(&data.buffer).context("invalid GenEvent message")?;
+                match message {
+                    GenEventMessage::Notify { event, reply_to } => {
+                        let report = manager.notify(event).await;
+                        process_shared.reply(reply_to, Ok(report));
+                    }
+                    GenEventMessage::Stop => return Ok(()),
+                }
+            }
+        })?;
+
+        let join_shared = shared.clone();
+        tokio::spawn(async move {
+            let result = match join.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(format!("process task failed: {error}")),
+            };
+            join_shared.finish(result);
+        });
+
+        Ok(GenEventHandle::from_process(
+            Arc::new(process),
+            shared,
+            config,
+        ))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum GenEventMessage<E> {
+    Notify { event: E, reply_to: u64 },
+    Stop,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenEventConfig {
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for GenEventConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: Some(5_000),
+        }
+    }
+}
+
+impl GenEventConfig {
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout_ms.map(Duration::from_millis)
+    }
+}
+
+pub struct GenEventHandle<E: Event> {
+    pub process_id: u64,
+    process: Arc<dyn Process>,
+    shared: Arc<GenEventShared>,
+    config: GenEventConfig,
+    _event: PhantomData<E>,
+}
+
+impl<E: Event> Clone for GenEventHandle<E> {
+    fn clone(&self) -> Self {
+        Self {
+            process_id: self.process_id,
+            process: self.process.clone(),
+            shared: self.shared.clone(),
+            config: self.config.clone(),
+            _event: PhantomData,
+        }
+    }
+}
+
+impl<E: Event> std::fmt::Debug for GenEventHandle<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenEventHandle")
+            .field("process_id", &self.process_id)
+            .field("alive", &self.is_alive())
+            .finish()
+    }
+}
+
+impl<E: Event> GenEventHandle<E> {
+    fn from_process(
+        process: Arc<dyn Process>,
+        shared: Arc<GenEventShared>,
+        config: GenEventConfig,
+    ) -> Self {
+        Self {
+            process_id: process.id(),
+            process,
+            shared,
+            config,
+            _event: PhantomData,
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.process_id
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.shared.result().is_none()
+            && self
+                .shared
+                .environment
+                .get_process(self.process_id)
+                .is_some()
+    }
+
+    pub fn notify(&self, event: E) -> Result<NotifyReport> {
+        self.ensure_running()?;
+        let request_id = self.shared.next_request_id();
+        let receiver = self.shared.reserve_reply(request_id);
+        if let Err(error) = self.send(GenEventMessage::Notify {
+            event,
+            reply_to: request_id,
+        }) {
+            self.shared.cancel_reply(request_id);
+            return Err(error);
+        }
+
+        let result = blocking_wait(|| match self.config.timeout() {
+            Some(timeout) => receiver.recv_timeout(timeout).map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => anyhow!(
+                    "GenEvent notification {} to process {} timed out",
+                    request_id,
+                    self.process_id
+                ),
+                mpsc::RecvTimeoutError::Disconnected => anyhow!(
+                    "GenEvent process {} terminated before notification {} completed",
+                    self.process_id,
+                    request_id
+                ),
+            }),
+            None => receiver.recv().map_err(|_| {
+                anyhow!(
+                    "GenEvent process {} terminated before notification {} completed",
+                    self.process_id,
+                    request_id
+                )
+            }),
+        });
+        match result {
+            Ok(result) => result.map_err(anyhow::Error::msg),
+            Err(error) => {
+                self.shared.cancel_reply(request_id);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn stop(&self) -> Result<()> {
+        self.send(GenEventMessage::Stop)?;
+        self.shared.wait_for_exit(self.config.timeout())
+    }
+
+    pub fn kill(&self) -> Result<()> {
+        self.ensure_running()?;
+        self.process
+            .send(Signal::Kill)
+            .map_err(|error| anyhow!("Failed to kill GenEvent: {error}"))?;
+        self.shared.wait_result(self.config.timeout()).map(|_| ())
+    }
+
+    pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<()> {
+        self.shared.wait_for_exit(timeout)
+    }
+
+    fn send(&self, message: GenEventMessage<E>) -> Result<()> {
+        self.ensure_running()?;
+        let payload =
+            bincode::serialize(&message).context("failed to serialize GenEvent message")?;
+        self.process
+            .send(Signal::Message(Message::Data(DataMessage::new_from_vec(
+                None, payload,
+            ))))
+            .map_err(|error| anyhow!("Failed to send GenEvent message: {error}"))
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        match self.shared.result() {
+            None if self.is_alive() => Ok(()),
+            Some(Ok(())) => Err(anyhow!("GenEvent process {} has stopped", self.id())),
+            Some(Err(error)) => Err(anyhow!(
+                "GenEvent process {} terminated: {}",
+                self.id(),
+                error
+            )),
+            None => Err(anyhow!(
+                "GenEvent process {} is not registered in its environment",
+                self.id()
+            )),
+        }
+    }
+}
+
+type PendingNotify = std::result::Result<NotifyReport, String>;
+
+struct GenEventShared {
+    environment: Arc<LunaticEnvironment>,
+    pending: Mutex<HashMap<u64, mpsc::Sender<PendingNotify>>>,
+    next_request_id: AtomicU64,
+    exit: (Mutex<Option<std::result::Result<(), String>>>, Condvar),
+}
+
+impl GenEventShared {
+    fn new(environment: Arc<LunaticEnvironment>) -> Self {
+        Self {
+            environment,
+            pending: Mutex::new(HashMap::new()),
+            next_request_id: AtomicU64::new(1),
+            exit: (Mutex::new(None), Condvar::new()),
+        }
+    }
+
+    fn next_request_id(&self) -> u64 {
+        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn reserve_reply(&self, request_id: u64) -> mpsc::Receiver<PendingNotify> {
+        let (sender, receiver) = mpsc::channel();
+        self.pending
+            .lock()
+            .expect("GenEvent pending replies mutex poisoned")
+            .insert(request_id, sender);
+        receiver
+    }
+
+    fn cancel_reply(&self, request_id: u64) {
+        self.pending
+            .lock()
+            .expect("GenEvent pending replies mutex poisoned")
+            .remove(&request_id);
+    }
+
+    fn reply(&self, request_id: u64, result: PendingNotify) {
+        if let Some(sender) = self
+            .pending
+            .lock()
+            .expect("GenEvent pending replies mutex poisoned")
+            .remove(&request_id)
+        {
+            let _ = sender.send(result);
+        }
+    }
+
+    fn finish(&self, result: std::result::Result<(), String>) {
+        let pending_error = result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "GenEvent stopped".to_string());
+        let mut exit = self.exit.0.lock().expect("GenEvent exit mutex poisoned");
+        if exit.is_some() {
+            return;
+        }
+        *exit = Some(result);
+        drop(exit);
+
+        for (_, sender) in self
+            .pending
+            .lock()
+            .expect("GenEvent pending replies mutex poisoned")
+            .drain()
+        {
+            let _ = sender.send(Err(pending_error.clone()));
+        }
+        self.exit.1.notify_all();
+    }
+
+    fn result(&self) -> Option<std::result::Result<(), String>> {
+        self.exit
+            .0
+            .lock()
+            .expect("GenEvent exit mutex poisoned")
+            .clone()
+    }
+
+    fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<()> {
+        self.wait_result(timeout)?.map_err(anyhow::Error::msg)
+    }
+
+    fn wait_result(&self, timeout: Option<Duration>) -> Result<std::result::Result<(), String>> {
+        blocking_wait(|| {
+            let exit = self.exit.0.lock().expect("GenEvent exit mutex poisoned");
+            let exit = match timeout {
+                Some(timeout) => {
+                    let (exit, wait) = self
+                        .exit
+                        .1
+                        .wait_timeout_while(exit, timeout, |result| result.is_none())
+                        .expect("GenEvent exit mutex poisoned");
+                    if wait.timed_out() && exit.is_none() {
+                        return Err(anyhow!("timed out waiting for GenEvent to exit"));
+                    }
+                    exit
+                }
+                None => self
+                    .exit
+                    .1
+                    .wait_while(exit, |result| result.is_none())
+                    .expect("GenEvent exit mutex poisoned"),
+            };
+            exit.clone()
+                .ok_or_else(|| anyhow!("GenEvent exit status unavailable"))
+        })
+    }
+}
+
+fn gen_event_environment() -> Arc<LunaticEnvironment> {
+    static ENVIRONMENT: OnceLock<Arc<LunaticEnvironment>> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| Arc::new(LunaticEnvironment::new(2)))
+        .clone()
+}
+
+fn ensure_multi_thread_runtime() -> Result<()> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .context("GenEvent::spawn requires a multi-thread Tokio runtime")?;
+    if matches!(
+        runtime.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    ) {
+        return Err(anyhow!(
+            "GenEvent::spawn requires a multi-thread Tokio runtime"
+        ));
+    }
+    Ok(())
+}
+
+fn blocking_wait<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime)
+            if matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
 }
 

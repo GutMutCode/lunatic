@@ -1,6 +1,6 @@
 # Lunatic Core Values & Design Principles
 
-**Last Updated**: July 21, 2026
+**Last Updated**: July 22, 2026
 
 **Historical Performance Analysis (October 2025)**: See [docs/benchmarks/PERFORMANCE_ANALYSIS.md](docs/benchmarks/PERFORMANCE_ANALYSIS.md)
 
@@ -203,7 +203,8 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 
 **Lunatic Implementation Status:**
 - ✅ Process links preserve actual-Wasm normal-versus-failure reasons, while monitors notify once; default links terminate peers and trapping exits preserve the tagged notification
-- ⚠️ Supervisor restart strategies manage real host-side Lunatic processes; automatic monitor-event intake and guest-WASM adapters remain pending
+- ✅ A native Supervisor process automatically consumes acknowledged child monitor events with preserved normal/failure reasons; actual-process tests cover immediate exit/panic, kill, an actual guest-Wasm trap, OneForOne, OneForAll, RestForOne, restart intensity, reverse shutdown, and failure escalation
+- ⚠️ Guest-Wasm supervisor trees and distributed supervision remain pending
 
 ### Distribution
 
@@ -244,10 +245,11 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 
 **Lunatic Implementation Status:**
 - ✅ GenServer native process spawn, mailbox call/cast, correlated replies, timeout, stop, kill, and handler-error propagation are connected and covered by process-level integration tests
-- ⚠️ The current GenServer adapter is host-side and requires a multi-thread Tokio runtime; guest-WASM bindings and named registry integration remain pending
-- ✅ Supervisor OneForOne, OneForAll, RestForOne, restart policies, intensity limits, duplicate-start prevention, and shutdown are connected to real native Lunatic processes
-- ⚠️ Supervisor exit events must currently be forwarded through `handle_child_exit`; automatic monitor-event intake and guest-WASM integration remain pending
-- 📝 The Rust examples exercise the GenServer and Supervisor native process paths; additional-language runtime integrations are still needed
+- ✅ GenServer runs on a native Lunatic process; optional names use the bounded, owner-indexed production local registry with collision rejection and exit cleanup
+- ✅ Supervisor OneForOne, OneForAll, RestForOne, restart policies, intensity limits, ordered shutdown, and escalation are driven by actual process monitor events, including an actual guest-Wasm trap and children that terminate before ordinary monitor intake
+- ✅ GenStatem and GenEvent have native Lunatic-process mailbox/lifecycle adapters
+- ✅ An actual-Wasm OTP1 fixture verifies guest cast, correlated call/reply, timeout, and acknowledged stop over the existing language-neutral message ABI
+- ⚠️ High-level Rust/TinyGo/AssemblyScript guest SDKs, guest-side Supervisor/GenStatem/GenEvent libraries, and distributed OTP integration remain pending
 
 ---
 
@@ -337,7 +339,7 @@ Checkboxes in this section represent current production-path verification, not w
 - [ ] Production isolation contract (Wasm memory isolation, least-privilege defaults, and linked failure propagation are verified; bounded queues, process counts, and complete resource accounting remain open)
 - [ ] Live hot reload state preservation with acknowledgement and rollback proof
 - [ ] 99.999% uptime (application-dependent)
-- [ ] Automatic failure recovery via OTP supervisors (real process restart is implemented; automatic monitor-event intake is pending)
+- [x] Automatic local failure recovery via OTP supervisors (actual child monitor events drive restart strategies and intensity escalation; distributed recovery is excluded)
 
 ### Developer Experience
 - [ ] Multi-language guest API support (basic Rust, Go, and AssemblyScript build examples exist; equivalent runtime APIs and CI E2E coverage do not)

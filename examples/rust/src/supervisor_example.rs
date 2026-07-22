@@ -1,7 +1,6 @@
 use anyhow::{Error, Result};
 use lunatic_otp_patterns::{
-    ChildSpec, ChildType, ExitReason, RestartPolicy, RestartStrategy, ShutdownPolicy, Supervisor,
-    SupervisorSpec,
+    ChildSpec, ChildType, RestartPolicy, RestartStrategy, ShutdownPolicy, Supervisor, SupervisorSpec,
 };
 use lunatic_process::{env::Environment, spawn_native, Process};
 use std::{future, sync::Arc};
@@ -28,24 +27,16 @@ async fn main() -> Result<()> {
             child_type: ChildType::Worker,
         }],
     };
-    let mut supervisor = Supervisor::new(spec);
-    supervisor.start_children().map_err(Error::msg)?;
+    let supervisor = Supervisor::spawn(spec).map_err(Error::msg)?;
 
     let original_process = supervisor.which_children()[0]
         .process_id
         .expect("worker should be running");
-    supervisor
-        .handle_child_exit("worker", ExitReason::Crash)
-        .map_err(Error::msg)?;
-    let restarted = &supervisor.which_children()[0];
-
     println!(
-        "worker restarted: {} -> {}, count={}",
-        original_process,
-        restarted.process_id.expect("worker should be restarted"),
-        restarted.restart_count
+        "automatic supervisor {} started worker {}",
+        supervisor.id(),
+        original_process
     );
-
     supervisor.shutdown().map_err(Error::msg)?;
     Ok(())
 }

@@ -58,16 +58,20 @@ impl<T> Debug for MessageNetworkResource<T> {
 
 /// Can be sent between processes by being embedded into a  [`Signal::Message`][0]
 ///
-/// A [`Message`] has 2 variants:
+/// A [`Message`] has 3 variants:
 /// * Data - Regular message containing a tag, buffer and resources.
 /// * LinkDied - A `LinkDied` signal that was turned into a message.
+/// * ProcessDied - A monitor notification containing the process ID and death reason.
 ///
 /// [0]: crate::Signal
 #[derive(Debug)]
 pub enum Message {
     Data(DataMessage),
     LinkDied(Option<i64>),
-    ProcessDied(u64),
+    ProcessDied {
+        process_id: u64,
+        reason: crate::DeathReason,
+    },
 }
 
 impl Message {
@@ -75,7 +79,7 @@ impl Message {
         match self {
             Message::Data(message) => message.tag,
             Message::LinkDied(tag) => *tag,
-            Message::ProcessDied(_) => None,
+            Message::ProcessDied { .. } => None,
         }
     }
 
@@ -83,7 +87,14 @@ impl Message {
         match self {
             Message::Data(_) => None,
             Message::LinkDied(_) => None,
-            Message::ProcessDied(process_id) => Some(*process_id),
+            Message::ProcessDied { process_id, .. } => Some(*process_id),
+        }
+    }
+
+    pub fn death_reason(&self) -> Option<crate::DeathReason> {
+        match self {
+            Message::ProcessDied { reason, .. } => Some(*reason),
+            Message::Data(_) | Message::LinkDied(_) => None,
         }
     }
 
@@ -94,7 +105,7 @@ impl Message {
             Message::LinkDied(_) => {
                 metrics::increment_counter!("lunatic.process.messages.link_died.count");
             }
-            Message::ProcessDied(_) => {}
+            Message::ProcessDied { .. } => {}
         }
     }
 }
@@ -334,7 +345,7 @@ mod tests {
     use anyhow::anyhow;
     use lunatic_networking_api::{NetworkHandleLease, NetworkHandleQuota};
 
-    use crate::{state::mailboxes_with_limits, Signal};
+    use crate::{state::mailboxes_with_limits, DeathReason, Signal};
 
     use super::{DataMessage, Message, MessageNetworkResource};
 
@@ -395,6 +406,18 @@ mod tests {
         assert_eq!(quota.current(), 0);
         quota.reserve().unwrap();
         quota.release().unwrap();
+    }
+
+    #[test]
+    fn process_died_exposes_process_id_and_reason_without_a_tag() {
+        let message = Message::ProcessDied {
+            process_id: 42,
+            reason: DeathReason::Failure,
+        };
+
+        assert_eq!(message.tag(), None);
+        assert_eq!(message.process_id(), Some(42));
+        assert_eq!(message.death_reason(), Some(DeathReason::Failure));
     }
 
     #[test]

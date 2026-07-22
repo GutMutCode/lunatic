@@ -2548,13 +2548,19 @@ fn monitor<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u
         let id = caller.data().id();
         let signal_mailbox = caller.data().signal_mailbox().clone();
         let this_process = WasmProcess::new(id, signal_mailbox.0);
-        process.send(Signal::Monitor(Arc::new(this_process)))?;
+        process.send(Signal::Monitor {
+            process: Arc::new(this_process),
+            acknowledgement: None,
+        })?;
     } else {
         caller
             .data_mut()
             .signal_mailbox()
             .0
-            .send(Signal::ProcessDied(process_id))?;
+            .send(Signal::ProcessDied {
+                process_id,
+                reason: DeathReason::NoProcess,
+            })?;
     }
 
     Ok(())

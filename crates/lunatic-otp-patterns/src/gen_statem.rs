@@ -61,8 +61,19 @@
 //! }
 //! ```
 
-use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use anyhow::{anyhow, Context, Result};
+use lunatic_process::{
+    env::{Environment, LunaticEnvironment},
+    message::{DataMessage, Message},
+    spawn_native, Process, Signal,
+};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::{
+    fmt::Debug,
+    marker::PhantomData,
+    sync::{Arc, Condvar, Mutex, OnceLock},
+    time::Duration,
+};
 
 /// GenStatem behavior trait
 ///
@@ -70,13 +81,13 @@ use std::fmt::Debug;
 /// Erlang's gen_statem pattern.
 pub trait GenStatem: Sized {
     /// State type (must be comparable for transitions)
-    type State: Clone + PartialEq + Serialize + for<'de> Deserialize<'de> + Debug;
+    type State: Clone + PartialEq + Serialize + DeserializeOwned + Debug + Send + 'static;
 
     /// Data type (state machine data)
-    type Data: Clone + Serialize + for<'de> Deserialize<'de> + Debug;
+    type Data: Clone + Serialize + DeserializeOwned + Debug + Send + 'static;
 
     /// Event type (triggers state transitions)
-    type Event: Serialize + for<'de> Deserialize<'de> + Debug;
+    type Event: Serialize + DeserializeOwned + Debug + Send + 'static;
 
     /// Initialize state machine
     ///
@@ -113,6 +124,93 @@ pub trait GenStatem: Sized {
     fn terminate(&mut self, _state: &Self::State, _data: &Self::Data) {
         // Default: no-op
     }
+
+    /// Handle a timeout delivered to the state-machine process.
+    fn handle_timeout(
+        &mut self,
+        state: Self::State,
+        data: Self::Data,
+    ) -> StateData<Self::State, Self::Data> {
+        StateData { state, data }
+    }
+
+    /// Spawn this state machine as a native Lunatic process.
+    fn spawn(self, config: GenStatemConfig) -> Result<GenStatemHandle<Self::Event>>
+    where
+        Self: Send + 'static,
+    {
+        ensure_multi_thread_runtime()?;
+
+        let environment = gen_statem_environment();
+        let shared = Arc::new(GenStatemShared::new(environment.clone()));
+        let (join, process) = spawn_native(environment, move |_process, mailbox| async move {
+            let mut machine = self;
+            let mut state_data = Self::init();
+
+            loop {
+                let data = match mailbox.pop(None).await {
+                    Message::Data(data) => data,
+                    Message::LinkDied(_) | Message::ProcessDied { .. } => continue,
+                };
+                let message: StatemMessage<Self::Event> =
+                    bincode::deserialize(&data.buffer).context("invalid GenStatem message")?;
+
+                match message {
+                    StatemMessage::Event(event) => {
+                        state_data =
+                            apply_transition(&mut machine, state_data, |machine, state, data| {
+                                machine.handle_event(state, event, data)
+                            });
+                    }
+                    StatemMessage::Timeout => {
+                        state_data =
+                            apply_transition(&mut machine, state_data, |machine, state, data| {
+                                machine.handle_timeout(state, data)
+                            });
+                    }
+                    StatemMessage::Stop(_reason) => {
+                        machine.terminate(&state_data.state, &state_data.data);
+                        return Ok(());
+                    }
+                }
+            }
+        })?;
+
+        let join_shared = shared.clone();
+        tokio::spawn(async move {
+            let result = match join.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(format!("process task failed: {error}")),
+            };
+            join_shared.finish(result);
+        });
+
+        Ok(GenStatemHandle::from_process(
+            Arc::new(process),
+            shared,
+            config,
+        ))
+    }
+}
+
+fn apply_transition<M, F>(
+    machine: &mut M,
+    current: StateData<M::State, M::Data>,
+    transition: F,
+) -> StateData<M::State, M::Data>
+where
+    M: GenStatem,
+    F: FnOnce(&mut M, M::State, M::Data) -> StateData<M::State, M::Data>,
+{
+    let previous_state = current.state.clone();
+    let previous_data = current.data.clone();
+    let next = transition(machine, current.state, current.data);
+    if next.state != previous_state {
+        machine.exit_state(&previous_state, &previous_data);
+        machine.enter_state(&next.state, &next.data);
+    }
+    next
 }
 
 /// State and data container
@@ -149,19 +247,234 @@ pub enum StopReason {
     Error(String),
 }
 
-/// State machine handle for client interactions
-#[derive(Debug, Clone)]
-pub struct GenStatemHandle {
+/// State machine handle for client interactions.
+pub struct GenStatemHandle<Event = Vec<u8>> {
     pub process_id: u64,
+    process: Arc<dyn Process>,
+    shared: Arc<GenStatemShared>,
+    config: GenStatemConfig,
+    _event: PhantomData<Event>,
 }
 
-impl GenStatemHandle {
-    pub fn new(process_id: u64) -> Self {
-        Self { process_id }
+impl<Event> Clone for GenStatemHandle<Event> {
+    fn clone(&self) -> Self {
+        Self {
+            process_id: self.process_id,
+            process: self.process.clone(),
+            shared: self.shared.clone(),
+            config: self.config.clone(),
+            _event: PhantomData,
+        }
+    }
+}
+
+impl<Event> Debug for GenStatemHandle<Event> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenStatemHandle")
+            .field("process_id", &self.process_id)
+            .field("alive", &self.is_alive())
+            .finish()
+    }
+}
+
+impl<Event> GenStatemHandle<Event> {
+    fn from_process(
+        process: Arc<dyn Process>,
+        shared: Arc<GenStatemShared>,
+        config: GenStatemConfig,
+    ) -> Self {
+        Self {
+            process_id: process.id(),
+            process,
+            shared,
+            config,
+            _event: PhantomData,
+        }
     }
 
     pub fn id(&self) -> u64 {
         self.process_id
+    }
+
+    pub fn is_alive(&self) -> bool {
+        self.shared.result().is_none()
+            && self
+                .shared
+                .environment
+                .get_process(self.process_id)
+                .is_some()
+    }
+
+    pub fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<()> {
+        self.shared.wait_for_exit(timeout)
+    }
+}
+
+impl<Event> GenStatemHandle<Event>
+where
+    Event: Serialize + DeserializeOwned + Debug,
+{
+    pub fn send_event(&self, event: Event) -> Result<()> {
+        self.send(StatemMessage::Event(event))
+    }
+
+    pub fn timeout(&self) -> Result<()> {
+        self.send(StatemMessage::Timeout)
+    }
+
+    pub fn stop(&self, reason: StopReason) -> Result<()> {
+        self.send(StatemMessage::Stop(reason))?;
+        self.shared.wait_for_exit(self.config.timeout())
+    }
+
+    pub fn kill(&self) -> Result<()> {
+        self.ensure_running()?;
+        self.process
+            .send(Signal::Kill)
+            .map_err(|error| anyhow!("Failed to kill GenStatem: {error}"))?;
+        self.shared.wait_result(self.config.timeout()).map(|_| ())
+    }
+
+    fn send(&self, message: StatemMessage<Event>) -> Result<()> {
+        self.ensure_running()?;
+        let payload =
+            bincode::serialize(&message).context("failed to serialize GenStatem message")?;
+        self.process
+            .send(Signal::Message(Message::Data(DataMessage::new_from_vec(
+                None, payload,
+            ))))
+            .map_err(|error| anyhow!("Failed to send GenStatem message: {error}"))
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        match self.shared.result() {
+            None if self.is_alive() => Ok(()),
+            Some(Ok(())) => Err(anyhow!("GenStatem process {} has stopped", self.id())),
+            Some(Err(error)) => Err(anyhow!(
+                "GenStatem process {} terminated: {}",
+                self.id(),
+                error
+            )),
+            None => Err(anyhow!(
+                "GenStatem process {} is not registered in its environment",
+                self.id()
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GenStatemConfig {
+    pub timeout_ms: Option<u64>,
+}
+
+impl Default for GenStatemConfig {
+    fn default() -> Self {
+        Self {
+            timeout_ms: Some(5_000),
+        }
+    }
+}
+
+impl GenStatemConfig {
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout_ms.map(Duration::from_millis)
+    }
+}
+
+struct GenStatemShared {
+    environment: Arc<LunaticEnvironment>,
+    exit: (Mutex<Option<std::result::Result<(), String>>>, Condvar),
+}
+
+impl GenStatemShared {
+    fn new(environment: Arc<LunaticEnvironment>) -> Self {
+        Self {
+            environment,
+            exit: (Mutex::new(None), Condvar::new()),
+        }
+    }
+
+    fn finish(&self, result: std::result::Result<(), String>) {
+        let mut exit = self.exit.0.lock().expect("GenStatem exit mutex poisoned");
+        if exit.is_none() {
+            *exit = Some(result);
+            self.exit.1.notify_all();
+        }
+    }
+
+    fn result(&self) -> Option<std::result::Result<(), String>> {
+        self.exit
+            .0
+            .lock()
+            .expect("GenStatem exit mutex poisoned")
+            .clone()
+    }
+
+    fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<()> {
+        self.wait_result(timeout)?.map_err(anyhow::Error::msg)
+    }
+
+    fn wait_result(&self, timeout: Option<Duration>) -> Result<std::result::Result<(), String>> {
+        blocking_wait(|| {
+            let exit = self.exit.0.lock().expect("GenStatem exit mutex poisoned");
+            let exit = match timeout {
+                Some(timeout) => {
+                    let (exit, wait) = self
+                        .exit
+                        .1
+                        .wait_timeout_while(exit, timeout, |result| result.is_none())
+                        .expect("GenStatem exit mutex poisoned");
+                    if wait.timed_out() && exit.is_none() {
+                        return Err(anyhow!("timed out waiting for GenStatem to exit"));
+                    }
+                    exit
+                }
+                None => self
+                    .exit
+                    .1
+                    .wait_while(exit, |result| result.is_none())
+                    .expect("GenStatem exit mutex poisoned"),
+            };
+            exit.clone()
+                .ok_or_else(|| anyhow!("GenStatem exit status unavailable"))
+        })
+    }
+}
+
+fn gen_statem_environment() -> Arc<LunaticEnvironment> {
+    static ENVIRONMENT: OnceLock<Arc<LunaticEnvironment>> = OnceLock::new();
+    ENVIRONMENT
+        .get_or_init(|| Arc::new(LunaticEnvironment::new(1)))
+        .clone()
+}
+
+fn ensure_multi_thread_runtime() -> Result<()> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .context("GenStatem::spawn requires a multi-thread Tokio runtime")?;
+    if matches!(
+        runtime.runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    ) {
+        return Err(anyhow!(
+            "GenStatem::spawn requires a multi-thread Tokio runtime"
+        ));
+    }
+    Ok(())
+}
+
+fn blocking_wait<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime)
+            if matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
 }
 

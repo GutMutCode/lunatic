@@ -589,7 +589,7 @@ mod tests {
         task::{Context, Poll, Wake},
     };
 
-    use crate::message::DataMessage;
+    use crate::{message::DataMessage, DeathReason};
 
     use super::{MailboxPushErrorKind, Message, MessageMailbox};
 
@@ -810,25 +810,46 @@ mod tests {
         assert_eq!(mailbox.capacity(), 1);
         assert_eq!(mailbox.available_capacity(), 1);
 
-        mailbox.push(Message::ProcessDied(7)).unwrap();
+        mailbox
+            .push(Message::ProcessDied {
+                process_id: 7,
+                reason: DeathReason::Failure,
+            })
+            .unwrap();
         assert_eq!(mailbox.len(), 1);
         assert_eq!(mailbox.available_capacity(), 0);
 
-        let error = mailbox.push(Message::ProcessDied(99)).unwrap_err();
+        let error = mailbox
+            .push(Message::ProcessDied {
+                process_id: 99,
+                reason: DeathReason::Normal,
+            })
+            .unwrap_err();
         assert_eq!(error.kind(), MailboxPushErrorKind::Full);
         match error.into_message() {
-            Message::ProcessDied(process_id) => assert_eq!(process_id, 99),
+            Message::ProcessDied { process_id, reason } => {
+                assert_eq!(process_id, 99);
+                assert_eq!(reason, DeathReason::Normal);
+            }
             _ => panic!("full push returned the wrong message"),
         }
 
         match mailbox.pop(None).await {
-            Message::ProcessDied(process_id) => assert_eq!(process_id, 7),
+            Message::ProcessDied { process_id, reason } => {
+                assert_eq!(process_id, 7);
+                assert_eq!(reason, DeathReason::Failure);
+            }
             _ => panic!("mailbox returned the wrong message"),
         }
         assert!(mailbox.is_empty());
         assert_eq!(mailbox.available_capacity(), 1);
 
-        mailbox.push(Message::ProcessDied(100)).unwrap();
+        mailbox
+            .push(Message::ProcessDied {
+                process_id: 100,
+                reason: DeathReason::NoProcess,
+            })
+            .unwrap();
         assert_eq!(mailbox.len(), 1);
     }
 
@@ -922,23 +943,46 @@ mod tests {
     async fn foreign_snapshot_and_permit_are_rejected_without_losing_ownership() {
         let source = MessageMailbox::new(1);
         let destination = MessageMailbox::new(1);
-        source.push(Message::ProcessDied(41)).unwrap();
+        source
+            .push(Message::ProcessDied {
+                process_id: 41,
+                reason: DeathReason::Failure,
+            })
+            .unwrap();
 
         let snapshot = source.snapshot();
         let error = destination.restore(snapshot).unwrap_err();
         assert!(destination.is_empty());
         assert_eq!(source.available_capacity(), 0);
         source.restore(error.into_snapshot()).unwrap();
-        assert!(matches!(source.pop(None).await, Message::ProcessDied(41)));
+        assert!(matches!(
+            source.pop(None).await,
+            Message::ProcessDied {
+                process_id: 41,
+                reason: DeathReason::Failure
+            }
+        ));
 
         let permit = source.try_reserve().unwrap();
         let error = destination
-            .push_with_permit(Message::ProcessDied(42), permit)
+            .push_with_permit(
+                Message::ProcessDied {
+                    process_id: 42,
+                    reason: DeathReason::Normal,
+                },
+                permit,
+            )
             .unwrap_err();
         assert_eq!(error.kind(), MailboxPushErrorKind::ForeignPermit);
         let (message, permit) = error.into_parts();
         source.push_with_permit(message, permit.unwrap()).unwrap();
-        assert!(matches!(source.pop(None).await, Message::ProcessDied(42)));
+        assert!(matches!(
+            source.pop(None).await,
+            Message::ProcessDied {
+                process_id: 42,
+                reason: DeathReason::Normal
+            }
+        ));
     }
 
     #[test]

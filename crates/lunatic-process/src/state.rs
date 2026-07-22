@@ -4,7 +4,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
 };
 
@@ -141,6 +141,34 @@ impl SignalEnvelope {
     pub fn into_signal(self) -> Signal {
         self.signal
     }
+
+    fn complete_monitor_after_exit(
+        self,
+        process_id: u64,
+        reason: crate::DeathReason,
+    ) -> Result<(), SignalSendError> {
+        let Self {
+            signal,
+            monitor_notification,
+            ..
+        } = self;
+        match signal {
+            Signal::Monitor {
+                process,
+                acknowledgement,
+            } => {
+                complete_exited_monitor(
+                    process,
+                    acknowledgement,
+                    monitor_notification,
+                    process_id,
+                    reason,
+                );
+                Ok(())
+            }
+            signal => Err(SignalSendError::Closed(signal)),
+        }
+    }
 }
 
 /// A mailbox slot reserved for one future monitor-death notification.
@@ -162,9 +190,13 @@ impl MonitorNotification {
         Ok(Self { mailbox, permit })
     }
 
-    pub(crate) fn deliver(self, process_id: u64) -> Result<(), MailboxPushError> {
+    pub(crate) fn deliver(
+        self,
+        process_id: u64,
+        reason: crate::DeathReason,
+    ) -> Result<(), MailboxPushError> {
         self.mailbox.push_with_permit(
-            crate::message::Message::ProcessDied(process_id),
+            crate::message::Message::ProcessDied { process_id, reason },
             self.permit,
         )
     }
@@ -196,6 +228,29 @@ impl fmt::Display for MonitorNotificationError {
 
 impl Error for MonitorNotificationError {}
 
+fn complete_exited_monitor(
+    observer: Arc<dyn crate::Process>,
+    acknowledgement: Option<crate::MonitorAckSender>,
+    notification: Option<MonitorNotification>,
+    process_id: u64,
+    reason: crate::DeathReason,
+) {
+    if let Some(notification) = notification {
+        if let Err(error) = notification.deliver(process_id, reason) {
+            log::warn!(
+                "Failed to deliver reserved late monitor notification for process {process_id}: \
+                 {error}"
+            );
+        }
+    } else if let Err(error) = observer.send(Signal::ProcessDied { process_id, reason }) {
+        log::warn!("Failed to notify custom late monitor that process {process_id} died: {error}");
+    }
+
+    if let Some(acknowledgement) = acknowledgement {
+        let _ = acknowledgement.try_send(());
+    }
+}
+
 impl fmt::Debug for SignalEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -210,6 +265,7 @@ impl fmt::Debug for SignalEnvelope {
 pub struct SignalSender {
     sender: mpsc::Sender<SignalEnvelope>,
     kill: Arc<KillSignal>,
+    lifecycle: Arc<ProcessLifecycle>,
     data_admission: Arc<Semaphore>,
     link_admission: Arc<Semaphore>,
     monitor_admission: Arc<Semaphore>,
@@ -219,15 +275,53 @@ pub struct SignalSender {
     max_message_resources: u32,
 }
 
+#[derive(Debug, Default)]
+struct ProcessLifecycle {
+    death_reason: OnceLock<crate::DeathReason>,
+}
+
 impl SignalSender {
     /// Attempts to enqueue a signal without waiting for capacity.
     ///
     /// Message-producing signals reserve mailbox capacity before entering the
     /// signal queue. Every failure returns ownership of the original signal.
     pub fn send(&self, signal: Signal) -> Result<(), SignalSendError> {
+        self.send_inner(signal, None)
+    }
+
+    /// Sends through a built-in process handle that can complete monitors after
+    /// the target's signal receiver has closed.
+    pub(crate) fn send_to_process(
+        &self,
+        process_id: u64,
+        signal: Signal,
+    ) -> Result<(), SignalSendError> {
+        self.send_inner(signal, Some(process_id))
+    }
+
+    fn send_inner(
+        &self,
+        signal: Signal,
+        target_process_id: Option<u64>,
+    ) -> Result<(), SignalSendError> {
+        if let Some(process_id) = target_process_id {
+            if let Some(reason) = self.lifecycle.death_reason.get().copied() {
+                return self.complete_monitor_after_exit(process_id, reason, signal);
+            }
+        }
+
         // Prefer reporting a terminal receiver closure over a transient
         // mailbox-capacity failure when closure is already observable.
         if self.sender.is_closed() {
+            if let Some(process_id) = target_process_id {
+                let reason = self
+                    .lifecycle
+                    .death_reason
+                    .get()
+                    .copied()
+                    .unwrap_or(crate::DeathReason::NoProcess);
+                return self.complete_monitor_after_exit(process_id, reason, signal);
+            }
             return Err(SignalSendError::Closed(signal));
         }
 
@@ -294,7 +388,7 @@ impl SignalSender {
             None
         };
 
-        let monitor_permit = if matches!(signal, Signal::Monitor(_)) {
+        let monitor_permit = if matches!(signal, Signal::Monitor { .. }) {
             match Arc::clone(&self.monitor_admission).try_acquire_owned() {
                 Ok(permit) => Some(permit),
                 Err(_) => return Err(SignalSendError::QueueFull(signal)),
@@ -308,8 +402,8 @@ impl SignalSender {
         // relation enters the target's queue. Built-in processes support
         // direct delivery; custom Process implementations may opt out and
         // retain the legacy signal-based notification path.
-        let monitor_notification = if let Signal::Monitor(observer) = &signal {
-            match observer.reserve_monitor_notification() {
+        let monitor_notification = if let Signal::Monitor { process, .. } = &signal {
+            match process.reserve_monitor_notification() {
                 Ok(notification) => notification,
                 Err(MonitorNotificationError::MailboxFull) => {
                     return Err(SignalSendError::MailboxFull(signal));
@@ -335,14 +429,65 @@ impl SignalSender {
             Err(TrySendError::Full(envelope)) => {
                 Err(SignalSendError::QueueFull(envelope.into_signal()))
             }
-            Err(TrySendError::Closed(envelope)) => {
-                Err(SignalSendError::Closed(envelope.into_signal()))
-            }
+            Err(TrySendError::Closed(envelope)) => match target_process_id {
+                Some(process_id) => {
+                    let reason = self
+                        .lifecycle
+                        .death_reason
+                        .get()
+                        .copied()
+                        .unwrap_or(crate::DeathReason::NoProcess);
+                    envelope.complete_monitor_after_exit(process_id, reason)
+                }
+                None => Err(SignalSendError::Closed(envelope.into_signal())),
+            },
+        }
+    }
+
+    fn complete_monitor_after_exit(
+        &self,
+        process_id: u64,
+        reason: crate::DeathReason,
+        signal: Signal,
+    ) -> Result<(), SignalSendError> {
+        match signal {
+            Signal::Monitor {
+                process,
+                acknowledgement,
+            } => match process.reserve_monitor_notification() {
+                Ok(notification) => {
+                    complete_exited_monitor(
+                        process,
+                        acknowledgement,
+                        notification,
+                        process_id,
+                        reason,
+                    );
+                    Ok(())
+                }
+                Err(error) => {
+                    let signal = Signal::Monitor {
+                        process,
+                        acknowledgement,
+                    };
+                    match error {
+                        MonitorNotificationError::MailboxFull => {
+                            Err(SignalSendError::MailboxFull(signal))
+                        }
+                        MonitorNotificationError::Closed => Err(SignalSendError::Closed(signal)),
+                    }
+                }
+            },
+            signal => Err(SignalSendError::Closed(signal)),
         }
     }
 
     pub fn is_closed(&self) -> bool {
         self.sender.is_closed()
+    }
+
+    pub(crate) fn terminal_reason(&self) -> Option<crate::DeathReason> {
+        self.lifecycle.death_reason.get().copied()
     }
 
     /// Returns the configured signal queue capacity.
@@ -393,6 +538,7 @@ impl fmt::Debug for SignalSender {
 pub struct SignalReceiver {
     receiver: Arc<Mutex<mpsc::Receiver<SignalEnvelope>>>,
     kill: Arc<KillSignal>,
+    lifecycle: Arc<ProcessLifecycle>,
 }
 
 #[derive(Debug, Default)]
@@ -404,6 +550,7 @@ struct KillSignal {
 pub struct SignalReceiverGuard<'a> {
     receiver: MutexGuard<'a, mpsc::Receiver<SignalEnvelope>>,
     kill: Arc<KillSignal>,
+    lifecycle: Arc<ProcessLifecycle>,
 }
 
 impl SignalReceiverGuard<'_> {
@@ -420,6 +567,25 @@ impl SignalReceiverGuard<'_> {
             }
         }
     }
+
+    /// Publishes the terminal reason before closing ingress. Once this returns,
+    /// target-aware senders either observe the reason and deliver monitors
+    /// directly or lose the close race and leave an envelope for `try_recv`.
+    pub(crate) fn close_with_reason(&mut self, reason: crate::DeathReason) {
+        if let Err(existing) = self.lifecycle.death_reason.set(reason) {
+            debug_assert_eq!(
+                self.lifecycle.death_reason.get(),
+                Some(&existing),
+                "a process must publish exactly one terminal reason"
+            );
+        }
+        self.receiver.close();
+    }
+
+    /// Receives one already-queued signal without waiting for new ingress.
+    pub(crate) fn try_recv(&mut self) -> Option<SignalEnvelope> {
+        self.receiver.try_recv().ok()
+    }
 }
 
 impl SignalReceiver {
@@ -428,6 +594,7 @@ impl SignalReceiver {
         SignalReceiverGuard {
             receiver: self.receiver.lock().await,
             kill: self.kill.clone(),
+            lifecycle: self.lifecycle.clone(),
         }
     }
 
@@ -558,7 +725,7 @@ fn reserves_mailbox_capacity(signal: &Signal) -> bool {
     matches!(
         signal,
         Signal::Message(_)
-            | Signal::ProcessDied(_)
+            | Signal::ProcessDied { .. }
             | Signal::LinkDied(
                 _,
                 _,
@@ -596,6 +763,7 @@ pub fn signal_mailbox_with_limits(
     );
     let (sender, receiver) = mpsc::channel(signal_capacity);
     let kill = Arc::new(KillSignal::default());
+    let lifecycle = Arc::new(ProcessLifecycle::default());
     // Capacity-one queues retain their legacy ability to carry a message;
     // larger queues reserve one physical slot from data admission.
     let data_capacity = signal_capacity.saturating_sub(1).max(1);
@@ -603,6 +771,7 @@ pub fn signal_mailbox_with_limits(
         SignalSender {
             sender,
             kill: kill.clone(),
+            lifecycle: lifecycle.clone(),
             data_admission: Arc::new(Semaphore::new(data_capacity)),
             link_admission: Arc::new(Semaphore::new(signal_capacity)),
             monitor_admission: Arc::new(Semaphore::new(signal_capacity)),
@@ -614,6 +783,7 @@ pub fn signal_mailbox_with_limits(
         SignalReceiver {
             receiver: Arc::new(Mutex::new(receiver)),
             kill,
+            lifecycle,
         },
     )
 }
@@ -819,7 +989,10 @@ mod tests {
         let (sender, receiver) = signal_mailbox(4, &mailbox);
 
         sender
-            .send(Signal::Message(Message::ProcessDied(7)))
+            .send(Signal::Message(Message::ProcessDied {
+                process_id: 7,
+                reason: DeathReason::Failure,
+            }))
             .unwrap();
         assert_eq!(mailbox.available_capacity(), 0);
         assert!(mailbox.is_empty());
@@ -838,7 +1011,13 @@ mod tests {
 
         assert_eq!(mailbox.len(), 1);
         assert_eq!(mailbox.available_capacity(), 0);
-        assert!(matches!(mailbox.pop(None).await, Message::ProcessDied(7)));
+        assert!(matches!(
+            mailbox.pop(None).await,
+            Message::ProcessDied {
+                process_id: 7,
+                reason: DeathReason::Failure
+            }
+        ));
         assert_eq!(mailbox.available_capacity(), 1);
     }
 
@@ -848,9 +1027,17 @@ mod tests {
         let (sender, receiver) = signal_mailbox(4, &mailbox);
 
         sender
-            .send(Signal::Message(Message::ProcessDied(1)))
+            .send(Signal::Message(Message::ProcessDied {
+                process_id: 1,
+                reason: DeathReason::Normal,
+            }))
             .unwrap();
-        sender.send(Signal::ProcessDied(2)).unwrap();
+        sender
+            .send(Signal::ProcessDied {
+                process_id: 2,
+                reason: DeathReason::Failure,
+            })
+            .unwrap();
         sender
             .send(Signal::LinkDied(3, Some(4), DeathReason::Failure))
             .unwrap();
@@ -878,11 +1065,33 @@ mod tests {
         let mailbox = MessageMailbox::new(1);
         let (sender, receiver) = signal_mailbox(4, &mailbox);
 
-        sender.send(Signal::ProcessDied(10)).unwrap();
-        let error = sender.send(Signal::ProcessDied(99)).unwrap_err();
+        sender
+            .send(Signal::ProcessDied {
+                process_id: 10,
+                reason: DeathReason::Failure,
+            })
+            .unwrap();
+        let error = sender
+            .send(Signal::ProcessDied {
+                process_id: 99,
+                reason: DeathReason::NoProcess,
+            })
+            .unwrap_err();
         assert_eq!(error.kind(), SignalSendErrorKind::MailboxFull);
-        assert!(matches!(error.signal(), Signal::ProcessDied(99)));
-        assert!(matches!(error.into_signal(), Signal::ProcessDied(99)));
+        assert!(matches!(
+            error.signal(),
+            Signal::ProcessDied {
+                process_id: 99,
+                reason: DeathReason::NoProcess
+            }
+        ));
+        assert!(matches!(
+            error.into_signal(),
+            Signal::ProcessDied {
+                process_id: 99,
+                reason: DeathReason::NoProcess
+            }
+        ));
 
         drop(receiver.recv().await.unwrap());
         assert_eq!(mailbox.available_capacity(), 1);
@@ -899,7 +1108,12 @@ mod tests {
         let target_mailbox = MessageMailbox::new(1);
         let (target_sender, target_receiver) = signal_mailbox(2, &target_mailbox);
 
-        target_sender.send(Signal::Monitor(observer)).unwrap();
+        target_sender
+            .send(Signal::Monitor {
+                process: observer,
+                acknowledgement: None,
+            })
+            .unwrap();
         assert_eq!(observer_mailbox.available_capacity(), 0);
 
         // Saturate the observer's independent signal ingress after monitor
@@ -911,13 +1125,19 @@ mod tests {
 
         let envelope = target_receiver.recv().await.unwrap();
         let (signal, _, _, monitor_permit, notification) = envelope.into_process_parts();
-        assert!(matches!(signal, Signal::Monitor(_)));
+        assert!(matches!(signal, Signal::Monitor { .. }));
         assert!(monitor_permit.is_some());
-        notification.unwrap().deliver(42).unwrap();
+        notification
+            .unwrap()
+            .deliver(42, DeathReason::Failure)
+            .unwrap();
 
         assert!(matches!(
             observer_mailbox.pop(None).await,
-            Message::ProcessDied(42)
+            Message::ProcessDied {
+                process_id: 42,
+                reason: DeathReason::Failure
+            }
         ));
         assert_eq!(observer_mailbox.available_capacity(), 1);
         drop(observer_receiver);
@@ -935,9 +1155,14 @@ mod tests {
         let (target_sender, _target_receiver) = signal_mailbox(1, &target_mailbox);
 
         target_sender.send(Signal::DieWhenLinkDies(false)).unwrap();
-        let error = target_sender.send(Signal::Monitor(observer)).unwrap_err();
+        let error = target_sender
+            .send(Signal::Monitor {
+                process: observer,
+                acknowledgement: None,
+            })
+            .unwrap_err();
         assert_eq!(error.kind(), SignalSendErrorKind::QueueFull);
-        assert!(matches!(error.into_signal(), Signal::Monitor(_)));
+        assert!(matches!(error.into_signal(), Signal::Monitor { .. }));
         assert_eq!(observer_mailbox.available_capacity(), 1);
     }
 
@@ -947,16 +1172,25 @@ mod tests {
         let (sender, receiver) = signal_mailbox(1, &mailbox);
 
         sender
-            .send(Signal::Message(Message::ProcessDied(1)))
+            .send(Signal::Message(Message::ProcessDied {
+                process_id: 1,
+                reason: DeathReason::Normal,
+            }))
             .unwrap();
         assert_eq!(mailbox.available_capacity(), 1);
 
         let error = sender
-            .send(Signal::Message(Message::ProcessDied(2)))
+            .send(Signal::Message(Message::ProcessDied {
+                process_id: 2,
+                reason: DeathReason::Failure,
+            }))
             .unwrap_err();
         assert_eq!(error.kind(), SignalSendErrorKind::QueueFull);
         match error.into_signal() {
-            Signal::Message(Message::ProcessDied(process_id)) => assert_eq!(process_id, 2),
+            Signal::Message(Message::ProcessDied { process_id, reason }) => {
+                assert_eq!(process_id, 2);
+                assert_eq!(reason, DeathReason::Failure);
+            }
             _ => panic!("queue-full send returned the wrong signal"),
         }
         assert_eq!(mailbox.available_capacity(), 1);
@@ -971,11 +1205,27 @@ mod tests {
         let (sender, receiver) = signal_mailbox(4, &mailbox);
 
         for process_id in 0..3 {
-            sender.send(Signal::ProcessDied(process_id)).unwrap();
+            sender
+                .send(Signal::ProcessDied {
+                    process_id,
+                    reason: DeathReason::Failure,
+                })
+                .unwrap();
         }
-        let error = sender.send(Signal::ProcessDied(99)).unwrap_err();
+        let error = sender
+            .send(Signal::ProcessDied {
+                process_id: 99,
+                reason: DeathReason::NoProcess,
+            })
+            .unwrap_err();
         assert_eq!(error.kind(), SignalSendErrorKind::QueueFull);
-        assert!(matches!(error.into_signal(), Signal::ProcessDied(99)));
+        assert!(matches!(
+            error.into_signal(),
+            Signal::ProcessDied {
+                process_id: 99,
+                reason: DeathReason::NoProcess
+            }
+        ));
         assert_eq!(mailbox.available_capacity(), 1);
 
         sender.send(Signal::Kill).unwrap();
@@ -1016,9 +1266,20 @@ mod tests {
         let (sender, receiver) = signal_mailbox(1, &mailbox);
         drop(receiver);
 
-        let error = sender.send(Signal::ProcessDied(88)).unwrap_err();
+        let error = sender
+            .send(Signal::ProcessDied {
+                process_id: 88,
+                reason: DeathReason::Failure,
+            })
+            .unwrap_err();
         assert_eq!(error.kind(), SignalSendErrorKind::Closed);
-        assert!(matches!(error.into_signal(), Signal::ProcessDied(88)));
+        assert!(matches!(
+            error.into_signal(),
+            Signal::ProcessDied {
+                process_id: 88,
+                reason: DeathReason::Failure
+            }
+        ));
         assert_eq!(mailbox.available_capacity(), 1);
     }
 

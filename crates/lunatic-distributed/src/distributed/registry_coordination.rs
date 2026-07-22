@@ -1034,14 +1034,14 @@ impl RegistryCoordinator {
             Some(existing) if existing.global_pid != expected_global_pid => {
                 return GlobalUnregisterResult::OwnerChanged
             }
-            Some(_) => {
+            Some(_)
                 if !self
                     .registry
-                    .remove_global_if_owner(name.as_str(), expected_global_pid)
-                {
-                    return GlobalUnregisterResult::OwnerChanged;
-                }
+                    .remove_global_if_owner(name.as_str(), expected_global_pid) =>
+            {
+                return GlobalUnregisterResult::OwnerChanged;
             }
+            Some(_) => {}
             None if !allow_missing_owner => return GlobalUnregisterResult::NotFound,
             None => {}
         }

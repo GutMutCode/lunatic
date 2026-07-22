@@ -64,6 +64,7 @@
 //! ```
 
 use anyhow::{anyhow, Context, Result};
+use lunatic_distributed::distributed::{DistributedRegistry, GlobalProcessId};
 use lunatic_process::{
     env::{Environment, LunaticEnvironment},
     message::{DataMessage, Message},
@@ -136,10 +137,25 @@ pub trait GenServer: Sized {
     where
         Self: GenServer<State = Self> + Send + 'static,
     {
-        let runtime = tokio::runtime::Handle::try_current()
+        Self::spawn_in(gen_server_runtime(), config)
+    }
+
+    /// Spawn a new GenServer in an explicitly supplied runtime context.
+    ///
+    /// `GenServerConfig::name` is registered in the context's node-local
+    /// production registry before [`GenServer::init`] runs. Cluster-wide
+    /// quorum registration is deliberately outside this synchronous API.
+    fn spawn_in(
+        runtime: GenServerRuntime,
+        config: GenServerConfig,
+    ) -> Result<GenServerHandle<Self::Call, Self::Cast, Self::CallReply>>
+    where
+        Self: GenServer<State = Self> + Send + 'static,
+    {
+        let tokio_runtime = tokio::runtime::Handle::try_current()
             .context("GenServer::spawn requires a multi-thread Tokio runtime")?;
         if matches!(
-            runtime.runtime_flavor(),
+            tokio_runtime.runtime_flavor(),
             tokio::runtime::RuntimeFlavor::CurrentThread
         ) {
             return Err(anyhow!(
@@ -147,12 +163,19 @@ pub trait GenServer: Sized {
             ));
         }
 
-        let environment = gen_server_environment();
+        let environment = runtime.environment.clone();
         let shared = Arc::new(GenServerShared::new(environment.clone()));
         let process_shared = shared.clone();
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
 
         let (join, process) = spawn_native(environment, move |_process, mailbox| async move {
             let mut exit_guard = ExitGuard::new(process_shared.clone());
+            // Keep the owner lease declared after ExitGuard. Rust drops locals
+            // in reverse order, so registry cleanup completes before finish()
+            // wakes stop/kill/wait_for_exit callers.
+            let _registration: Option<LocalNameRegistration> = start_receiver
+                .await
+                .context("GenServer start cancelled before registry registration")?;
             let mut server = Self::init();
 
             loop {
@@ -160,7 +183,7 @@ pub trait GenServer: Sized {
                 let data = match message {
                     Message::Data(data) => data,
                     Message::LinkDied(_) => continue,
-                    Message::ProcessDied(process_id) => {
+                    Message::ProcessDied { process_id, .. } => {
                         server.handle_info(process_id.to_le_bytes().to_vec());
                         continue;
                     }
@@ -207,6 +230,24 @@ pub trait GenServer: Sized {
             join_shared.finish(status);
         });
 
+        let registration = match config.name.as_deref() {
+            Some(name) => match runtime.register_local(name, process.id()) {
+                Ok(registration) => Some(registration),
+                Err(error) => {
+                    drop(start_sender);
+                    let _ = process.send(Signal::Kill);
+                    return Err(error);
+                }
+            },
+            None => None,
+        };
+
+        if let Err(registration) = start_sender.send(registration) {
+            drop(registration);
+            let _ = process.send(Signal::Kill);
+            return Err(anyhow!("GenServer process exited before startup completed"));
+        }
+
         Ok(GenServerHandle::from_process(process, shared, config))
     }
 }
@@ -248,6 +289,77 @@ struct PendingReply {
     completed_at: Instant,
 }
 
+/// Runtime resources used by process-backed GenServers.
+///
+/// Named servers use the supplied [`DistributedRegistry`]'s local namespace.
+/// That is the same bounded, owner-indexed registry used by the production
+/// distributed runtime, but it does not perform cluster quorum registration.
+#[derive(Clone)]
+pub struct GenServerRuntime {
+    environment: Arc<dyn Environment>,
+    node_id: u64,
+    registry: Arc<DistributedRegistry>,
+}
+
+impl GenServerRuntime {
+    pub fn new(
+        environment: Arc<dyn Environment>,
+        node_id: u64,
+        registry: Arc<DistributedRegistry>,
+    ) -> Self {
+        Self {
+            environment,
+            node_id,
+            registry,
+        }
+    }
+
+    pub fn environment(&self) -> Arc<dyn Environment> {
+        self.environment.clone()
+    }
+
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    pub fn registry(&self) -> Arc<DistributedRegistry> {
+        self.registry.clone()
+    }
+
+    /// Resolve a node-local name to its full process identity.
+    pub fn whereis(&self, name: &str) -> Option<GlobalProcessId> {
+        self.registry
+            .lookup_local(name)
+            .map(|entry| entry.global_pid)
+    }
+
+    fn register_local(&self, name: &str, process_id: u64) -> Result<LocalNameRegistration> {
+        if self.environment.get_process(process_id).is_none() {
+            return Err(anyhow!(
+                "GenServer process {process_id} is not registered in environment {}",
+                self.environment.id()
+            ));
+        }
+        let global_pid = GlobalProcessId::new(self.node_id, self.environment.id(), process_id);
+        self.registry.register_local(name, global_pid)?;
+        Ok(LocalNameRegistration {
+            registry: self.registry.clone(),
+            global_pid,
+        })
+    }
+}
+
+struct LocalNameRegistration {
+    registry: Arc<DistributedRegistry>,
+    global_pid: GlobalProcessId,
+}
+
+impl Drop for LocalNameRegistration {
+    fn drop(&mut self) {
+        self.registry.remove_local_registrations(self.global_pid);
+    }
+}
+
 impl PendingReply {
     fn new(result: std::result::Result<Vec<u8>, String>) -> Self {
         Self {
@@ -276,14 +388,14 @@ enum ExitStatus {
 }
 
 struct GenServerShared {
-    environment: Arc<LunaticEnvironment>,
+    environment: Arc<dyn Environment>,
     pending: Mutex<HashMap<u64, mpsc::Sender<PendingReply>>>,
     next_request_id: AtomicU64,
     exit: (Mutex<Option<ExitStatus>>, Condvar),
 }
 
 impl GenServerShared {
-    fn new(environment: Arc<LunaticEnvironment>) -> Self {
+    fn new(environment: Arc<dyn Environment>) -> Self {
         Self {
             environment,
             pending: Mutex::new(HashMap::new()),
@@ -341,25 +453,27 @@ impl GenServerShared {
     }
 
     fn wait_for_exit(&self, timeout: Option<Duration>) -> Result<ExitStatus> {
-        let (exit, condvar) = &self.exit;
-        let exit = exit.lock().expect("GenServer exit mutex poisoned");
-        let exit = match timeout {
-            Some(timeout) => {
-                let (exit, wait) = condvar
-                    .wait_timeout_while(exit, timeout, |status| status.is_none())
-                    .expect("GenServer exit mutex poisoned");
-                if wait.timed_out() && exit.is_none() {
-                    return Err(anyhow!("timed out waiting for GenServer to exit"));
+        blocking_wait(|| {
+            let (exit, condvar) = &self.exit;
+            let exit = exit.lock().expect("GenServer exit mutex poisoned");
+            let exit = match timeout {
+                Some(timeout) => {
+                    let (exit, wait) = condvar
+                        .wait_timeout_while(exit, timeout, |status| status.is_none())
+                        .expect("GenServer exit mutex poisoned");
+                    if wait.timed_out() && exit.is_none() {
+                        return Err(anyhow!("timed out waiting for GenServer to exit"));
+                    }
+                    exit
                 }
-                exit
-            }
-            None => condvar
-                .wait_while(exit, |status| status.is_none())
-                .expect("GenServer exit mutex poisoned"),
-        };
+                None => condvar
+                    .wait_while(exit, |status| status.is_none())
+                    .expect("GenServer exit mutex poisoned"),
+            };
 
-        exit.clone()
-            .ok_or_else(|| anyhow!("GenServer exit status unavailable"))
+            exit.clone()
+                .ok_or_else(|| anyhow!("GenServer exit status unavailable"))
+        })
     }
 }
 
@@ -395,10 +509,13 @@ impl Drop for ExitGuard {
     }
 }
 
-fn gen_server_environment() -> Arc<LunaticEnvironment> {
-    static ENVIRONMENT: OnceLock<Arc<LunaticEnvironment>> = OnceLock::new();
-    ENVIRONMENT
-        .get_or_init(|| Arc::new(LunaticEnvironment::new(0)))
+fn gen_server_runtime() -> GenServerRuntime {
+    static RUNTIME: OnceLock<GenServerRuntime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(0));
+            GenServerRuntime::new(environment, 0, Arc::new(DistributedRegistry::new(0)))
+        })
         .clone()
 }
 
@@ -497,7 +614,7 @@ where
             return Err(error);
         }
 
-        let response = match self.config.timeout_ms {
+        let response = blocking_wait(|| match self.config.timeout_ms {
             Some(timeout_ms) => {
                 let timeout = Duration::from_millis(timeout_ms);
                 timeout
@@ -529,7 +646,7 @@ where
                     request_id
                 )
             }),
-        };
+        });
 
         let response = match response {
             Ok(response) => response,
@@ -628,6 +745,8 @@ where
 /// GenServer spawn configuration
 #[derive(Debug, Clone)]
 pub struct GenServerConfig {
+    /// Optional node-local registry name. Cluster-wide quorum registration is
+    /// not performed by the synchronous GenServer API.
     pub name: Option<String>,
     pub timeout_ms: Option<u64>,
 }
@@ -644,6 +763,20 @@ impl Default for GenServerConfig {
 impl GenServerConfig {
     fn timeout(&self) -> Option<Duration> {
         self.timeout_ms.map(Duration::from_millis)
+    }
+}
+
+fn blocking_wait<T>(wait: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime)
+            if matches!(
+                runtime.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            ) =>
+        {
+            tokio::task::block_in_place(wait)
+        }
+        _ => wait(),
     }
 }
 

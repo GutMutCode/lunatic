@@ -4,7 +4,7 @@ Lunatic exposes language-neutral WebAssembly host imports. A language can target
 
 This guide helps you choose the right language for your use case and get started quickly.
 
-> **Evidence boundary:** Source examples and build recipes are present, but the repository does not yet validate them as a complete build-and-run matrix. They do not prove equivalent Lunatic API coverage across languages. Rust OTP examples use host-side native-process adapters; the Go and AssemblyScript OTP examples are manual pattern simulations. TinyGo and AssemblyScript guest E2E execution are not enforced in CI, and some example recipes still require repair. See [`docs/core_values/status.md`](../docs/core_values/status.md) for canonical status.
+> **Evidence boundary:** Source examples and build recipes are present, but the repository does not yet validate them as a complete build-and-run matrix. Rust OTP examples use native-process adapters; the Go and AssemblyScript OTP examples remain manual simulations. A language-neutral OTP1 WAT fixture verifies actual-Wasm cast, call/reply, timeout, and stop, but it is not a packaged SDK for those languages. See [`docs/core_values/status.md`](../docs/core_values/status.md) for canonical status.
 
 ## Quick Start by Language
 
@@ -17,7 +17,7 @@ This guide helps you choose the right language for your use case and get started
 
 ## OTP Pattern Examples — Experimental and Scope-Limited
 
-The `lunatic-otp-patterns` crate contains host-side Erlang/OTP-inspired components. GenServer and Supervisor have native Lunatic-process integration tests, but guest-Wasm adapters, automatic Supervisor monitor intake, and process-runtime GenStatem/GenEvent adapters remain pending.
+The `lunatic-otp-patterns` crate provides native Lunatic-process adapters for GenServer, Supervisor, GenStatem, and GenEvent. Supervisor consumes child monitor events automatically, named GenServers use a bounded local registry, and the OTP1 wire fixture exercises an actual Wasm client/server. High-level cross-language guest SDKs and distributed supervision remain pending.
 
 ### GenServer - Generic Server Pattern
 
@@ -68,7 +68,7 @@ impl GenServer for Counter {
 
 ### Supervisor - Process Supervision
 
-**Supervisor** manages real child process handles and applies restart strategies when an exit reason is forwarded to `handle_child_exit`.
+**Supervisor** runs as a native process, registers acknowledged monitors on real child processes, and applies restart strategies automatically from reason-preserving exit events.
 
 ```rust
 use lunatic_otp_patterns::{
@@ -80,7 +80,8 @@ use std::{future, sync::Arc};
 fn start_worker(environment: Arc<dyn Environment>) -> Result<Arc<dyn Process>, String> {
     let (_join, process) = spawn_native(environment, |_process, _mailbox| async move {
         future::pending::<anyhow::Result<()>>().await
-    });
+    })
+    .map_err(|error| error.to_string())?;
     Ok(Arc::new(process))
 }
 
@@ -99,8 +100,7 @@ let spec = SupervisorSpec {
     ],
 };
 
-let mut supervisor = Supervisor::new(spec);
-supervisor.start_children()?;
+let supervisor = Supervisor::spawn(spec)?;
 ```
 
 ### Key Features
@@ -202,7 +202,7 @@ ChildSpec {
 
 ### Monitoring
 
-The current Supervisor does not automatically emit restart telemetry. Applications must add their own logging around forwarded exit events and `handle_child_exit`; a structured OTP monitoring contract remains future work.
+The current Supervisor publishes child and restart-history snapshots through its handle, but it does not yet expose a structured external telemetry stream. Applications still need their own metrics/logging integration around the handle.
 
 ## Language Comparison
 
@@ -475,7 +475,7 @@ let counter: i32 = 0;
 
 ## OTP Patterns in Lunatic
 
-The repository provides host-side Rust adapters for selected Erlang/OTP-inspired patterns and manual Go/AssemblyScript sketches. These examples are learning material, not equivalent guest-Wasm runtime integrations or a general fault-tolerance guarantee.
+The repository provides native Rust process adapters, a low-level actual-Wasm OTP1 wire fixture, and manual Go/AssemblyScript sketches. The sketches are learning material, not equivalent packaged guest SDKs or a general distributed fault-tolerance guarantee.
 
 ### GenServer Pattern
 

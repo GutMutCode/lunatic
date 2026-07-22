@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-22
 
-Reviewed working tree based on: `2bff20678eb90cef083075d58e63cff663e546c7` plus the reviewed working-tree changes for Hanary #1678
+Reviewed working tree based on: `52101a2` plus the reviewed working-tree changes for Hanary #1665
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -22,9 +22,9 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
 | Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. Version-2 TLS listener snapshots exclude raw private-key bytes, Cloud CLI credentials use native protected stores, and typed/redacted V1 audit events cover major privileged boundaries, but the guest TLS ABI still accepts raw key input, complete resource accounting and receiver path policy remain open, and audit delivery is not durable/required. |
-| Fault Tolerance & HA | Partial | Actual-Wasm links and monitors, process-local live reload, host-side OTP components, snapshots, and registry quorum components exist. Distributed recovery paths remain incomplete. |
+| Fault Tolerance & HA | Partial | Actual-Wasm links/monitors, process-local live reload, and automatic native Supervisor restart/escalation paths are production-path tested. Guest-side and distributed recovery paths remain incomplete. |
 | Async by Default | Partial | Wasmtime preemption, bounded actor ingress, and several async host paths exist. Unverified blocking host calls and scheduler fairness prevent a stronger claim. |
-| Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
+| Erlang-Inspired | Partial | Actor primitives, process-backed GenServer/Supervisor/GenStatem/GenEvent adapters, a guest-Wasm OTP wire E2E, and coordinated registry components exist. High-level guest SDKs and several BEAM-like guarantees remain open. |
 
 Status values: **Strong** means production-path implementation plus executable validation; **Partial** means major connected elements with material gaps; **Emerging** means useful scaffolding without a demonstrated system-level guarantee. No focus currently meets the Strong threshold.
 
@@ -78,7 +78,7 @@ missing.
 ### Boundary
 
 - The example sources and recipes have not yet been validated as a complete multi-language build-and-run matrix; they do not demonstrate equivalent access to the complete Lunatic runtime API.
-- Rust OTP examples use host-side `lunatic-otp-patterns`; they are not proof of a guest-Wasm OTP API.
+- Rust OTP examples still use host-side `lunatic-otp-patterns`. The actual-Wasm OTP1 fixture proves the low-level wire path, not a packaged Rust guest SDK.
 - Go and AssemblyScript OTP samples are manual pattern simulations, not runtime adapters.
 - CI does not yet build and execute a representative guest API scenario for every advertised language.
 
@@ -127,7 +127,7 @@ missing.
 ### Verified components
 
 - Process links and monitors, snapshot/signature components, and reload coordination structures exist.
-- `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one monitor notification, removal-before-notification ordering, and native-runner parity.
+- `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one reason-preserving monitor notification, removal-before-notification ordering, native-runner parity, and automatic Supervisor replacement after an immediate guest trap.
 - Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, resynchronization, rejection of a node-2 certificate claiming node 1 for leader notifications, and rejection of a node-2-authenticated synchronization snapshot while node 3 expects coordinator node 1. The latter proves processing with a same-stream response marker before a legitimate node-1 snapshot completes the preserved waiter (`crates/lunatic-distributed/tests/registry_coordination.rs`).
 - `tests/distributed_registry_e2e.rs` runs actual Wasm guests on full node servers. It covers guest registration and replica lookup, confirmed request/reply through live cross-node mailboxes, missing environment/process errors, explicit removal, cross-environment fail-closed lookup, and owner-exit cleanup on both replicas. A three-node mTLS case also proves that a spawn waiter expecting node 2 rejects a matching response ID from node 3 without consuming the waiter, then accepts node 2's response.
 - Confirmed sends correlate `Sent`/typed error responses before reporting success, preserve bounded waiter/outbound accounting on timeout or cancellation, and distinguish missing environments, missing processes, receiver backpressure, and oversized/rejected delivery. Owner cleanup retains a bounded retry record with backoff until quorum coordination succeeds.
@@ -156,25 +156,26 @@ missing.
 
 ### Verified components
 
-- `GenServer::spawn` uses native Lunatic processes and mailbox call/cast/reply flows. Process-level integration tests cover its host-side lifecycle (`crates/lunatic-otp-patterns`).
-- Supervisor strategies operate on native Lunatic process handles and have process-level integration tests.
-- GenEvent has a tested in-memory concurrency contract.
+- `GenServer::spawn` uses native Lunatic processes and mailbox call/cast/reply flows. `spawn_in` optionally registers a name in an injected bounded `DistributedRegistry` local namespace; tests cover collision rejection before `init`, owner-indexed cleanup, and immediate reuse after exit.
+- `Supervisor::spawn_with_environment` runs the supervisor itself as a native Lunatic process. It registers acknowledged monitors before exposing startup, retains terminal reasons for late monitor registration, consumes child-death messages automatically, ignores stale intentional-kill events by process identity, and escalates restart exhaustion after reverse-order shutdown. Tests cover immediate normal/error/panic exits, kill, an actual guest-Wasm trap, ChildStart-panic orphan cleanup, Normal/Failure monitor output, OneForOne, OneForAll, and RestForOne.
+- GenStatem and GenEvent have native Lunatic-process mailbox/lifecycle adapters in addition to their behavior APIs. Their synchronous handle waits, along with GenServer calls and lifecycle waits, are regression-tested on a one-worker multi-thread Tokio runtime.
+- `tests/otp_guest_wasm.rs` runs an actual Wasm client and server using the language-neutral OTP1 envelope over existing bounded message imports. It verifies a Rust-encoded contract probe, cast, correlated reply envelopes, timeout status, and acknowledged graceful stop.
 - Coordinated registry messages travel over the production QUIC control transport.
 
 ### Boundary
 
-- Supervisor exit events must be forwarded manually to `handle_child_exit`; automatic monitor intake is pending.
-- GenStatem and GenEvent are not Lunatic process-runtime adapters.
-- GenServer, Supervisor, GenStatem, and GenEvent do not yet expose equivalent guest-Wasm adapters; GenServer named registration is not connected.
-- Linked failure behavior is verified locally for actual Wasm peers; automatic Supervisor monitor intake and distributed BEAM-like recovery remain unverified.
+- The automatic Supervisor adapter is host-side and local. Guest-Wasm supervisor trees, cross-node supervision, and distributed BEAM-like recovery remain unverified.
+- OTP1 is a low-level, language-neutral guest wire contract, not a complete high-level SDK. Rust, TinyGo, and AssemblyScript still need equivalent packaged guest APIs and CI build/run coverage; guest-side GenStatem, GenEvent, and Supervisor libraries remain follow-up work.
+- Named GenServer registration is node-local and requires an explicitly supplied runtime context for embedding. Cluster-quorum/global naming and name-based reconstruction of a typed handle are outside the synchronous adapter.
 
 ## Validation Scope
 
 | Evidence | What it establishes | What it does not establish |
 | --- | --- | --- |
 | `cargo test --all` | Current unit and integration contracts exercised by the repository | Untested production paths, performance, scale, or multi-host behavior |
-| `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and monitor semantics | Cross-node links, Supervisor event intake, or every possible host-future suspension point |
-| `cargo test -p lunatic-otp-patterns` | Host-side OTP component and process integration behavior | Guest-Wasm adapters, automatic Supervisor monitor intake, GenStatem/GenEvent runtime integration |
+| `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and reason-preserving monitor semantics, plus Supervisor restart after an immediate guest trap | Cross-node links or every possible host-future suspension point |
+| `cargo test -p lunatic-otp-patterns` | Native GenServer/GenStatem/GenEvent mailbox lifecycles, local named registration, and automatic Supervisor monitor/restart/escalation behavior | Guest-side supervisor trees, global naming, or distributed recovery |
+| `cargo test -p lunatic-runtime --test otp_guest_wasm` | Actual-Wasm OTP1 cast, correlated call/reply, timeout, and acknowledged stop over production message imports | Packaged language SDK ergonomics, guest-side Supervisor/GenStatem/GenEvent libraries, or cross-node OTP |
 | TLS listener credential tests | Version-2 address-plus-handle serialization, scoped/single-use/expiry/capacity behavior, stable fail-closed errors, provider-backed rebind, legacy rejection, and live listener transfer without provider lookup | Persistent-provider implementation, host restart, cross-node restoration, or elimination of guest-memory duplicates |
 | TLS bind production-import test | The const guest key-input range remains reusable on the exercised invalid-input path, the temporary host copy is zeroized by implementation, and the audit record omits the marker | Guest-managed erasure, `MemorySnapshot` key absence, successful-bind crash-dump/remanence guarantees, or distributed credential delivery |
 | Registry/QUIC + guest integration tests | Real localhost mTLS transport, framing, quorum behavior, two actual Wasm guest lookup-to-mailbox request/reply, typed missing-target errors, and owner cleanup | Cross-host deployment, cross-environment handles, partitioned guest owner exit, distributed process recovery |
@@ -202,9 +203,8 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 3. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
 4. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
 5. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
-6. Connect Supervisor monitor intake and OTP guest/runtime adapters.
-7. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
-8. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
+6. Package the OTP1 contract as equivalent Rust, TinyGo, and AssemblyScript guest APIs, including guest-side Supervisor/GenStatem/GenEvent libraries, and build/run representative scenarios in CI.
+7. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
 
 ## Related Resources
 
