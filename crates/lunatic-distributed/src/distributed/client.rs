@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{
         atomic::{self, AtomicBool, AtomicU64, AtomicUsize},
@@ -24,7 +24,7 @@ use crate::{
     congestion::{self, node_connection_manager, MessageChunk, NodeConnectionManager},
     control,
     distributed::message::{Request, ResponseContent, Spawn},
-    distributed::registry::{DistributedRegistry, RegistryLimits},
+    distributed::registry::{DistributedRegistry, ProcessName, RegistryLimits},
     distributed::registry_coordination::{RegistryCoordinationMessage, RegistryCoordinator},
     quic,
 };
@@ -44,7 +44,10 @@ pub struct NodeId(pub u64);
 pub struct MessageId(pub u64);
 
 pub struct SendParams {
-    pub env: EnvironmentId,
+    /// Environment that owns the sending process and its outbound queue.
+    pub source_env: EnvironmentId,
+    /// Environment that owns the destination process on the remote node.
+    pub target_env: EnvironmentId,
     pub src: ProcessId,
     pub node: NodeId,
     pub dest: ProcessId,
@@ -114,6 +117,9 @@ pub const MAX_OUTBOUND_IN_FLIGHT_MESSAGES: usize = 1_024;
 pub const MAX_OUTBOUND_IN_FLIGHT_BYTES: usize = 32 * 1024 * 1024;
 pub const OUTBOUND_PROCESS_QUEUE_CAPACITY: usize = 64;
 pub const OUTBOUND_NODE_QUEUE_CAPACITY: usize = 256;
+const MAX_REGISTRY_CLEANUP_IN_FLIGHT: usize = 8;
+const REGISTRY_CLEANUP_RETRY_TICK: Duration = Duration::from_millis(100);
+const MAX_REGISTRY_CLEANUP_BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboundLimits {
@@ -185,6 +191,14 @@ pub enum SendErrorKind {
     MessageTooLarge,
     QueueClosed,
     Serialization,
+    EnvironmentNotFound,
+    ProcessNotFound,
+    RemoteBackpressure,
+    RemoteMessageTooLarge,
+    RemoteRejected,
+    Connection,
+    ResponseTimeout,
+    UnexpectedResponse,
 }
 
 pub struct SendError {
@@ -229,6 +243,53 @@ impl fmt::Display for SendError {
 }
 
 impl std::error::Error for SendError {}
+
+fn remote_send_error(error: message::ClientError, data: Vec<u8>) -> SendError {
+    use message::ClientError;
+
+    match error {
+        ClientError::Unexpected(message) => {
+            SendError::new(SendErrorKind::RemoteRejected, message, data)
+        }
+        ClientError::Connection(message) => {
+            SendError::new(SendErrorKind::Connection, message, data)
+        }
+        ClientError::NodeNotFound => SendError::new(
+            SendErrorKind::NodeNotFound,
+            "Remote node does not exist",
+            data,
+        ),
+        ClientError::ModuleNotFound => SendError::new(
+            SendErrorKind::UnexpectedResponse,
+            "Remote delivery returned a module-not-found response",
+            data,
+        ),
+        ClientError::ProcessNotFound => SendError::new(
+            SendErrorKind::ProcessNotFound,
+            "Remote process does not exist",
+            data,
+        ),
+        ClientError::EnvironmentNotFound => SendError::new(
+            SendErrorKind::EnvironmentNotFound,
+            "Remote environment does not exist",
+            data,
+        ),
+        ClientError::DeliveryBackpressure(message) => {
+            SendError::new(SendErrorKind::RemoteBackpressure, message, data)
+        }
+        ClientError::DeliveryTooLarge(message) => {
+            SendError::new(SendErrorKind::RemoteMessageTooLarge, message, data)
+        }
+        ClientError::DeliveryRejected(message) => {
+            SendError::new(SendErrorKind::RemoteRejected, message, data)
+        }
+        ClientError::ResponseTimeout => SendError::new(
+            SendErrorKind::ResponseTimeout,
+            "Timed out waiting for remote mailbox admission",
+            data,
+        ),
+    }
+}
 
 pub(crate) struct OutboundEnqueueError {
     kind: SendErrorKind,
@@ -396,6 +457,34 @@ pub(crate) fn test_outbound_lease(bytes: usize) -> (OutboundMessageLease, Outbou
 
 type IncomingResponse = (AsyncCell<ResponseContent>, Instant);
 
+/// Removes a response waiter if the operation is cancelled or returns early.
+///
+/// Normal completion also removes the entry through [`Client::await_response`];
+/// the second removal in `Drop` is intentionally harmless.
+struct ResponseWaiterGuard<'a> {
+    responses: &'a DashMap<MessageId, Arc<IncomingResponse>>,
+    message_id: MessageId,
+}
+
+impl<'a> ResponseWaiterGuard<'a> {
+    fn insert(
+        responses: &'a DashMap<MessageId, Arc<IncomingResponse>>,
+        message_id: MessageId,
+    ) -> Self {
+        responses.insert(message_id, Arc::new((AsyncCell::new(), Instant::now())));
+        Self {
+            responses,
+            message_id,
+        }
+    }
+}
+
+impl Drop for ResponseWaiterGuard<'_> {
+    fn drop(&mut self) {
+        self.responses.remove(&self.message_id);
+    }
+}
+
 #[derive(Clone)]
 pub struct Client {
     pub node_id: NodeId,
@@ -411,6 +500,29 @@ pub struct RegistryProcessRegistration {
     client: Client,
     global_pid: super::GlobalProcessId,
     cleaned: AtomicBool,
+}
+
+#[derive(Debug)]
+struct RegistryCleanupRetry {
+    in_flight: bool,
+    failures: u32,
+    next_attempt: Instant,
+}
+
+impl RegistryCleanupRetry {
+    fn ready() -> Self {
+        Self {
+            in_flight: false,
+            failures: 0,
+            next_attempt: Instant::now(),
+        }
+    }
+}
+
+fn registry_cleanup_backoff(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    let multiplier = 1_u32 << exponent;
+    (REGISTRY_CLEANUP_RETRY_TICK * multiplier).min(MAX_REGISTRY_CLEANUP_BACKOFF)
 }
 
 impl RegistryProcessRegistration {
@@ -429,6 +541,26 @@ impl RegistryProcessRegistration {
         if !has_global_names {
             return;
         }
+        {
+            let mut pending = self
+                .client
+                .inner
+                .registry_cleanup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !pending.contains_key(&self.global_pid)
+                && pending.len() >= self.client.inner.limits.registry.max_entries
+            {
+                log::error!(
+                    "Registry cleanup pending limit reached; retaining registrations for {}",
+                    self.global_pid
+                );
+                return;
+            }
+            pending
+                .entry(self.global_pid)
+                .or_insert_with(RegistryCleanupRetry::ready);
+        }
         if let Err(error) = self
             .client
             .inner
@@ -436,12 +568,9 @@ impl RegistryProcessRegistration {
             .try_send(self.global_pid)
         {
             log::warn!(
-                "Registry process-cleanup queue rejected {}: {error}",
+                "Registry process-cleanup wake queue rejected {}; periodic retry retains it: {error}",
                 self.global_pid
             );
-            // Saturated or runtime-less teardown still releases all local
-            // retention. Remote replicas converge on node removal/resync.
-            self.client.registry().unregister_process(self.global_pid);
         }
     }
 }
@@ -473,6 +602,7 @@ pub struct Inner {
     pub responses: DashMap<MessageId, Arc<IncomingResponse>>,
     pub response_tx: Sender<(MessageId, ResponseContent)>,
     registry_cleanup_tx: Sender<super::GlobalProcessId>,
+    registry_cleanup_pending: Mutex<HashMap<super::GlobalProcessId, RegistryCleanupRetry>>,
     pub has_messages: Arc<Notify>,
     outbound_budget: Arc<OutboundBudget>,
     node_queue_admission: AsyncMutex<()>,
@@ -540,6 +670,7 @@ impl Client {
                 responses: DashMap::new(),
                 response_tx: send,
                 registry_cleanup_tx,
+                registry_cleanup_pending: Mutex::new(HashMap::new()),
                 has_messages: Arc::new(Notify::new()),
                 outbound_budget: Arc::new(OutboundBudget::new(
                     outbound.max_messages,
@@ -811,96 +942,99 @@ impl Client {
         self.ensure_node_queue(node).await?;
 
         // Lazy-initialize exactly one process queue/receiver pair under the sender-map entry lock.
-        let (queue_generation, tx, admission_gate) = match self.inner.buf_tx.entry((env, src)) {
-            DashEntry::Occupied(entry) => (
-                entry.get().generation,
-                entry.get().sender.clone(),
-                entry.get().admission_gate.clone(),
-            ),
-            DashEntry::Vacant(entry) => {
-                let (send, recv) = tokio::sync::mpsc::channel(OUTBOUND_PROCESS_QUEUE_CAPACITY);
-                let generation = self
-                    .inner
-                    .next_process_queue_generation
-                    .fetch_add(1, atomic::Ordering::Relaxed);
-                let admission_gate = Arc::new(AsyncMutex::new(()));
-                match self.inner.buf_rx.entry(env) {
-                    DashEntry::Occupied(env_queue) => {
-                        env_queue.get().insert(
-                            src,
-                            ProcessQueueReceiver {
-                                generation,
-                                receiver: RwLock::new(recv),
-                                admission_gate: admission_gate.clone(),
-                            },
-                        );
+        // The worker can win the admission gate and retire a newly observed empty queue before
+        // this producer reaches it. That is a benign internal race, so retry with a fresh
+        // generation without surfacing QueueClosed to the guest.
+        loop {
+            let (queue_generation, tx, admission_gate) = match self.inner.buf_tx.entry((env, src)) {
+                DashEntry::Occupied(entry) => (
+                    entry.get().generation,
+                    entry.get().sender.clone(),
+                    entry.get().admission_gate.clone(),
+                ),
+                DashEntry::Vacant(entry) => {
+                    let (send, recv) = tokio::sync::mpsc::channel(OUTBOUND_PROCESS_QUEUE_CAPACITY);
+                    let generation = self
+                        .inner
+                        .next_process_queue_generation
+                        .fetch_add(1, atomic::Ordering::Relaxed);
+                    let admission_gate = Arc::new(AsyncMutex::new(()));
+                    match self.inner.buf_rx.entry(env) {
+                        DashEntry::Occupied(env_queue) => {
+                            env_queue.get().insert(
+                                src,
+                                ProcessQueueReceiver {
+                                    generation,
+                                    receiver: RwLock::new(recv),
+                                    admission_gate: admission_gate.clone(),
+                                },
+                            );
+                        }
+                        DashEntry::Vacant(env_queue) => {
+                            let queue = DashMap::new();
+                            queue.insert(
+                                src,
+                                ProcessQueueReceiver {
+                                    generation,
+                                    receiver: RwLock::new(recv),
+                                    admission_gate: admission_gate.clone(),
+                                },
+                            );
+                            env_queue.insert(queue);
+                        }
                     }
-                    DashEntry::Vacant(env_queue) => {
-                        let queue = DashMap::new();
-                        queue.insert(
-                            src,
-                            ProcessQueueReceiver {
-                                generation,
-                                receiver: RwLock::new(recv),
-                                admission_gate: admission_gate.clone(),
-                            },
-                        );
-                        env_queue.insert(queue);
-                    }
+                    entry.insert(ProcessQueueSender {
+                        generation,
+                        sender: send.clone(),
+                        admission_gate: admission_gate.clone(),
+                    });
+                    (generation, send, admission_gate)
                 }
-                entry.insert(ProcessQueueSender {
-                    generation,
-                    sender: send.clone(),
-                    admission_gate: admission_gate.clone(),
-                });
-                (generation, send, admission_gate)
-            }
-        };
+            };
 
-        let admission_guard = admission_gate.lock().await;
-        let current_generation =
-            process_queue_is_current(&self.inner.buf_tx, env, src, queue_generation, &tx);
-        if !current_generation {
-            return Err(OutboundEnqueueError::new(
-                SendErrorKind::QueueClosed,
-                "Distributed outbound process queue was replaced during admission",
-            ));
-        }
-
-        let message = MessageCtx {
-            message_id,
-            env,
-            src,
-            node,
-            dest,
-            queue_generation,
-            offset: AtomicUsize::new(0),
-            chunk_id: AtomicU64::new(0),
-            data: data.into(),
-            outbound_lease,
-        };
-        match tx.try_send(message) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_message)) => {
-                return Err(OutboundEnqueueError::new(
-                    SendErrorKind::Backpressure,
-                    format!(
-                        "Distributed outbound process queue is full (capacity {})",
-                        OUTBOUND_PROCESS_QUEUE_CAPACITY
-                    ),
-                ));
-            }
-            Err(TrySendError::Closed(_message)) => {
+            let admission_guard = admission_gate.lock().await;
+            let current_generation =
+                process_queue_is_current(&self.inner.buf_tx, env, src, queue_generation, &tx);
+            if !current_generation {
                 drop(admission_guard);
-                self.remove_process_resources_if_generation(env, src, queue_generation);
-                return Err(OutboundEnqueueError::new(
-                    SendErrorKind::QueueClosed,
-                    "Distributed outbound process queue is closed",
-                ));
+                continue;
             }
+
+            let message = MessageCtx {
+                message_id,
+                env,
+                src,
+                node,
+                dest,
+                queue_generation,
+                offset: AtomicUsize::new(0),
+                chunk_id: AtomicU64::new(0),
+                data: data.into(),
+                outbound_lease,
+            };
+            match tx.try_send(message) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_message)) => {
+                    return Err(OutboundEnqueueError::new(
+                        SendErrorKind::Backpressure,
+                        format!(
+                            "Distributed outbound process queue is full (capacity {})",
+                            OUTBOUND_PROCESS_QUEUE_CAPACITY
+                        ),
+                    ));
+                }
+                Err(TrySendError::Closed(_message)) => {
+                    drop(admission_guard);
+                    self.remove_process_resources_if_generation(env, src, queue_generation);
+                    return Err(OutboundEnqueueError::new(
+                        SendErrorKind::QueueClosed,
+                        "Distributed outbound process queue is closed",
+                    ));
+                }
+            }
+            self.inner.has_messages.notify_one();
+            return Ok(message_id);
         }
-        self.inner.has_messages.notify_one();
-        Ok(message_id)
     }
 
     pub fn remove_process_resources(&self, env: EnvironmentId, process_id: ProcessId) {
@@ -983,8 +1117,28 @@ impl Client {
 
     // Send distributed message
     pub async fn send(&self, params: SendParams) -> std::result::Result<MessageId, SendError> {
+        self.send_with_response_timeout(params, None).await
+    }
+
+    /// Send a distributed message and bound the time spent waiting for the
+    /// destination's mailbox-admission acknowledgement.
+    pub async fn send_with_timeout(
+        &self,
+        params: SendParams,
+        response_timeout: Duration,
+    ) -> std::result::Result<MessageId, SendError> {
+        self.send_with_response_timeout(params, Some(response_timeout))
+            .await
+    }
+
+    async fn send_with_response_timeout(
+        &self,
+        params: SendParams,
+        response_timeout: Option<Duration>,
+    ) -> std::result::Result<MessageId, SendError> {
         let SendParams {
-            env,
+            source_env,
+            target_env,
             src,
             node,
             dest,
@@ -993,7 +1147,7 @@ impl Client {
         } = params;
         let message = Request::Message {
             node_id: self.node_id.0,
-            environment_id: env.0,
+            environment_id: target_env.0,
             process_id: dest.0,
             tag,
             data,
@@ -1012,17 +1166,55 @@ impl Client {
             }
         };
         let message_id = self.next_message_id();
-        match self
-            .new_message(message_id, env, src, node, dest, serialized)
+        // Install the waiter before outbound admission. A fast receiver can
+        // otherwise return the mailbox result before this node can correlate it.
+        let _waiter = ResponseWaiterGuard::insert(&self.inner.responses, message_id);
+        if let Err(error) = self
+            .new_message(message_id, source_env, src, node, dest, serialized)
             .await
         {
-            Ok(message_id) => Ok(message_id),
-            Err(error) => {
-                let Request::Message { data, .. } = message else {
-                    unreachable!()
-                };
-                Err(SendError::new(error.kind, error.message, data))
+            let Request::Message { data, .. } = message else {
+                unreachable!()
+            };
+            return Err(SendError::new(error.kind, error.message, data));
+        }
+
+        let response_result = if let Some(response_timeout) = response_timeout {
+            match tokio::time::timeout(response_timeout, self.await_response(message_id)).await {
+                Ok(result) => result.map_err(|error| {
+                    (
+                        SendErrorKind::UnexpectedResponse,
+                        format!("Remote delivery response disappeared: {error}"),
+                    )
+                }),
+                Err(_) => Err((
+                    SendErrorKind::ResponseTimeout,
+                    "Timed out waiting for remote mailbox admission".to_string(),
+                )),
             }
+        } else {
+            self.await_response(message_id).await.map_err(|error| {
+                (
+                    SendErrorKind::UnexpectedResponse,
+                    format!("Remote delivery response disappeared: {error}"),
+                )
+            })
+        };
+        let Request::Message { data, .. } = message else {
+            unreachable!()
+        };
+        match response_result {
+            Err((kind, error)) => Err(SendError::new(kind, error, data)),
+            Ok(ResponseContent::Sent) => Ok(message_id),
+            Ok(ResponseContent::Error(error)) => Err(remote_send_error(error, data)),
+            Ok(other) => Err(SendError::new(
+                SendErrorKind::UnexpectedResponse,
+                format!(
+                    "Remote delivery returned an unexpected {} response",
+                    other.kind()
+                ),
+                data,
+            )),
         }
     }
 
@@ -1114,17 +1306,115 @@ async fn registry_sync_worker(client: Client) -> ! {
     }
 }
 
-async fn registry_cleanup_worker(client: Client, mut cleanup_rx: Receiver<super::GlobalProcessId>) {
-    while let Some(global_pid) = cleanup_rx.recv().await {
-        if let Err(error) = client
-            .inner
-            .coordinator
-            .unregister_process_registrations(global_pid)
-            .await
-        {
-            log::warn!("Failed to coordinate registry cleanup for process {global_pid}: {error}");
+fn take_due_registry_cleanups(client: &Client, limit: usize) -> Vec<super::GlobalProcessId> {
+    let now = Instant::now();
+    let mut pending = client
+        .inner
+        .registry_cleanup_pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let available = limit.saturating_sub(pending.values().filter(|retry| retry.in_flight).count());
+    let mut due = Vec::with_capacity(available);
+    for (global_pid, retry) in pending.iter_mut() {
+        if due.len() >= available {
+            break;
         }
-        client.registry().unregister_process(global_pid);
+        if !retry.in_flight && retry.next_attempt <= now {
+            retry.in_flight = true;
+            due.push(*global_pid);
+        }
+    }
+    due
+}
+
+fn finish_registry_cleanup_attempt(
+    client: &Client,
+    global_pid: super::GlobalProcessId,
+    result: Result<Vec<ProcessName>>,
+) {
+    match result {
+        Ok(_) => {
+            // NotFound and OwnerChanged are terminal successes for this old
+            // owner too: the coordinator already proved that this process no
+            // longer owns the name.
+            client.registry().unregister_process(global_pid);
+            client
+                .inner
+                .registry_cleanup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&global_pid);
+        }
+        Err(error) => {
+            let mut pending = client
+                .inner
+                .registry_cleanup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(retry) = pending.get_mut(&global_pid) {
+                retry.in_flight = false;
+                retry.failures = retry.failures.saturating_add(1);
+                retry.next_attempt = Instant::now() + registry_cleanup_backoff(retry.failures);
+                log::warn!(
+                    "Failed to coordinate registry cleanup for process {global_pid}; retry {} scheduled: {error}",
+                    retry.failures
+                );
+            }
+            // Keep the global entry and reverse mapping until a terminal
+            // coordinator result. They are the bounded durable retry record.
+        }
+    }
+}
+
+async fn registry_cleanup_worker(client: Client, mut cleanup_rx: Receiver<super::GlobalProcessId>) {
+    let mut retry_tick = tokio::time::interval(REGISTRY_CLEANUP_RETRY_TICK);
+    retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut attempts = tokio::task::JoinSet::new();
+    loop {
+        for global_pid in take_due_registry_cleanups(&client, MAX_REGISTRY_CLEANUP_IN_FLIGHT) {
+            let attempt_client = client.clone();
+            attempts.spawn(async move {
+                let result = attempt_client
+                    .inner
+                    .coordinator
+                    .unregister_process_registrations(global_pid)
+                    .await;
+                (global_pid, result)
+            });
+        }
+
+        tokio::select! {
+            _ = retry_tick.tick() => {}
+            wake = cleanup_rx.recv() => {
+                if wake.is_none() && attempts.is_empty() {
+                    return;
+                }
+            }
+            Some(attempt) = attempts.join_next(), if !attempts.is_empty() => {
+                match attempt {
+                    Ok((global_pid, result)) => {
+                        finish_registry_cleanup_attempt(&client, global_pid, result);
+                    }
+                    Err(error) => {
+                        log::error!("Registry cleanup attempt task failed: {error}");
+                        // Coordinator futures are not expected to panic. If one does,
+                        // cancel the remaining batch before making every in-flight
+                        // marker retryable. This prevents overlapping duplicate attempts.
+                        attempts.abort_all();
+                        while attempts.join_next().await.is_some() {}
+                        let mut pending = client
+                            .inner
+                            .registry_cleanup_pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        for retry in pending.values_mut() {
+                            retry.in_flight = false;
+                            retry.next_attempt = Instant::now() + REGISTRY_CLEANUP_RETRY_TICK;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1178,9 +1468,7 @@ fn expire_responses(
             completed.push(*entry.key());
         } else {
             entry.0.set(ResponseContent::Error(
-                crate::distributed::message::ClientError::Unexpected(
-                    "Response timeout.".to_string(),
-                ),
+                crate::distributed::message::ClientError::ResponseTimeout,
             ));
         }
     }
@@ -1254,6 +1542,7 @@ mod tests {
                 responses: DashMap::new(),
                 response_tx,
                 registry_cleanup_tx,
+                registry_cleanup_pending: Mutex::new(HashMap::new()),
                 has_messages: Arc::new(Notify::new()),
                 outbound_budget: Arc::new(OutboundBudget::new(
                     limits.outbound.max_messages,
@@ -1268,6 +1557,38 @@ mod tests {
         };
         client.inner.coordinator.attach_client(&client);
         client
+    }
+
+    fn install_send_route(
+        client: &Client,
+        source_env: EnvironmentId,
+        source: ProcessId,
+        node: NodeId,
+    ) -> (Arc<AsyncMutex<()>>, tokio::sync::mpsc::Receiver<MessageCtx>) {
+        let (node_sender, node_receiver) = tokio::sync::mpsc::channel(OUTBOUND_NODE_QUEUE_CAPACITY);
+        let manager = tokio::spawn(async move {
+            let _node_receiver = node_receiver;
+            std::future::pending::<()>().await
+        });
+        client.inner.nodes_queues.insert(
+            node,
+            NodeQueue {
+                sender: node_sender,
+                manager: manager.abort_handle(),
+            },
+        );
+        let (process_sender, process_receiver) =
+            tokio::sync::mpsc::channel(OUTBOUND_PROCESS_QUEUE_CAPACITY);
+        let admission_gate = Arc::new(AsyncMutex::new(()));
+        client.inner.buf_tx.insert(
+            (source_env, source),
+            ProcessQueueSender {
+                generation: 1,
+                sender: process_sender,
+                admission_gate: admission_gate.clone(),
+            },
+        );
+        (admission_gate, process_receiver)
     }
 
     #[test]
@@ -1451,7 +1772,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_exit_hook_is_idempotent_and_releases_registry_ownership() {
+    async fn process_exit_hook_is_idempotent_and_retains_global_names_until_quorum_cleanup() {
         let client = test_client_without_workers();
         let owner = super::super::GlobalProcessId::new(1, 7, 9);
         client.registry().register_local("local", owner).unwrap();
@@ -1461,10 +1782,49 @@ mod tests {
         lunatic_process::env::ProcessExitHook::process_exited(registration.as_ref());
 
         assert!(client.registry().lookup_local("local").is_none());
-        assert!(client.registry().lookup_global("global").is_none());
-        assert_eq!(client.registry().usage().entries, 0);
+        assert_eq!(
+            client
+                .registry()
+                .lookup_global("global")
+                .unwrap()
+                .global_pid,
+            owner
+        );
+        assert!(client
+            .inner
+            .registry_cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&owner));
         lunatic_process::env::ProcessExitHook::process_exited(registration.as_ref());
+
+        finish_registry_cleanup_attempt(
+            &client,
+            owner,
+            Err(anyhow!("simulated registry partition")),
+        );
+        assert!(client.registry().lookup_global("global").is_some());
+        {
+            let mut pending = client
+                .inner
+                .registry_cleanup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let retry = pending.get_mut(&owner).unwrap();
+            assert_eq!(retry.failures, 1);
+            assert!(!retry.in_flight);
+            retry.next_attempt = Instant::now() - Duration::from_millis(1);
+        }
+        assert_eq!(take_due_registry_cleanups(&client, 1), vec![owner]);
+
+        finish_registry_cleanup_attempt(&client, owner, Ok(vec!["global".into()]));
         assert_eq!(client.registry().usage().entries, 0);
+        assert!(!client
+            .inner
+            .registry_cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&owner));
     }
 
     #[test]
@@ -1481,6 +1841,250 @@ mod tests {
         assert_eq!(recovered, b"recover me");
         assert_eq!(recovered.as_ptr(), original_ptr);
         assert_eq!(recovered.capacity(), original_capacity);
+    }
+
+    #[tokio::test]
+    async fn send_waiter_precedes_admission_and_remote_error_preserves_payload() {
+        let client = test_client_without_workers();
+        let source_env = EnvironmentId(5);
+        let target_env = EnvironmentId(8);
+        let source = ProcessId(6);
+        let node = NodeId(2);
+        let (admission_gate, process_receiver) =
+            install_send_route(&client, source_env, source, node);
+        let admission_guard = admission_gate.clone().lock_owned().await;
+
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(b"remote payload");
+        let original_ptr = data.as_ptr();
+        let original_capacity = data.capacity();
+        let sending_client = client.clone();
+        let send_task = tokio::spawn(async move {
+            sending_client
+                .send(SendParams {
+                    source_env,
+                    target_env,
+                    src: source,
+                    node,
+                    dest: ProcessId(9),
+                    tag: Some(10),
+                    data,
+                })
+                .await
+        });
+
+        let message_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(entry) = client.inner.responses.iter().next() {
+                    break *entry.key();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send must install its waiter before admission");
+        assert!(!send_task.is_finished());
+        assert!(deliver_response(
+            &client.inner.responses,
+            message_id,
+            ResponseContent::Error(message::ClientError::EnvironmentNotFound),
+        ));
+
+        drop(admission_guard);
+        let error = send_task
+            .await
+            .expect("send task must finish")
+            .expect_err("missing remote environment must fail delivery");
+        assert_eq!(error.kind(), SendErrorKind::EnvironmentNotFound);
+        let recovered = error.into_data();
+        assert_eq!(recovered, b"remote payload");
+        assert_eq!(recovered.as_ptr(), original_ptr);
+        assert_eq!(recovered.capacity(), original_capacity);
+        assert!(!client.inner.responses.contains_key(&message_id));
+
+        drop(process_receiver);
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn send_uses_target_environment_and_waits_for_sent_ack() {
+        let client = test_client_without_workers();
+        let source_env = EnvironmentId(5);
+        let target_env = EnvironmentId(8);
+        let source = ProcessId(6);
+        let node = NodeId(2);
+        let (_admission_gate, mut process_receiver) =
+            install_send_route(&client, source_env, source, node);
+        let sending_client = client.clone();
+        let send_task = tokio::spawn(async move {
+            sending_client
+                .send(SendParams {
+                    source_env,
+                    target_env,
+                    src: source,
+                    node,
+                    dest: ProcessId(9),
+                    tag: Some(10),
+                    data: b"mailbox data".to_vec(),
+                })
+                .await
+        });
+
+        let queued = tokio::time::timeout(Duration::from_secs(1), process_receiver.recv())
+            .await
+            .expect("message admission must complete")
+            .expect("process queue must remain open");
+        let request: Request = message::deserialize_message(&queued.data).unwrap();
+        assert!(matches!(
+            request,
+            Request::Message {
+                environment_id: 8,
+                process_id: 9,
+                ..
+            }
+        ));
+        assert!(!send_task.is_finished());
+        assert!(deliver_response(
+            &client.inner.responses,
+            queued.message_id,
+            ResponseContent::Sent,
+        ));
+        let delivered = send_task
+            .await
+            .expect("send task must finish")
+            .expect("Sent acknowledgement must complete delivery");
+        assert_eq!(delivered, queued.message_id);
+        assert!(!client.inner.responses.contains_key(&delivered));
+
+        drop(queued);
+        drop(process_receiver);
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn send_timeout_and_unexpected_response_are_typed_and_remove_waiters() {
+        for (response, expected_kind) in [
+            (
+                ResponseContent::Error(message::ClientError::ResponseTimeout),
+                SendErrorKind::ResponseTimeout,
+            ),
+            (
+                ResponseContent::Spawned(99),
+                SendErrorKind::UnexpectedResponse,
+            ),
+        ] {
+            let client = test_client_without_workers();
+            let source_env = EnvironmentId(5);
+            let source = ProcessId(6);
+            let node = NodeId(2);
+            let (_admission_gate, mut process_receiver) =
+                install_send_route(&client, source_env, source, node);
+            let sending_client = client.clone();
+            let send_task = tokio::spawn(async move {
+                sending_client
+                    .send(SendParams {
+                        source_env,
+                        target_env: EnvironmentId(8),
+                        src: source,
+                        node,
+                        dest: ProcessId(9),
+                        tag: None,
+                        data: vec![1, 2, 3],
+                    })
+                    .await
+            });
+            let queued = process_receiver.recv().await.unwrap();
+            let message_id = queued.message_id;
+            assert!(deliver_response(
+                &client.inner.responses,
+                message_id,
+                response,
+            ));
+            let error = send_task.await.unwrap().expect_err("delivery must fail");
+            assert_eq!(error.kind(), expected_kind);
+            assert_eq!(error.into_data(), vec![1, 2, 3]);
+            assert!(!client.inner.responses.contains_key(&message_id));
+            drop(queued);
+            drop(process_receiver);
+            assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_send_timeout_returns_payload_and_removes_waiter() {
+        let client = test_client_without_workers();
+        let source_env = EnvironmentId(5);
+        let source = ProcessId(6);
+        let node = NodeId(2);
+        let (_admission_gate, mut process_receiver) =
+            install_send_route(&client, source_env, source, node);
+        let error = client
+            .send_with_timeout(
+                SendParams {
+                    source_env,
+                    target_env: EnvironmentId(8),
+                    src: source,
+                    node,
+                    dest: ProcessId(9),
+                    tag: None,
+                    data: vec![1, 2, 3],
+                },
+                Duration::from_millis(10),
+            )
+            .await
+            .expect_err("missing acknowledgement must time out");
+        assert_eq!(error.kind(), SendErrorKind::ResponseTimeout);
+        assert_eq!(error.into_data(), vec![1, 2, 3]);
+        assert!(client.inner.responses.is_empty());
+
+        let queued = process_receiver
+            .try_recv()
+            .expect("timed-out delivery was admitted locally");
+        drop(queued);
+        drop(process_receiver);
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn cancelling_send_removes_waiter_and_releases_outbound_budget() {
+        let client = test_client_without_workers();
+        let source_env = EnvironmentId(5);
+        let source = ProcessId(6);
+        let node = NodeId(2);
+        let (admission_gate, process_receiver) =
+            install_send_route(&client, source_env, source, node);
+        let admission_guard = admission_gate.clone().lock_owned().await;
+        let sending_client = client.clone();
+        let send_task = tokio::spawn(async move {
+            sending_client
+                .send(SendParams {
+                    source_env,
+                    target_env: EnvironmentId(8),
+                    src: source,
+                    node,
+                    dest: ProcessId(9),
+                    tag: None,
+                    data: vec![1, 2, 3],
+                })
+                .await
+        });
+        let message_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(entry) = client.inner.responses.iter().next() {
+                    break *entry.key();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("send must install its waiter");
+
+        send_task.abort();
+        let _ = send_task.await;
+        assert!(!client.inner.responses.contains_key(&message_id));
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
+        drop(admission_guard);
+        drop(process_receiver);
     }
 
     #[tokio::test]
@@ -1548,6 +2152,50 @@ mod tests {
             Err(TryRecvError::Disconnected)
         ));
         assert_eq!(usage.current_usage(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn new_message_retries_a_generation_retired_during_admission() {
+        let client = test_client_without_workers();
+        let env = EnvironmentId(7);
+        let source = ProcessId(11);
+        let node = NodeId(2);
+        let (admission_gate, old_receiver) = install_send_route(&client, env, source, node);
+        let cleanup_guard = admission_gate.clone().lock_owned().await;
+        let sending_client = client.clone();
+        let send_task = tokio::spawn(async move {
+            sending_client
+                .new_message(
+                    MessageId(9),
+                    env,
+                    source,
+                    node,
+                    ProcessId(13),
+                    vec![1, 2, 3],
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(client.inner.buf_tx.remove(&(env, source)).is_some());
+        drop(cleanup_guard);
+        let admitted = tokio::time::timeout(Duration::from_secs(1), send_task)
+            .await
+            .expect("benign queue retirement must be retried")
+            .unwrap()
+            .unwrap();
+        assert_eq!(admitted, MessageId(9));
+
+        let env_queue = client.inner.buf_rx.get(&env).unwrap();
+        let receiver = env_queue.get(&source).unwrap();
+        assert_ne!(receiver.generation, 1);
+        let queued = receiver.receiver.write().await.try_recv().unwrap();
+        drop(receiver);
+        drop(env_queue);
+        drop(queued);
+        drop(old_receiver);
+        client.remove_process_resources(env, source);
+        assert_eq!(client.inner.outbound_budget.current_usage(), (0, 0));
     }
 
     #[tokio::test]

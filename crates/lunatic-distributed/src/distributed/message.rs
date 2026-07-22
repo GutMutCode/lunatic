@@ -41,13 +41,20 @@ pub struct Spawn {
     pub config: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClientError {
     Unexpected(String),
     Connection(String),
     NodeNotFound,
     ModuleNotFound,
     ProcessNotFound,
+    // Keep new variants at the end so the MessagePack discriminants of the
+    // existing protocol variants remain stable.
+    EnvironmentNotFound,
+    DeliveryBackpressure(String),
+    DeliveryTooLarge(String),
+    DeliveryRejected(String),
+    ResponseTimeout,
 }
 
 impl Default for ClientError {
@@ -56,13 +63,13 @@ impl Default for ClientError {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Response {
     pub message_id: u64,
     pub content: ResponseContent,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseContent {
     Spawned(u64),
     Sent,
@@ -70,14 +77,20 @@ pub enum ResponseContent {
     Error(ClientError),
 }
 
+impl ResponseContent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Spawned(_) => "Spawned",
+            Self::Sent => "Sent",
+            Self::Linked => "Linked",
+            Self::Error(_) => "Error",
+        }
+    }
+}
+
 impl Response {
     pub fn kind(&self) -> &'static str {
-        match self.content {
-            ResponseContent::Spawned(_) => "Spawned",
-            ResponseContent::Sent => "Sent",
-            ResponseContent::Linked => "Linked",
-            ResponseContent::Error(_) => "Error",
-        }
+        self.content.kind()
     }
 }
 

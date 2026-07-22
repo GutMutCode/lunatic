@@ -46,7 +46,7 @@ lunatic-messaging-api = { workspace = true }
 lunatic-networking-api = { workspace = true }
 lunatic-process = { workspace = true }
 lunatic-process-api = { workspace = true }
-lunatic-registry-api = { workspace = true }
+lunatic-registry-api = { workspace = true, features = ["distributed"] }
 lunatic-stdout-capture = { workspace = true }
 lunatic-timer-api = { workspace = true }
 lunatic-version-api = { workspace = true }
@@ -83,6 +83,7 @@ notify = "6.1"
 criterion = { version = "0.4", features = ["async_tokio"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
 quinn = { workspace = true }
+rcgen = { workspace = true }
 wat = "1.0"
 rmp-serde = "1.1"
 

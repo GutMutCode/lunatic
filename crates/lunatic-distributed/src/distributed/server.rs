@@ -11,7 +11,7 @@ use lunatic_process::{
     env::{Environment, Environments, ProcessLimitReached},
     message::{DataMessage, Message},
     runtimes::{wasmtime::WasmtimeRuntime, Modules, RawWasm},
-    state::ProcessState,
+    state::{ProcessState, SignalSendErrorKind},
     Signal,
 };
 use rcgen::{CertificateParams, DnType};
@@ -546,29 +546,101 @@ where
         + 'static,
     E: Environment,
 {
-    let env = ctx.envs.get(environment_id).await;
+    deliver_process_message(ctx.envs.as_ref(), environment_id, process_id, tag, data).await
+}
+
+async fn deliver_process_message<E: Environment>(
+    envs: &dyn Environments<Env = E>,
+    environment_id: u64,
+    process_id: u64,
+    tag: Option<i64>,
+    data: Vec<u8>,
+) -> std::result::Result<(), ClientError> {
+    let env = envs.get(environment_id).await;
     if let Some(env) = env {
         if let Some(proc) = env.get_process(process_id) {
             proc.send(Signal::Message(Message::Data(DataMessage::new_from_vec(
                 tag, data,
             ))))
-            .map_err(|error| ClientError::Unexpected(error.to_string()))?;
+            .map_err(|error| match error.kind() {
+                SignalSendErrorKind::Closed => ClientError::ProcessNotFound,
+                SignalSendErrorKind::MailboxFull | SignalSendErrorKind::QueueFull => {
+                    ClientError::DeliveryBackpressure(error.to_string())
+                }
+                SignalSendErrorKind::MessageTooLarge => {
+                    ClientError::DeliveryTooLarge(error.to_string())
+                }
+                SignalSendErrorKind::TooManyMessageResources => {
+                    ClientError::DeliveryRejected(error.to_string())
+                }
+            })?;
         } else {
             return Err(ClientError::ProcessNotFound);
         }
         Ok(())
     } else {
-        Err(ClientError::ProcessNotFound)
+        Err(ClientError::EnvironmentNotFound)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use lunatic_common_api::{AuditReason, AuditResult};
-    use lunatic_process::{config::ProcessConfig, env::ProcessLimitReached};
+    use lunatic_process::{
+        config::ProcessConfig,
+        env::{Environment, Environments, LunaticEnvironments, ProcessLimitReached},
+        state::SignalSendError,
+        Process, Signal,
+    };
     use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
 
-    use super::{classify_spawn_error, decode_distributed_config, request_authorization_event};
+    use super::{
+        classify_spawn_error, decode_distributed_config, deliver_process_message,
+        request_authorization_event, ClientError,
+    };
+
+    #[derive(Clone, Copy)]
+    enum DeliveryBehavior {
+        Accept,
+        Closed,
+        Backpressure,
+        TooLarge,
+        Rejected,
+    }
+
+    struct DeliveryProcess {
+        id: u64,
+        behavior: DeliveryBehavior,
+    }
+
+    impl Process for DeliveryProcess {
+        fn id(&self) -> u64 {
+            self.id
+        }
+
+        fn send(&self, signal: Signal) -> std::result::Result<(), SignalSendError> {
+            match self.behavior {
+                DeliveryBehavior::Accept => Ok(()),
+                DeliveryBehavior::Closed => Err(SignalSendError::Closed(signal)),
+                DeliveryBehavior::Backpressure => Err(SignalSendError::MailboxFull(signal)),
+                DeliveryBehavior::TooLarge => Err(SignalSendError::MessageTooLarge {
+                    signal,
+                    actual: 2,
+                    max: 1,
+                }),
+                DeliveryBehavior::Rejected => Err(SignalSendError::TooManyMessageResources {
+                    signal,
+                    actual: 2,
+                    max: 1,
+                }),
+            }
+        }
+    }
+
+    fn delivery_process(id: u64, behavior: DeliveryBehavior) -> Arc<dyn Process> {
+        Arc::new(DeliveryProcess { id, behavior })
+    }
 
     #[test]
     fn atomic_process_admission_failure_is_a_resource_denial() {
@@ -581,6 +653,59 @@ mod tests {
             classify_spawn_error(&anyhow::anyhow!("runtime failure")),
             (AuditResult::Failed, AuditReason::RuntimeFailure)
         );
+    }
+
+    #[tokio::test]
+    async fn delivery_distinguishes_missing_environment_and_process() {
+        let environments = LunaticEnvironments::default();
+        assert_eq!(
+            deliver_process_message(&environments, 7, 11, None, vec![]).await,
+            Err(ClientError::EnvironmentNotFound)
+        );
+
+        environments.create(7).await.unwrap();
+        assert_eq!(
+            deliver_process_message(&environments, 7, 11, None, vec![]).await,
+            Err(ClientError::ProcessNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_maps_receiver_admission_failures_to_wire_errors() {
+        let environments = LunaticEnvironments::default();
+        let environment = environments.create(7).await.unwrap();
+        for (process_id, behavior) in [
+            (1, DeliveryBehavior::Accept),
+            (2, DeliveryBehavior::Closed),
+            (3, DeliveryBehavior::Backpressure),
+            (4, DeliveryBehavior::TooLarge),
+            (5, DeliveryBehavior::Rejected),
+        ] {
+            environment
+                .add_process(process_id, delivery_process(process_id, behavior))
+                .unwrap();
+        }
+
+        assert_eq!(
+            deliver_process_message(&environments, 7, 1, Some(9), vec![1]).await,
+            Ok(())
+        );
+        assert_eq!(
+            deliver_process_message(&environments, 7, 2, None, vec![]).await,
+            Err(ClientError::ProcessNotFound)
+        );
+        assert!(matches!(
+            deliver_process_message(&environments, 7, 3, None, vec![]).await,
+            Err(ClientError::DeliveryBackpressure(_))
+        ));
+        assert!(matches!(
+            deliver_process_message(&environments, 7, 4, None, vec![]).await,
+            Err(ClientError::DeliveryTooLarge(_))
+        ));
+        assert!(matches!(
+            deliver_process_message(&environments, 7, 5, None, vec![]).await,
+            Err(ClientError::DeliveryRejected(_))
+        ));
     }
 
     #[test]

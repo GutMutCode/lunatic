@@ -16,7 +16,7 @@ Use these evidence classes when reporting results:
 - **Transport-boundary benchmark** — real transport through decode/dispatch, stopping before a live destination process.
 - **Production E2E benchmark** — public/runtime entry point through a live outcome, including acknowledgement and failure behavior.
 
-The current suite contains microbenchmark, component-harness, probe/projection, and transport-boundary evidence. It does not yet contain production E2E coverage for live hot reload or process messaging.
+The current suite contains microbenchmark, component-harness, probe/projection, transport-boundary, and production E2E evidence. The production E2E coverage is currently limited to distributed registry lookup and live native-process mailbox delivery; live hot reload and guest-Wasm messaging still lack production E2E benchmarks.
 
 Historical numeric results in the companion documents are from 2025-10-06. They have no recorded commit or exact hardware/toolchain profile and therefore are not a reproducible current baseline.
 
@@ -31,7 +31,9 @@ Historical numeric results in the companion documents are from 2025-10-06. They 
 | `memory_profile.rs` | Probe/projection | Rust type sizes, example memory snapshot, up to 100 state constructions | No RSS/reachable-heap measurement or large-scale live process run |
 | `instance_pool.rs` | Component harness | Pool acquire/release and hit/miss behavior | Does not establish whole-process spawn behavior under production load |
 | `distributed_messaging.rs` | Micro + transport boundary | Encode/decode and real loopback mTLS QUIC framing/reassembly/dispatch | Stops at decoded callback; no registry-to-live-mailbox delivery |
-| `distributed_latency.rs` | Component/transport boundary | Control-plane node lookup | No remote guest process lifecycle or data-plane message round trip |
+| `distributed_latency.rs` | Component + production E2E | Control-plane node lookup; global registry lookup followed by a confirmed two-node mTLS QUIC request/reply through live Lunatic native-process mailboxes | Cluster creation, quorum registration, and connection warm-up are outside measurement; no guest-Wasm host-call boundary |
+
+`distributed_registry_live_mailbox_round_trip` is the production-path measurement. Its persistent two-node harness resolves the live echo process from the global registry on node 1, sends through the production distributed client and full node server to node 2, receives the request in a real Lunatic mailbox, sends a confirmed reply, and observes that reply in a live node-1 mailbox. By contrast, `distributed_quic_message_dispatch_2kb` in `distributed_messaging.rs` deliberately stops at the decoded callback boundary and is transport-boundary evidence only.
 
 ## Quick Start
 
@@ -86,7 +88,7 @@ The script checks configured absolute upper bounds for specific Criterion labels
 
 The `spawn process` guard is calibrated to the Wasmtime 46 hosted-Linux baseline recorded on 2026-07-21 at commit `100767b` ([Actions run 29803866397](https://github.com/GutMutCode/lunatic/actions/runs/29803866397)): a 53.827µs Criterion upper bound, with a warning above 60µs and a hard failure above 75µs. The margin provides headroom for shared-runner variance while still detecting a material regression. These CI limits do not replace the separate aspirational `<10µs` product target.
 
-Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete.
+Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete. The live-mailbox threshold likewise covers only its fixed two-node native-process fixture, not the guest-Wasm boundary or broader production readiness.
 
 ## Adding or Changing a Benchmark
 
@@ -139,7 +141,7 @@ The suite still needs:
 
 1. A live running-Wasm `Signal::HotReload` benchmark that asserts interruption, state transition, acknowledgement, commit, failure, and rollback.
 2. A local guest sender-to-live-guest receiver benchmark with serialization, scheduling, bounded-mailbox pressure, and tail latency.
-3. A distributed guest round trip through registry lookup, routing, mTLS QUIC, destination mailbox, and reply.
+3. A distributed guest-Wasm round trip through registry lookup, host calls, routing, mTLS QUIC, destination mailbox, and reply. The native-process production-path benchmark does not include the guest host-call boundary.
 4. Actual process RSS/reachable-heap measurement under idle and loaded states.
 5. Increasing-count scale tests and sustained soak tests with resource usage, queue depth, latency percentiles, failures, and recovery.
 6. Supervisor/link failure and resource-limit overhead benchmarks on their production paths.

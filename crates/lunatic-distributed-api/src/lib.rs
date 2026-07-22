@@ -1,4 +1,8 @@
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Result};
 use asn1_rs::ToDer;
@@ -622,6 +626,20 @@ where
                         "Process does not exist.".to_string(),
                         AuditReason::NotFound,
                     ),
+                    ClientError::EnvironmentNotFound => (
+                        4,
+                        "Environment does not exist.".to_string(),
+                        AuditReason::NotFound,
+                    ),
+                    ClientError::DeliveryBackpressure(cause) => {
+                        (3, cause, AuditReason::ResourceLimit)
+                    }
+                    ClientError::DeliveryTooLarge(cause) | ClientError::DeliveryRejected(cause) => {
+                        (3, cause, AuditReason::InvalidInput)
+                    }
+                    ClientError::ResponseTimeout => {
+                        (9027, "Response timeout.".to_string(), AuditReason::TimedOut)
+                    }
                 };
                 audit.finish(AuditResult::Failed, reason);
                 Ok((caller.data_mut().add_error_resource(anyhow!(message)), code))
@@ -643,7 +661,8 @@ where
 
 // Sends the message in scratch area to a process running on a node with id `node_id`.
 //
-// There are no guarantees that the message will be received.
+// Success means that the destination accepted the message into its bounded
+// signal/mailbox ingress. It does not mean that guest code has processed it.
 //
 // Returns:
 // * 0      If message sent
@@ -657,10 +676,17 @@ where
 fn distributed_send_error_status(kind: SendErrorKind) -> u32 {
     match kind {
         SendErrorKind::NodeNotFound => 2,
+        SendErrorKind::EnvironmentNotFound | SendErrorKind::ProcessNotFound => 1,
         SendErrorKind::Backpressure
         | SendErrorKind::MessageTooLarge
         | SendErrorKind::QueueClosed
-        | SendErrorKind::Serialization => 9027,
+        | SendErrorKind::Serialization
+        | SendErrorKind::RemoteBackpressure
+        | SendErrorKind::RemoteMessageTooLarge
+        | SendErrorKind::RemoteRejected
+        | SendErrorKind::Connection
+        | SendErrorKind::ResponseTimeout
+        | SendErrorKind::UnexpectedResponse => 9027,
     }
 }
 
@@ -719,7 +745,8 @@ where
         let data = std::mem::take(&mut data_message.buffer);
         let tag = data_message.tag;
         let send_params = SendParams {
-            env,
+            source_env: env,
+            target_env: env,
             src,
             node: NodeId(node_id),
             dest: ProcessId(process_id),
@@ -819,14 +846,23 @@ where
         let data = std::mem::take(&mut data_message.buffer);
         let tag = data_message.tag;
         let send_params = SendParams {
-            env,
+            source_env: env,
+            target_env: env,
             src,
             node: NodeId(node_id),
             dest: ProcessId(process_id),
             tag,
             data,
         };
-        if let Err(error) = node_client.send(send_params).await {
+        let wait_started = Instant::now();
+        let send_result = if timeout_duration == u64::MAX {
+            node_client.send(send_params).await
+        } else {
+            node_client
+                .send_with_timeout(send_params, Duration::from_millis(timeout_duration))
+                .await
+        };
+        if let Err(error) = send_result {
             let status = distributed_send_error_status(error.kind());
             data_message.buffer = error.into_data();
             caller
@@ -841,8 +877,14 @@ where
         if let Ok(message) = match timeout_duration {
             // Without timeout
             u64::MAX => Ok(pop_skip_search.await),
-            // With timeout
-            t => timeout(Duration::from_millis(t), pop_skip_search).await,
+            // Delivery acknowledgement and reply share one caller budget.
+            t => {
+                timeout(
+                    Duration::from_millis(t).saturating_sub(wait_started.elapsed()),
+                    pop_skip_search,
+                )
+                .await
+            }
         } {
             // Put the message into the scratch area
             caller.data_mut().message_scratch_area().replace(message);
@@ -874,4 +916,36 @@ where
     E: Environment,
 {
     caller.data().module_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::distributed_send_error_status;
+    use lunatic_distributed::distributed::client::SendErrorKind;
+
+    #[test]
+    fn delivery_error_status_preserves_the_existing_guest_abi() {
+        assert_eq!(
+            distributed_send_error_status(SendErrorKind::EnvironmentNotFound),
+            1
+        );
+        assert_eq!(
+            distributed_send_error_status(SendErrorKind::ProcessNotFound),
+            1
+        );
+        assert_eq!(
+            distributed_send_error_status(SendErrorKind::NodeNotFound),
+            2
+        );
+        for kind in [
+            SendErrorKind::RemoteBackpressure,
+            SendErrorKind::RemoteMessageTooLarge,
+            SendErrorKind::RemoteRejected,
+            SendErrorKind::Connection,
+            SendErrorKind::ResponseTimeout,
+            SendErrorKind::UnexpectedResponse,
+        ] {
+            assert_eq!(distributed_send_error_status(kind), 9027);
+        }
+    }
 }

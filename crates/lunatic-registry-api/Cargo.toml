@@ -9,9 +9,11 @@ license = "Apache-2.0 OR MIT"
 
 [features]
 metrics = ["dep:metrics"]
+distributed = ["dep:lunatic-distributed"]
 
 [dependencies]
 lunatic-common-api = { workspace = true }
+lunatic-distributed = { workspace = true, optional = true }
 lunatic-process = { workspace = true }
 lunatic-process-api = { workspace = true }
 

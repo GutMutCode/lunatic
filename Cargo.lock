@@ -2353,6 +2353,7 @@ version = "0.13.2"
 dependencies = [
  "anyhow",
  "lunatic-common-api",
+ "lunatic-distributed",
  "lunatic-process",
  "lunatic-process-api",
  "metrics",
@@ -2395,6 +2396,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "notify",
  "quinn",
+ "rcgen",
  "regex",
  "reqwest",
  "rmp-serde",

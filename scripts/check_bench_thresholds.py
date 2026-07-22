@@ -69,6 +69,13 @@ BENCHES: Dict[str, BenchConfig] = {
                 threshold_us=30_000.0,
                 warn_us=15_000.0,
             ),
+            # This is the full two-node registry -> mTLS QUIC -> live mailbox
+            # -> reply path. Keep generous hosted-runner headroom while still
+            # detecting a material order-of-magnitude regression.
+            "distributed_registry_live_mailbox_round_trip": BenchTarget(
+                threshold_us=100_000.0,
+                warn_us=50_000.0,
+            ),
         },
     ),
 }

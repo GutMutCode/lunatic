@@ -1,8 +1,8 @@
 # Core Values Compliance Status
 
-Reviewed: 2026-07-21
+Reviewed: 2026-07-22
 
-Reviewed working tree based on: `f9b97a10d7e6d2a9666b50a7dd2ec671fb9a6853` plus the reviewed working-tree changes for Hanary #1663
+Reviewed working tree based on: `c11061cc4c0ab6158a792c7019eac6dfdc4f6d87` plus the reviewed working-tree changes for Hanary #1664
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -17,7 +17,7 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 
 | Focus | Status | Current evidence boundary |
 | --- | --- | --- |
-| Fast | Partial | Wasmtime preemption primitives and live process-local hot reload are production-path tested. Hot-reload latency and end-to-end local/remote process delivery are not benchmarked. |
+| Fast | Partial | Wasmtime preemption primitives and live process-local hot reload are production-path tested. A two-node registry-to-live-native-mailbox round trip is benchmarked; hot-reload latency and guest-host-call messaging latency are not. |
 | Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and acknowledged atomic reload/rollback/in-doubt behavior are production-path tested. Cross-node recovery remains incomplete. |
 | Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
@@ -57,11 +57,12 @@ missing.
   `tests/live_hot_reload.rs` exercises this through running Wasm processes.
 - Instance-pool and component microbenchmarks provide useful local regression signals.
 - The distributed QUIC benchmark uses real loopback mTLS, production framing, reassembly, MessagePack decoding, and the request-dispatch boundary.
+- The distributed latency suite also measures a persistent two-node production path from global-registry lookup through confirmed QUIC delivery into a live native-process mailbox and a confirmed live-mailbox reply (`benches/distributed_latency.rs`).
 
 ### Boundary
 
 - The mailbox benchmark measures local mailbox operations, not a sender-to-live-receiver process round trip.
-- The distributed benchmark stops at decoded request dispatch; it does not deliver into a live guest mailbox or cover discovery, multiple hosts, or partitions.
+- The `distributed_messaging` transport benchmark stops at decoded request dispatch. The live-mailbox benchmark reaches real processes but does not include guest-Wasm host calls, multi-host deployment, or partitions in its timed fixture.
 - Historical spawn, mailbox, and component-reload measurements do not establish current production latency guarantees.
 - Each independently constructed Wasmtime engine has an epoch ticker, but live-reload latency and scheduler fairness have not been benchmarked under sustained load.
 - Reload cancels the current Wasmtime call and re-enters the same export on the replacement module. It preserves compatible linear memory and host-owned state, not the interrupted instruction pointer, native stack, private globals, or tables; modules therefore need a compatible entrypoint-reentry contract.
@@ -110,13 +111,15 @@ missing.
 - Process links and monitors, snapshot/signature components, and reload coordination structures exist.
 - `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one monitor notification, removal-before-notification ordering, and native-runner parity.
 - Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, and resynchronization (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- `tests/distributed_registry_e2e.rs` runs two actual Wasm guests on two full node servers. It covers guest registration and replica lookup, confirmed request/reply through live cross-node mailboxes, missing environment/process errors, explicit removal, cross-environment fail-closed lookup, and owner-exit cleanup on both replicas.
+- Confirmed sends correlate `Sent`/typed error responses before reporting success, preserve bounded waiter/outbound accounting on timeout or cancellation, and distinguish missing environments, missing processes, receiver backpressure, and oversized/rejected delivery. Owner cleanup retains a bounded retry record with backoff until quorum coordination succeeds.
 - Production QUIC framing has a multi-chunk transport test (`crates/lunatic-distributed/tests/quic_transport.rs`).
 
 ### Boundary
 
 - Process-local reload re-enters the guest entrypoint rather than continuing the interrupted instruction stream. Acknowledged commit/rollback is implemented for the local environment, but it does not establish instruction-level continuation, cross-node coordination, or broad zero-downtime guarantees. Cross-node failure propagation remains outside the local link/monitor evidence.
-- Registry coordination is real, and cleanup helpers exist, but guest name lookup, automatic process/node-lifecycle-triggered ownership cleanup, and live cross-node process-mailbox delivery are not connected and tested together.
-- Cross-node process failure, reload, rollback, and message recovery have no production-path E2E test.
+- Guest registry reads use the local replica and are eventually consistent during partitions. The legacy `(node, process)` ABI deliberately hides registrations from another environment; cross-environment delivery needs an environment-aware guest handle/API.
+- Healthy owner exit is guest-E2E tested, and cleanup retry/partition mechanics are component-tested, but owner exit during a live partition has no combined guest E2E. Cross-node process failure propagation, reload, rollback, and message recovery remain unverified.
 
 ## 5. Asynchronous by Default
 
@@ -154,7 +157,7 @@ missing.
 | `cargo test --all` | Current unit and integration contracts exercised by the repository | Untested production paths, performance, scale, or multi-host behavior |
 | `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and monitor semantics | Cross-node links, Supervisor event intake, or every possible host-future suspension point |
 | `cargo test -p lunatic-otp-patterns` | Host-side OTP component and process integration behavior | Guest-Wasm adapters, automatic Supervisor monitor intake, GenStatem/GenEvent runtime integration |
-| Registry/QUIC integration tests | Real localhost mTLS transport, framing, and registry quorum behavior | Guest lookup-to-mailbox delivery, cross-host operations, distributed process recovery |
+| Registry/QUIC + guest integration tests | Real localhost mTLS transport, framing, quorum behavior, two actual Wasm guest lookup-to-mailbox request/reply, typed missing-target errors, and owner cleanup | Cross-host deployment, cross-environment handles, partitioned guest owner exit, distributed process recovery |
 | Criterion mailbox benchmark | Local queue-operation cost for its configured workload | End-to-end process message latency or backpressure |
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
 | Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
@@ -175,7 +178,7 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 
 1. Add an operator-selectable required/fail-closed durable audit sink and health endpoint, then extend the typed inventory to any remaining privileged host boundaries.
 2. Bind each authenticated transport peer to its numeric node ID and reject mismatched claims; then add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
-3. Connect guest registry lookup to live cross-node mailbox delivery and ownership cleanup.
+3. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
 4. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
 5. Connect Supervisor monitor intake and OTP guest/runtime adapters.
 6. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.

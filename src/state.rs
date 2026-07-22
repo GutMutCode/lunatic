@@ -526,7 +526,7 @@ impl ProcessState for DefaultProcessState {
         lunatic_version_api::register(linker)?;
         lunatic_wasi_api::register(linker)?;
         lunatic_wasi_api::register_checked(linker)?;
-        lunatic_registry_api::register(linker)?;
+        lunatic_registry_api::register_distributed::<Self, LunaticEnvironment>(linker)?;
         lunatic_distributed_api::register(linker)?;
         lunatic_sqlite_api::register(linker)?;
         #[cfg(feature = "metrics")]
