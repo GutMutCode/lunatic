@@ -270,6 +270,7 @@ jobs:
       - name: "Run benchmarks (baseline check)"
         if: runner.os == 'Linux'
         run: |
+          set -o pipefail
           cargo bench --bench spawn --no-fail-fast -- --output-format bencher | tee benchmark_output.txt
           cargo bench --bench mailbox --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           cargo bench --bench hot_reload --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt

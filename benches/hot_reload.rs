@@ -11,12 +11,11 @@ use tokio::sync::RwLock;
 
 fn bench_hot_reload_end_to_end(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
+    let wasmtime_config = default_config();
+    let runtime = rt.block_on(async { WasmtimeRuntime::new(&wasmtime_config).unwrap() });
 
     c.bench_function("hot_reload_module_compilation", |b| {
         b.iter(|| {
-            let wasmtime_config = default_config();
-            let runtime = rt.block_on(async { WasmtimeRuntime::new(&wasmtime_config).unwrap() });
-
             let start = Instant::now();
             let raw_module = wat::parse_file("./examples/counter_v1.wat").unwrap();
             let _module = runtime

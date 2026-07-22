@@ -7,6 +7,9 @@ use lunatic_process::runtimes::wasmtime::{default_config, WasmtimeRuntime};
 use lunatic_runtime::{state::DefaultProcessState, DefaultProcessConfig};
 use tokio::sync::RwLock;
 
+const INSTANCE_POOL_WAT: &str =
+    r#"(module (memory (export "memory") 1) (func (export "hello") nop))"#;
+
 fn bench_instance_pool_acquire_release(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -14,7 +17,7 @@ fn bench_instance_pool_acquire_release(c: &mut Criterion) {
     let wasmtime_config = default_config();
     let runtime = rt.block_on(async { WasmtimeRuntime::new(&wasmtime_config).unwrap() });
 
-    let raw_module = wat::parse_file("./wat/hello.wat").unwrap();
+    let raw_module = wat::parse_str(INSTANCE_POOL_WAT).unwrap();
     let module = Arc::new(
         runtime
             .compile_module::<DefaultProcessState>(raw_module.into())
@@ -67,7 +70,7 @@ fn bench_instance_pool_cold_path(c: &mut Criterion) {
     let wasmtime_config = default_config();
     let runtime = rt.block_on(async { WasmtimeRuntime::new(&wasmtime_config).unwrap() });
 
-    let raw_module = wat::parse_file("./wat/hello.wat").unwrap();
+    let raw_module = wat::parse_str(INSTANCE_POOL_WAT).unwrap();
     let module = Arc::new(
         runtime
             .compile_module::<DefaultProcessState>(raw_module.into())
@@ -102,7 +105,7 @@ fn bench_instance_pool_hit_rate(c: &mut Criterion) {
     let config = Arc::new(DefaultProcessConfig::default());
     let wasmtime_config = default_config();
     let runtime = rt.block_on(async { WasmtimeRuntime::new(&wasmtime_config).unwrap() });
-    let raw_module = wat::parse_file("./wat/hello.wat").unwrap();
+    let raw_module = wat::parse_str(INSTANCE_POOL_WAT).unwrap();
     let module = Arc::new(
         runtime
             .compile_module::<DefaultProcessState>(raw_module.into())

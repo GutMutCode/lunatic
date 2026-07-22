@@ -227,6 +227,7 @@ async fn concurrent_named_spawn_has_one_winner_and_does_not_initialize_the_loser
     };
 
     assert!(loser.to_string().contains("already registered locally"));
+    assert_eq!(winner.call(Call::Get).unwrap().0, 0);
     assert_eq!(COUNTING_SERVER_INITS.load(Ordering::SeqCst), 1);
     assert_eq!(
         runtime.whereis("contended-counter"),

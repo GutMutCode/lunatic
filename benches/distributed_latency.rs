@@ -43,6 +43,13 @@ use uuid::Uuid;
 const BENCH_ENVIRONMENT_ID: u64 = 1;
 const REGISTRY_NAME: &str = "benchmark-live-mailbox";
 const ROUND_TRIP_TAG: i64 = 7;
+// The production replay cache retains completed message IDs for 180 seconds and
+// admits 16,384 entries per node. Keep this correctness-oriented live benchmark
+// short enough that Criterion cannot turn one run into a replay-cache soak test.
+// At the observed 70-130 us round-trip range this window uses roughly 1,000
+// entries, while still collecting hundreds of real production-path samples.
+const LIVE_MAILBOX_WARM_UP: Duration = Duration::from_millis(10);
+const LIVE_MAILBOX_MEASUREMENT: Duration = Duration::from_millis(50);
 
 fn control_lookup_benchmark(c: &mut Criterion) {
     let rt = Runtime::new().expect("tokio runtime");
@@ -114,12 +121,16 @@ fn distributed_registry_live_mailbox_benchmark(c: &mut Criterion) {
     rt.block_on(harness.shutdown());
 }
 
-criterion_group!(
-    benches,
-    control_lookup_benchmark,
-    distributed_registry_live_mailbox_benchmark
-);
-criterion_main!(benches);
+criterion_group!(control_benches, control_lookup_benchmark);
+criterion_group! {
+    name = live_mailbox_benches;
+    config = Criterion::default()
+        .sample_size(10)
+        .warm_up_time(LIVE_MAILBOX_WARM_UP)
+        .measurement_time(LIVE_MAILBOX_MEASUREMENT);
+    targets = distributed_registry_live_mailbox_benchmark
+}
+criterion_main!(control_benches, live_mailbox_benches);
 
 struct BenchNode {
     client: Client,
