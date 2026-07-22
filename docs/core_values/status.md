@@ -107,6 +107,16 @@ missing.
   Linked global config files are rejected and errors remain stable and secret-free
   (`src/mode/credential_store.rs`,
   `src/mode/config.rs`, `src/mode/login.rs`, `src/mode/logout.rs`).
+- Node-control bearers use an explicit zeroizing wire envelope and a non-Clone/non-Serde runtime
+  secret. The active Axum server stores only SHA-256 verifiers, compares them in constant time,
+  uses generation-CAS two-phase refresh so response loss cannot strand a node, rejects duplicate
+  live UUID registration, revokes on stop, removes stopped records, and expires crashed-node leases.
+  Its HTTP listener is loopback-only; the client validates every endpoint against the registration
+  origin, disables redirects and proxies, caps responses, and returns stable secret-free errors.
+  Actual TCP tests cover Host poisoning, forged endpoints, redirect/authenticated-proxy refusal,
+  lost refresh acknowledgement, cancelled shutdown, cache controls, and normal lifecycle
+  (`crates/lunatic-control`, `crates/lunatic-control-axum`,
+  `crates/lunatic-distributed/src/control/client.rs`, `tests/node_control_security.rs`).
 
 ### Boundary
 
@@ -121,6 +131,13 @@ missing.
   on each supported OS, but availability, unlock prompts, desktop-session policy, and Linux session
   D-Bus behavior still require representative platform smoke tests. Logout deletes local material
   only because the provider API exposes no remote revocation endpoint.
+- The built-in Axum node-control server deliberately provides loopback HTTP, not a remote HTTPS
+  deployment, and enrollment has no bootstrap credential. It assumes a trusted single-user host;
+  remote operators need both a trusted HTTPS implementation/termination contract and explicit
+  registration admission authentication/authorization.
+  `lunatic-control-submillisecond` is excluded, non-publishable, and runtime-quarantined until its
+  plaintext SQLite credential model is migrated and independently tested; it is not covered by
+  root workspace success.
 
 ## 4. Fault Tolerance and High Availability
 

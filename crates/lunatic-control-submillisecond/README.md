@@ -1,26 +1,24 @@
-# Lunatic Control Server
+# Lunatic Control Server (Submillisecond, quarantined)
 
-Lunatic Control Server is an HTTP server designed for managing Lunatic nodes.
-It is built with Submillisecond and compiles to WebAssembly to run with Lunatic.
+This crate is preserved only as migration source. It is not a supported or
+production control server, is excluded from the root workspace, cannot be
+published, and its binary exits without starting a listener.
 
-### Running the Server Locally
+The legacy implementation does not satisfy the active node-control bearer
+contract:
 
-Before running the server locally, you need to build the Lunatic runtime by running the following command:
+- it persists recoverable bearer tokens in `control_server.db`;
+- token-bearing registration records derive general Clone/Debug/Serde traits;
+- absolute HTTP endpoints are constructed from the request Host header;
+- registrations have no bounded lease, rotation, or stop/crash revocation;
+- SQLite writes are not acknowledged before registration responses are sent;
+- the independent Git-based toolchain is not exercised by root CI.
 
-```bash
-cargo build --release
-```
+Reactivation requires a separate migration that stores only opaque/verifier
+records, removes token-bearing Clone/Debug/Serde paths, uses a trusted HTTPS or
+loopback origin, implements the same rotation/revocation lease as the active
+Axum server, and adds its own CI and security E2E suite. Until every gate is
+met, use `lunatic control`, which routes to `lunatic-control-axum`.
 
-Next, follow the steps below to build and run the control server:
-
-1. Navigate to the `./crates/lunatic-control-submillisecond` directory.
-2. Build the control server using the following command:
-   ```bash
-   cargo build --target wasm32-wasi
-   ```
-3. Finally, run the control server using the Lunatic runtime by executing the following command:
-   ```bash
-   ../../target/release/lunatic ./target/wasm32-wasi/debug/lunatic-control-submillisecond.wasm
-   ```
-   Please note that the command above assumes that you are still in the `./crates/lunatic-control-submillisecond directory.`
-   If you are in a different directory, you will need to adjust the relative paths accordingly.
+See [`../../docs/security/NODE_CONTROL_BEARER.md`](../../docs/security/NODE_CONTROL_BEARER.md)
+for the active contract and the reactivation checklist.

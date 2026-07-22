@@ -21,6 +21,7 @@ cargo test --all
 | Hot reload preserves Wasm memory across module replacement | Embedded v1/v2 Wasmtime integration test | This test covers memory replacement, not every runtime resource |
 | Live in-process TLS sessions survive hot reload | Real handshake and traffic after state transfer | Serialized, restarted, and cross-process TLS restoration is intentionally unsupported |
 | Global registration coordinates across authenticated nodes | Real mTLS QUIC tests cover 2/3/5-node contention, request-ID uniqueness, quorum, resync, forged leader/snapshot rejection with no registry mutation, and expected-peer response correlation | Cluster-wide resource quotas and crash chaos are not covered |
+| Node-control bearer credentials remain transport-bound and revocable | `tests/node_control_security.rs` and crate tests cover redaction, exact-origin URL validation, HTTP downgrade rejection, redirect/authenticated-proxy/forged-target fail-closed behavior, acknowledgement-loss-safe generation-CAS rotation, deterministic expiry, cancelled shutdown, stop revocation, and normal production Axum lifecycle | Plain HTTP is loopback-only; remote deployment requires HTTPS and enrollment admission, and the excluded submillisecond implementation is quarantined |
 | QUIC framing dispatches multi-chunk messages | 4,097-byte production-framed request E2E | Dispatch boundary only; no live process mailbox |
 | Performance limits are measured | Criterion benches plus `scripts/check_bench_thresholds.py` | Results are environment-sensitive and are not correctness proofs |
 

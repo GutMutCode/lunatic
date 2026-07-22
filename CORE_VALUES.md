@@ -341,6 +341,9 @@ Checkboxes in this section represent current production-path verification, not w
 - [ ] 99.999% uptime (application-dependent)
 - [x] Automatic local failure recovery via OTP supervisors (actual child monitor events drive restart strategies and intensity escalation; distributed recovery is excluded)
 
+### Security
+- [x] Node-control bearer boundary (redacted runtime secrets, same-origin transport, redirect/proxy fail-closed behavior, acknowledgement-safe rotation, expiry/revocation, and production-path E2E; remote HTTPS plus enrollment admission remain operator responsibilities and the legacy submillisecond server is quarantined)
+
 ### Developer Experience
 - [ ] Multi-language guest API support (basic Rust, Go, and AssemblyScript build examples exist; equivalent runtime APIs and CI E2E coverage do not)
 - [ ] Rich ecosystem (libraries in Rust, JS, Go, etc.)

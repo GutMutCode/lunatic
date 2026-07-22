@@ -1,9 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use lunatic_control::{
-    api::{ControlUrls, Registration},
-    NodeInfo,
-};
+use lunatic_control::NodeInfo;
 use lunatic_distributed::{
     control::{
         self,
@@ -335,22 +332,11 @@ fn der_utf8_string(value: &str) -> Vec<u8> {
     encoded
 }
 
-fn test_registration(node_id: u64, root_cert: &str, cert: &str) -> Registration {
-    let unused_url = "http://127.0.0.1:1/".to_string();
-    Registration {
+fn test_registration(node_id: u64, root_cert: &str, cert: &str) -> control::RegistrationMetadata {
+    control::RegistrationMetadata {
         node_name: uuid::Uuid::from_u128(node_id as u128),
         cert_pem_chain: vec![cert.to_string()],
-        authentication_token: "test".to_string(),
         root_cert: root_cert.to_string(),
-        urls: ControlUrls {
-            api_base: unused_url.clone(),
-            nodes: unused_url.clone(),
-            node_started: unused_url.clone(),
-            node_stopped: unused_url.clone(),
-            get_module: unused_url.clone(),
-            add_module: unused_url.clone(),
-            get_nodes: unused_url,
-        },
         envs: vec![],
         is_privileged: true,
     }

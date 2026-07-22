@@ -2440,8 +2440,11 @@ dependencies = [
 name = "lunatic-control"
 version = "0.13.2"
 dependencies = [
+ "base64-url",
+ "getrandom 0.2.17",
  "serde",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2451,10 +2454,8 @@ dependencies = [
  "anyhow",
  "asn1-rs",
  "axum",
- "base64-url",
  "chrono",
  "dashmap",
- "getrandom 0.2.17",
  "http 0.2.12",
  "log",
  "lunatic-control",
@@ -2462,9 +2463,12 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tokio",
  "tower-http 0.3.5",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2494,6 +2498,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

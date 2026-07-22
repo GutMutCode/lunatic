@@ -40,6 +40,7 @@ Unchecked entries are active implementation areas, not unavailable concepts. The
 - [**CORE_VALUES.md**](CORE_VALUES.md) - Design principles and Erlang inspiration
 - [**docs/core_values/status.md**](docs/core_values/status.md) - Up-to-date implementation compliance review
 - [**docs/security/AUDIT_LOGGING.md**](docs/security/AUDIT_LOGGING.md) - How to capture and route audit log events
+- [**docs/security/NODE_CONTROL_BEARER.md**](docs/security/NODE_CONTROL_BEARER.md) - Node-control bearer transport, rotation, and revocation contract
 - [**docs/hot_reload/HOT_RELOAD_ARCHITECTURE.md**](docs/hot_reload/HOT_RELOAD_ARCHITECTURE.md) - Hot reload system design
 - [**docs/hot_reload/HOT_RELOAD_PREEMPTIVE.md**](docs/hot_reload/HOT_RELOAD_PREEMPTIVE.md) - Historical preemptive hot reload design notes
 - [**docs/benchmarks/PERFORMANCE_ANALYSIS.md**](docs/benchmarks/PERFORMANCE_ANALYSIS.md) - Historical component metrics and analysis

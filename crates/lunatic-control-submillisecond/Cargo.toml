@@ -6,6 +6,7 @@ description = "TBD"
 homepage = "https://lunatic.solutions"
 repository = "https://github.com/lunatic-solutions/lunatic/tree/main/crates"
 license = "Apache-2.0 OR MIT"
+publish = false
 
 [dependencies]
 lunatic-control = { path = "../lunatic-control" }

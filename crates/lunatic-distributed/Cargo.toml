@@ -29,6 +29,7 @@ tokio = { workspace = true, features = ["io-util", "rt", "sync", "time"] }
 uuid = { version = "1.0", features = ["serde", "v4"] }
 wasmtime = { workspace = true }
 x509-parser = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 async-trait = "0.1"

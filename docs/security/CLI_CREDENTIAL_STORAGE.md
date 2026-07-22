@@ -6,7 +6,8 @@ credential reference.
 
 This contract applies to the `lunatic login`, authenticated platform, and `lunatic logout` paths.
 It does not cover distributed node bearer tokens, TLS listener credentials, or credentials owned
-by guest applications.
+by guest applications. The separate node bearer contract is documented in
+[Node-Control Bearer Security](NODE_CONTROL_BEARER.md).
 
 ## Storage boundary
 

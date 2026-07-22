@@ -44,7 +44,10 @@ exist when a node first submits its CSR.
 2. `/started` allocates the numeric ID, ignores caller-requested CA, key-usage,
    extended-key-usage, and custom extensions, rechecks the registered UUID,
    and signs a new leaf certificate containing `node_id: <allocated ID>`.
-   The chain is returned with `NodeStarted`.
+   The chain is returned with `NodeStarted`. Registration issues a separate
+   short-lived node-control bearer; periodic generation-CAS refresh rotates it
+   through an acknowledgement-safe pending verifier. That bearer is not a
+   distributed-node identity credential.
 3. The distributed control client installs the returned chain before the node
    creates its QUIC client and server endpoints. An empty chain fails closed
    with an upgrade error.
@@ -69,9 +72,9 @@ The in-memory Axum control plane generates a fresh CA whenever its in-memory
 registration and node-ID state is recreated. Its `/register` response returns
 that generated trust root, so leaves from a previous control-plane lifetime
 cannot authenticate after a restart even if numeric counters restart. The
-persistent submillisecond control plane keeps the node-ID high-water mark in
-its store and chooses a random positive starting ID within the compact 40-bit
-node-ID format for a fresh or reset store.
+legacy persistent submillisecond implementation is security-quarantined and is
+not a supported control plane; its prior persistence behavior is not evidence
+for the active contract.
 Any custom control implementation that persists a CA must likewise persist a
 never-reused node-ID/issuance epoch; CA state and identity-allocation state must
 not be restored independently.
@@ -132,4 +135,6 @@ The forged registry states remain absent, and the forged response neither
 completes nor removes the pending waiter.
 
 See also [Distributed Runtime Testing](../testing/DISTRIBUTED_TESTING.md) and
-[Audit Logging](../security/AUDIT_LOGGING.md).
+[Audit Logging](../security/AUDIT_LOGGING.md), plus
+[Node-Control Bearer Security](../security/NODE_CONTROL_BEARER.md) for the
+separate HTTP control credential.

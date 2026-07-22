@@ -2,8 +2,8 @@ use std::{fmt::Display, sync::Arc};
 
 use axum::{
     async_trait,
-    extract::{FromRequest, FromRequestParts, Host, Path},
-    http::{self, request::Parts, Request},
+    extract::{FromRequest, FromRequestParts, Path},
+    http::{self, request::Parts, HeaderMap, HeaderValue, Request},
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -14,9 +14,20 @@ use serde_json::json;
 use crate::server::ControlServer;
 
 pub type ApiResponse<D> = Result<Json<D>, ApiError>;
+pub type SecretApiResponse<D> = Result<(HeaderMap, Json<D>), ApiError>;
 
 pub fn ok<D: Serialize>(data: D) -> ApiResponse<D> {
     Ok(Json(data))
+}
+
+pub fn ok_secret<D: Serialize>(data: D) -> SecretApiResponse<D> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, max-age=0"),
+    );
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    Ok((headers, Json(data)))
 }
 
 #[derive(Debug)]
@@ -24,13 +35,7 @@ pub enum ApiError {
     Internal,
     NotAuthenticated,
     NotAuthorized,
-    InvalidData(String),
-    InvalidPathArg(String),
-    InvalidQueryArg(String),
-    Custom {
-        code: &'static str,
-        message: Option<String>,
-    },
+    Custom { code: &'static str },
 }
 
 impl ApiError {
@@ -39,10 +44,7 @@ impl ApiError {
             ApiError::Internal => "internal",
             ApiError::NotAuthenticated => "unauthenticated",
             ApiError::NotAuthorized => "unauthorized",
-            ApiError::InvalidData(_) => "invalid_data",
-            ApiError::InvalidPathArg(_) => "invalid_path_arg",
-            ApiError::InvalidQueryArg(_) => "invalid_query_arg",
-            ApiError::Custom { code, .. } => code,
+            ApiError::Custom { code } => code,
         }
     }
 
@@ -51,10 +53,7 @@ impl ApiError {
             ApiError::Internal => "".into(),
             ApiError::NotAuthenticated => "Not authenticated".into(),
             ApiError::NotAuthorized => "Not authorized".into(),
-            ApiError::InvalidData(msg) => msg.clone(),
-            ApiError::InvalidPathArg(msg) => msg.clone(),
-            ApiError::InvalidQueryArg(msg) => msg.clone(),
-            ApiError::Custom { message, .. } => message.clone().unwrap_or_else(|| "".into()),
+            ApiError::Custom { .. } => "".into(),
         }
     }
 
@@ -64,18 +63,8 @@ impl ApiError {
         Self::Internal
     }
 
-    pub fn custom(code: &'static str, message: String) -> Self {
-        Self::Custom {
-            code,
-            message: Some(message),
-        }
-    }
-
     pub fn custom_code(code: &'static str) -> Self {
-        Self::Custom {
-            code,
-            message: None,
-        }
+        Self::Custom { code }
     }
 }
 
@@ -106,9 +95,7 @@ impl IntoResponse for ApiError {
             Self::Internal => S::INTERNAL_SERVER_ERROR,
             Self::NotAuthenticated => S::UNAUTHORIZED,
             Self::NotAuthorized => S::FORBIDDEN,
-            InvalidData(_) | InvalidPathArg(_) | InvalidQueryArg(_) | Custom { .. } => {
-                S::BAD_REQUEST
-            }
+            Custom { .. } => S::BAD_REQUEST,
         };
 
         (status, body).into_response()
@@ -129,7 +116,7 @@ where
     async fn from_request(req: Request<B>, state: &S) -> Result<JsonExtractor<T>, Self::Rejection> {
         match Json::from_request(req, state).await {
             Ok(Json(value)) => Ok(JsonExtractor(value)),
-            Err(e) => Err(ApiError::InvalidData(e.to_string())),
+            Err(_) => Err(ApiError::custom_code("invalid_data")),
         }
     }
 }
@@ -150,37 +137,15 @@ where
     ) -> Result<PathExtractor<T>, Self::Rejection> {
         match Path::from_request_parts(req, state).await {
             Ok(Path(value)) => Ok(PathExtractor(value)),
-            Err(e) => Err(ApiError::InvalidPathArg(e.to_string())),
-        }
-    }
-}
-
-pub struct HostExtractor(pub String);
-
-#[async_trait]
-impl<S> FromRequestParts<S> for HostExtractor
-where
-    S: Send + Sync,
-{
-    type Rejection = ApiError;
-
-    async fn from_request_parts(
-        req: &mut Parts,
-        state: &S,
-    ) -> Result<HostExtractor, Self::Rejection> {
-        match Host::from_request_parts(req, state).await {
-            Ok(Host(host)) => Ok(HostExtractor(host)),
-            Err(e) => Err(ApiError::Custom {
-                code: "no_host",
-                message: Some(e.to_string()),
-            }),
+            Err(_) => Err(ApiError::custom_code("invalid_path_arg")),
         }
     }
 }
 
 #[derive(Debug)]
 pub struct NodeAuth {
-    pub registration_id: i64,
+    pub registration_id: u64,
+    pub bearer_generation: u64,
     pub node_name: uuid::Uuid,
 }
 
@@ -192,66 +157,38 @@ where
     type Rejection = ApiError;
 
     async fn from_request_parts(req: &mut Parts, state: &S) -> Result<NodeAuth, Self::Rejection> {
-        let headers = req.headers.clone();
-        let auth_header = headers
+        let cs: Extension<Arc<ControlServer>> = Extension::from_request_parts(req, state)
+            .await
+            .map_err(|e| ApiError::log_internal("Error getting control server state", e))?;
+        let auth_header = req
+            .headers
             .get(header::AUTHORIZATION)
-            .ok_or_else(|| {
-                ApiError::custom("no_auth_header", "Missing node authorization header".into())
-            })?
+            .ok_or_else(|| ApiError::custom_code("no_auth_header"))?
             .to_str()
-            .map_err(|_| {
-                ApiError::custom(
-                    "invalid_auth_header",
-                    "Invalid authorization header value".into(),
-                )
-            })?;
+            .map_err(|_| ApiError::custom_code("invalid_auth_header"))?;
 
         let token = auth_header
             .strip_prefix("Bearer ")
-            .to_owned()
-            .ok_or_else(|| {
-                ApiError::custom(
-                    "invalid_auth_token",
-                    "Header value doesn't start with Bearer".into(),
-                )
-            })?;
+            .ok_or_else(|| ApiError::custom_code("invalid_auth_token"))?;
 
-        let node_name = headers
+        let node_name = req
+            .headers
             .get("x-lunatic-node-name")
-            .ok_or_else(|| {
-                ApiError::custom(
-                    "no_lunatic_node_name_header",
-                    "Missing x-lunatic-node-name header".into(),
-                )
-            })?
+            .ok_or_else(|| ApiError::custom_code("no_lunatic_node_name_header"))?
             .to_str()
-            .map_err(|_| {
-                ApiError::custom(
-                    "invalid_lunatic_node_name_header",
-                    "Invalid x-lunatic-node-name header value".into(),
-                )
-            })?;
+            .map_err(|_| ApiError::custom_code("invalid_lunatic_node_name_header"))?;
 
-        let node_name: uuid::Uuid = node_name.parse().map_err(|_| {
-            ApiError::custom(
-                "invalid_lunatic_node_name_header",
-                format!("Invalid x-lunatic-node-name header: {node_name} not a valid UUID"),
-            )
-        })?;
+        let node_name: uuid::Uuid = node_name
+            .parse()
+            .map_err(|_| ApiError::custom_code("invalid_lunatic_node_name_header"))?;
 
-        let cs: Extension<Arc<ControlServer>> = Extension::from_request_parts(req, state)
-            .await
-            .map_err(|e| ApiError::log_internal("Error getting cs in registration auth", e))?;
-
-        let (registration_id, reg) = cs
-            .registrations
-            .iter()
-            .find(|r| r.node_name == node_name && r.authentication_token == token)
-            .map(|r| (*r.key(), r.value().clone()))
+        let authenticated = cs
+            .authenticate(node_name, token)
             .ok_or(ApiError::NotAuthenticated)?;
         let node_auth = NodeAuth {
-            registration_id: registration_id as i64,
-            node_name: reg.node_name,
+            registration_id: authenticated.registration_id,
+            bearer_generation: authenticated.bearer_generation,
+            node_name,
         };
 
         Ok(node_auth)

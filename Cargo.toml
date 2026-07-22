@@ -142,6 +142,7 @@ members = [
     "crates/lunatic-common-api",
     "crates/lunatic-control",
     "crates/lunatic-control-axum",
+    # Security-quarantined legacy source; see docs/security/NODE_CONTROL_BEARER.md.
     # "crates/lunatic-control-submillisecond",
     "crates/lunatic-distributed-api",
     "crates/lunatic-distributed",
@@ -184,8 +185,10 @@ lunatic-wasi-api = { path = "crates/lunatic-wasi-api", version = "0.13" }
 
 anyhow = "1.0"
 asn1-rs = "0.7.2"
+base64-url = "2.0"
 bincode = "1.3"
 dashmap = "5.4"
+getrandom = "0.2.8"
 log = "0.4"
 metrics = "0.20.1"
 reqwest = { version = "0.12.28", features = ["cookies", "multipart"] }
@@ -194,6 +197,8 @@ rcgen = { version = "0.14.8", default-features = false, features = ["pem", "ring
 rustls = { version = "0.23.42", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-pemfile = "2.2.0"
 serde = "1.0"
+sha2 = "0.10.9"
+subtle = "2.6.1"
 tokio = "1.28"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "ring", "tls12"] }
 uuid = { version = "1.1", features = ["v4"] }

@@ -7,10 +7,7 @@ use std::{
 
 use anyhow::{anyhow, ensure, Context, Result};
 use criterion::{criterion_group, criterion_main, Criterion};
-use lunatic_control::{
-    api::{ControlUrls, Registration},
-    NodeInfo,
-};
+use lunatic_control::NodeInfo;
 use lunatic_distributed::{
     control::{
         self,
@@ -35,7 +32,6 @@ use lunatic_process::{
 use lunatic_runtime::DefaultProcessState;
 use quinn::Endpoint;
 use rcgen::{CertificateParams, CustomExtension, DnType};
-use reqwest::Client as HttpClient;
 use tokio::{
     runtime::Runtime,
     sync::{mpsc, Mutex},
@@ -386,22 +382,11 @@ fn der_utf8_string(value: &str) -> Vec<u8> {
     encoded
 }
 
-fn test_registration(node_id: u64, root_cert: &str, cert: &str) -> Registration {
-    let unused_url = "http://127.0.0.1:1/".to_string();
-    Registration {
+fn test_registration(node_id: u64, root_cert: &str, cert: &str) -> control::RegistrationMetadata {
+    control::RegistrationMetadata {
         node_name: Uuid::from_u128(node_id as u128),
         cert_pem_chain: vec![cert.to_string()],
-        authentication_token: "benchmark".to_string(),
         root_cert: root_cert.to_string(),
-        urls: ControlUrls {
-            api_base: unused_url.clone(),
-            nodes: unused_url.clone(),
-            node_started: unused_url.clone(),
-            node_stopped: unused_url.clone(),
-            get_module: unused_url.clone(),
-            add_module: unused_url.clone(),
-            get_nodes: unused_url,
-        },
         envs: vec![],
         is_privileged: true,
     }
@@ -440,27 +425,17 @@ impl ControlHandle {
 }
 
 async fn register_node(control: &ControlHandle, node_addr: SocketAddr) -> Result<control::Client> {
-    let http_client = HttpClient::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("failed to build control HTTP client")?;
-
     let node_name = Uuid::new_v4();
     let node_cert = gen_node_cert(&node_name.hyphenated().to_string())?;
     let csr_pem = node_cert
         .serialize_request_pem()
         .context("failed to serialize node CSR")?;
 
-    let registration = control::Client::register(
-        &http_client,
-        Url::parse(&control.base_url())?,
-        node_name,
-        csr_pem,
-    )
-    .await?;
+    let registration =
+        control::Client::register(Url::parse(&control.base_url())?, node_name, csr_pem).await?;
 
     let mut attributes = HashMap::new();
     attributes.insert("bench".to_string(), "true".to_string());
 
-    control::Client::new(http_client, registration, node_addr, attributes).await
+    control::Client::new(registration, node_addr, attributes).await
 }

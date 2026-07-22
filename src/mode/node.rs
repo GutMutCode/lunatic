@@ -26,6 +26,14 @@ use uuid::Uuid;
 
 use crate::mode::common::{run_wasm, CompiledModuleArgs, RunWasm};
 
+struct AbortTaskOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 #[derive(Parser, Debug)]
 pub(crate) struct Args {
     /// Control server register URL
@@ -112,8 +120,6 @@ pub(crate) async fn start(args: Args) -> Result<()> {
         .bind_socket
         .or_else(get_available_localhost)
         .ok_or_else(|| anyhow!("No available localhost UDP port"))?;
-    let http_client = reqwest::Client::new();
-
     // TODO unwrap, better message
     let node_name = Uuid::new_v4();
     let node_name_str = node_name.as_hyphenated().to_string();
@@ -123,7 +129,6 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     log::info!("Generate CSR for node name {node_name_str}");
 
     let reg = control::Client::register(
-        &http_client,
         args.control
             .parse()
             .with_context(|| "Parsing control URL")?,
@@ -132,11 +137,11 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     )
     .await?;
 
-    let allowed_envs = if reg.is_privileged {
+    let allowed_envs = if reg.is_privileged() {
         None
     } else {
         Some(
-            reg.envs
+            reg.envs()
                 .iter()
                 .map(|env_id| *env_id as u64)
                 .collect::<HashSet<u64>>(),
@@ -144,8 +149,7 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     };
 
     let control_client = control::Client::new_with_topology_limit(
-        http_client.clone(),
-        reg.clone(),
+        reg,
         socket,
         node_attributes,
         args.registry_max_topology_nodes,
@@ -153,115 +157,136 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     .await?;
 
     let node_id = control_client.node_id();
-    // `/started` rotates the provisional registration certificate to one that
-    // is cryptographically bound to the newly allocated numeric node ID.
+    // `/started` replaces the provisional registration certificate with one
+    // cryptographically bound to the newly allocated numeric node ID.
     let reg = control_client.reg();
 
     log::info!("Registration successful, node id {}", node_id);
 
-    let quic_client = quic::new_quic_client(
-        &reg.root_cert,
-        reg.cert_pem_chain
-            .first()
-            .ok_or_else(|| anyhow!("No certificate available for QUIC client"))?,
-        &node_cert.serialize_private_key_pem(),
-    )
-    .with_context(|| "Failed to create mTLS QUIC client")?;
+    let run_result: Result<()> = async {
+        let quic_client = quic::new_quic_client(
+            &reg.root_cert,
+            reg.cert_pem_chain
+                .first()
+                .ok_or_else(|| anyhow!("No certificate available for QUIC client"))?,
+            &node_cert.serialize_private_key_pem(),
+        )
+        .with_context(|| "Failed to create mTLS QUIC client")?;
 
-    let distributed_client = distributed::Client::new_with_limits(
-        node_id,
-        control_client.clone(),
-        quic_client.clone(),
-        distributed::DistributedLimits {
-            outbound: distributed::OutboundLimits {
-                max_messages: args.outbound_max_messages,
-                max_bytes: args.outbound_max_bytes,
+        let distributed_client = distributed::Client::new_with_limits(
+            node_id,
+            control_client.clone(),
+            quic_client.clone(),
+            distributed::DistributedLimits {
+                outbound: distributed::OutboundLimits {
+                    max_messages: args.outbound_max_messages,
+                    max_bytes: args.outbound_max_bytes,
+                },
+                registry: distributed::RegistryLimits {
+                    max_name_bytes: args.registry_max_name_bytes,
+                    max_entries: args.registry_max_entries,
+                    max_retained_bytes: args.registry_max_retained_bytes,
+                    max_name_locks: args.registry_max_name_locks,
+                    max_pending_responses: args.registry_max_pending_responses,
+                    max_topology_nodes: args.registry_max_topology_nodes,
+                },
             },
-            registry: distributed::RegistryLimits {
-                max_name_bytes: args.registry_max_name_bytes,
-                max_entries: args.registry_max_entries,
-                max_retained_bytes: args.registry_max_retained_bytes,
-                max_name_locks: args.registry_max_name_locks,
-                max_pending_responses: args.registry_max_pending_responses,
-                max_topology_nodes: args.registry_max_topology_nodes,
+        );
+
+        let dist = lunatic_distributed::DistributedProcessState::new(
+            node_id,
+            control_client.clone(),
+            distributed_client.clone(),
+        )
+        .await?;
+
+        let wasmtime_config = runtimes::wasmtime::default_config();
+        let runtime = runtimes::wasmtime::WasmtimeRuntime::new_with_module_limits(
+            &wasmtime_config,
+            args.compiled_modules.limits(),
+        )?;
+        let envs = Arc::new(LunaticEnvironments::with_limits(
+            args.max_environments,
+            args.max_processes_per_environment,
+            args.max_node_processes,
+        ));
+
+        let wasm_spec = if let Some(path) = args.wasm {
+            Some((path, envs.create(1).await?))
+        } else {
+            None
+        };
+        let ctrl_c = async_ctrlc::CtrlC::new().with_context(|| "Installing Ctrl-C handler")?;
+
+        let mut node = tokio::task::spawn(lunatic_distributed::distributed::server::node_server(
+            ServerCtx {
+                envs: envs.clone(),
+                modules: Modules::<DefaultProcessState>::with_max_entries(args.max_cached_modules),
+                distributed: dist.clone(),
+                runtime: runtime.clone(),
+                node_client: distributed_client.clone(),
+                allowed_envs,
             },
-        },
-    );
+            socket,
+            reg.root_cert,
+            reg.cert_pem_chain,
+            node_cert.serialize_private_key_pem(),
+        ));
+        // JoinHandle::drop detaches. Keep an abort guard in the parent future
+        // so cancellation cannot orphan a node task that owns control clients
+        // and would otherwise keep renewing its bearer lease.
+        let _node_abort = AbortTaskOnDrop(node.abort_handle());
 
-    let dist = lunatic_distributed::DistributedProcessState::new(
-        node_id,
-        control_client.clone(),
-        distributed_client.clone(),
-    )
-    .await?;
+        let wasm = if let Some((path, env)) = wasm_spec {
+            Some(tokio::task::spawn(async move {
+                if let Err(e) = run_wasm(RunWasm {
+                    path,
+                    wasm_args: vec![],
+                    dir: vec![],
+                    runtime,
+                    envs,
+                    env,
+                    distributed: Some(dist),
+                    initial_module_version: None,
+                    compiled_module: None,
+                    spawn_ready: None,
+                })
+                .await
+                {
+                    log::error!("Error running wasm: {e:?}");
+                }
+            }))
+        } else {
+            None
+        };
+        let _wasm_abort = wasm
+            .as_ref()
+            .map(|task| AbortTaskOnDrop(task.abort_handle()));
 
-    let wasmtime_config = runtimes::wasmtime::default_config();
-    let runtime = runtimes::wasmtime::WasmtimeRuntime::new_with_module_limits(
-        &wasmtime_config,
-        args.compiled_modules.limits(),
-    )?;
-    let envs = Arc::new(LunaticEnvironments::with_limits(
-        args.max_environments,
-        args.max_processes_per_environment,
-        args.max_node_processes,
-    ));
-
-    let mut node = tokio::task::spawn(lunatic_distributed::distributed::server::node_server(
-        ServerCtx {
-            envs: envs.clone(),
-            modules: Modules::<DefaultProcessState>::with_max_entries(args.max_cached_modules),
-            distributed: dist.clone(),
-            runtime: runtime.clone(),
-            node_client: distributed_client.clone(),
-            allowed_envs,
-        },
-        socket,
-        reg.root_cert,
-        reg.cert_pem_chain,
-        node_cert.serialize_private_key_pem(),
-    ));
-
-    let wasm = if let Some(path) = args.wasm {
-        let env = envs.create(1).await?;
-        Some(tokio::task::spawn(async move {
-            if let Err(e) = run_wasm(RunWasm {
-                path,
-                wasm_args: vec![],
-                dir: vec![],
-                runtime,
-                envs,
-                env,
-                distributed: Some(dist),
-                initial_module_version: None,
-                compiled_module: None,
-                spawn_ready: None,
-            })
-            .await
-            {
-                log::error!("Error running wasm: {e:?}");
+        tokio::select! {
+            _ = &mut node => {}
+            _ = ctrl_c => {
+                log::info!("Shutting down node");
+                node.abort();
+                let _ = node.await;
             }
-        }))
-    } else {
-        None
-    };
-
-    tokio::select! {
-        _ = &mut node => {}
-        _ = async_ctrlc::CtrlC::new().unwrap() => {
-            log::info!("Shutting down node");
-            node.abort();
-            let _ = node.await;
         }
+
+        if let Some(wasm) = wasm {
+            wasm.abort();
+            let _ = wasm.await;
+        }
+        Ok(())
+    }
+    .await;
+
+    if control_client.shutdown().await.is_err() {
+        log::warn!(
+            "Node-control stop acknowledgement failed; the server lease will revoke the bearer"
+        );
     }
 
-    if let Some(wasm) = wasm {
-        wasm.abort();
-        let _ = wasm.await;
-    }
-
-    control_client.notify_node_stopped().await.ok();
-
-    Ok(())
+    run_result
 }
 
 fn get_available_localhost() -> Option<SocketAddr> {
@@ -286,6 +311,21 @@ fn parse_key_val(s: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn abort_task_guard_prevents_detach_on_parent_cancellation() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let guard = AbortTaskOnDrop(task.abort_handle());
+        started_rx.await.expect("child started");
+
+        drop(guard);
+        let error = task.await.expect_err("guard aborts child");
+        assert!(error.is_cancelled());
+    }
 
     #[test]
     fn node_process_and_environment_limits_have_finite_defaults() {

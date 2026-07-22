@@ -1535,7 +1535,6 @@ fn expire_responses(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lunatic_control::api::{ControlUrls, Registration};
     use lunatic_control::NodeInfo;
     use tokio::sync::mpsc::error::TryRecvError;
 
@@ -1554,21 +1553,10 @@ mod tests {
         let key_pem = node_certificate.serialize_private_key_pem();
         let node_client =
             quic::new_quic_client(&root_pem, &certificate_pem, &key_pem).expect("test QUIC client");
-        let unused_url = "http://127.0.0.1:1/".to_string();
-        let registration = Registration {
+        let registration = crate::control::RegistrationMetadata {
             node_name: uuid::Uuid::from_u128(1),
             cert_pem_chain: vec![certificate_pem],
-            authentication_token: "test".to_string(),
             root_cert: root_pem,
-            urls: ControlUrls {
-                api_base: unused_url.clone(),
-                nodes: unused_url.clone(),
-                node_started: unused_url.clone(),
-                node_stopped: unused_url.clone(),
-                get_module: unused_url.clone(),
-                add_module: unused_url.clone(),
-                get_nodes: unused_url,
-            },
             envs: vec![],
             is_privileged: true,
         };
