@@ -64,6 +64,10 @@ pub struct DefaultProcessConfig {
     max_sqlite_connections: u32,
     #[serde(default = "default_max_sqlite_statements")]
     max_sqlite_statements: u32,
+    // Can this process consume scoped host TLS credential handles. Keep new
+    // serde-defaulted fields at the end for legacy MessagePack sequences.
+    #[serde(default)]
+    can_use_tls_credential_handles: bool,
 }
 
 const fn default_max_mailbox_messages() -> u32 {
@@ -118,6 +122,7 @@ impl Default for DefaultProcessConfig {
             can_compile_modules: false,
             can_create_configs: false,
             can_spawn_processes: false,
+            can_use_tls_credential_handles: false,
             preopened_dirs: Vec::new(),
             command_line_arguments: Vec::new(),
             environment_variables: Vec::new(),
@@ -147,6 +152,10 @@ impl Debug for DefaultProcessConfig {
             .field("can_compile_modules", &self.can_compile_modules)
             .field("can_create_configs", &self.can_create_configs)
             .field("can_spawn_processes", &self.can_spawn_processes)
+            .field(
+                "can_use_tls_credential_handles",
+                &self.can_use_tls_credential_handles,
+            )
             .field("preopened_dir_count", &self.preopened_dirs.len())
             .field("argument_count", &self.command_line_arguments.len())
             .field(
@@ -227,6 +236,7 @@ impl ProcessConfig for DefaultProcessConfig {
             can_compile_modules: false,
             can_create_configs: false,
             can_spawn_processes: false,
+            can_use_tls_credential_handles: false,
             preopened_dirs: Vec::new(),
             command_line_arguments: Vec::new(),
             environment_variables: Vec::new(),
@@ -257,6 +267,9 @@ impl ProcessConfig for DefaultProcessConfig {
         }
         if child.can_spawn_processes && !self.can_spawn_processes {
             return Err("spawn capability exceeds parent authority".into());
+        }
+        if child.can_use_tls_credential_handles && !self.can_use_tls_credential_handles {
+            return Err("TLS credential-handle capability exceeds parent authority".into());
         }
         if child.max_memory > self.max_memory {
             return Err(format!(
@@ -377,6 +390,9 @@ impl ProcessConfig for DefaultProcessConfig {
         }
         if self.can_spawn_processes && !receiver_ceiling.can_spawn_processes {
             return Err("spawn capability exceeds receiver authority".into());
+        }
+        if self.can_use_tls_credential_handles && !receiver_ceiling.can_use_tls_credential_handles {
+            return Err("TLS credential-handle capability exceeds receiver authority".into());
         }
         if self.max_memory > receiver_ceiling.max_memory {
             return Err(format!(
@@ -752,6 +768,14 @@ impl ProcessConfigCtx for DefaultProcessConfig {
         self.can_spawn_processes = can
     }
 
+    fn can_use_tls_credential_handles(&self) -> bool {
+        self.can_use_tls_credential_handles
+    }
+
+    fn set_can_use_tls_credential_handles(&mut self, can: bool) {
+        self.can_use_tls_credential_handles = can
+    }
+
     fn get_max_table_elements(&self) -> u32 {
         self.max_table_elements
     }
@@ -986,6 +1010,7 @@ mod tests {
     use crate::config::{get_absolute_path, path_is_ancestor};
     use lunatic_process::config::ProcessConfig;
     use lunatic_process_api::ProcessConfigCtx;
+    use serde::Serialize;
 
     use super::{
         normalize_path, DefaultProcessConfig, DEFAULT_MAX_CONFIGS, DEFAULT_MAX_CONFIG_BYTES,
@@ -1000,6 +1025,7 @@ mod tests {
         assert!(!config.can_compile_modules());
         assert!(!config.can_create_configs());
         assert!(!config.can_spawn_processes());
+        assert!(!config.can_use_tls_credential_handles());
         assert!(config.preopened_dirs().is_empty());
         assert_eq!(config.get_max_modules(), DEFAULT_MAX_MODULES);
         assert_eq!(config.get_max_configs(), DEFAULT_MAX_CONFIGS);
@@ -1028,6 +1054,7 @@ mod tests {
             "max_config_bytes",
             "max_sqlite_connections",
             "max_sqlite_statements",
+            "can_use_tls_credential_handles",
         ] {
             object.remove(field);
         }
@@ -1046,6 +1073,66 @@ mod tests {
             config.get_max_sqlite_statements(),
             DEFAULT_MAX_SQLITE_STATEMENTS
         );
+        assert!(!config.can_use_tls_credential_handles());
+    }
+
+    #[test]
+    fn tls_credential_capability_defaults_false_for_legacy_messagepack_configs() {
+        #[derive(Serialize)]
+        struct LegacyDefaultProcessConfig {
+            max_memory: usize,
+            max_fuel: Option<u64>,
+            can_compile_modules: bool,
+            can_create_configs: bool,
+            can_spawn_processes: bool,
+            preopened_dirs: Vec<(String, String)>,
+            command_line_arguments: Vec<String>,
+            environment_variables: Vec<(String, String)>,
+            max_table_elements: u32,
+            max_file_descriptors: u32,
+            max_network_connections: u32,
+            max_mailbox_messages: u32,
+            max_signal_queue: u32,
+            max_message_size: u64,
+            max_message_resources: u32,
+            max_modules: u32,
+            max_configs: u32,
+            max_module_bytes: u64,
+            max_config_entries: u32,
+            max_config_bytes: u64,
+            max_sqlite_connections: u32,
+            max_sqlite_statements: u32,
+        }
+
+        let config = DefaultProcessConfig::default();
+        let legacy = LegacyDefaultProcessConfig {
+            max_memory: config.max_memory,
+            max_fuel: config.max_fuel,
+            can_compile_modules: config.can_compile_modules,
+            can_create_configs: config.can_create_configs,
+            can_spawn_processes: config.can_spawn_processes,
+            preopened_dirs: config.preopened_dirs.clone(),
+            command_line_arguments: config.command_line_arguments.clone(),
+            environment_variables: config.environment_variables.clone(),
+            max_table_elements: config.max_table_elements,
+            max_file_descriptors: config.max_file_descriptors,
+            max_network_connections: config.max_network_connections,
+            max_mailbox_messages: config.max_mailbox_messages,
+            max_signal_queue: config.max_signal_queue,
+            max_message_size: config.max_message_size,
+            max_message_resources: config.max_message_resources,
+            max_modules: config.max_modules,
+            max_configs: config.max_configs,
+            max_module_bytes: config.max_module_bytes,
+            max_config_entries: config.max_config_entries,
+            max_config_bytes: config.max_config_bytes,
+            max_sqlite_connections: config.max_sqlite_connections,
+            max_sqlite_statements: config.max_sqlite_statements,
+        };
+
+        let bytes = rmp_serde::to_vec(&legacy).unwrap();
+        let decoded: DefaultProcessConfig = rmp_serde::from_slice(&bytes).unwrap();
+        assert!(!decoded.can_use_tls_credential_handles());
     }
 
     #[test]
@@ -1149,6 +1236,7 @@ mod tests {
         parent.set_can_compile_modules(true);
         parent.set_can_create_configs(true);
         parent.set_can_spawn_processes(true);
+        parent.set_can_use_tls_credential_handles(true);
         parent.preopen_dir(".");
         parent.set_command_line_arguments(vec!["secret-argument".into()]);
         parent.set_environment_variables(vec![("SECRET".into(), "value".into())]);
@@ -1158,6 +1246,7 @@ mod tests {
         assert!(!child.can_compile_modules());
         assert!(!child.can_create_configs());
         assert!(!child.can_spawn_processes());
+        assert!(!child.can_use_tls_credential_handles());
         assert!(child.preopened_dirs().is_empty());
         assert!(child.command_line_arguments().is_empty());
         assert!(child.environment_variables().is_empty());
@@ -1199,6 +1288,13 @@ mod tests {
             .validate_child_config(&candidate)
             .unwrap_err()
             .contains("spawn capability"));
+
+        let mut candidate = child.clone();
+        candidate.set_can_use_tls_credential_handles(true);
+        assert!(parent
+            .validate_child_config(&candidate)
+            .unwrap_err()
+            .contains("TLS credential-handle capability"));
 
         let mut candidate = child.clone();
         candidate.set_max_memory(4097);
@@ -1343,6 +1439,13 @@ mod tests {
             .validate_distributed_config()
             .unwrap_err()
             .contains("spawn capability"));
+
+        let mut config = DefaultProcessConfig::default();
+        config.set_can_use_tls_credential_handles(true);
+        assert!(config
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("TLS credential-handle capability"));
     }
 
     #[cfg(unix)]

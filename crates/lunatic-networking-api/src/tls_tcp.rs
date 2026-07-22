@@ -27,7 +27,8 @@ use lunatic_error_api::ErrorCtx;
 use crate::dns::DnsIterator;
 use crate::{
     audit_port, redacted_network_target, socket_address, validate_memory_range, NetworkingCtx,
-    PendingNetworkAudit, TlsClientConnectionMetadata, TlsConnection, TlsListener,
+    PendingNetworkAudit, TlsClientConnectionMetadata, TlsConnection, TlsCredentialAccessError,
+    TlsListener,
 };
 
 // Register TLS networking APIs to the linker
@@ -35,6 +36,11 @@ pub fn register<T: NetworkingCtx + ErrorCtx + Send + 'static>(
     linker: &mut Linker<T>,
 ) -> Result<()> {
     linker.func_wrap10_async("lunatic::networking", "tls_bind", tls_bind)?;
+    linker.func_wrap8_async(
+        "lunatic::networking",
+        "tls_bind_with_credential",
+        tls_bind_with_credential,
+    )?;
     linker.func_wrap(
         "lunatic::networking",
         "drop_tls_listener",
@@ -292,6 +298,152 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
 
         audit.finish(audit_result, audit_reason);
 
+        Ok(result)
+    })
+}
+
+/// Creates a TLS listener from a host-provisioned, process-scoped credential.
+///
+/// `credential_low` and `credential_high` encode an opaque 16-byte handle as
+/// two little-endian halves. Private-key bytes never cross guest memory on
+/// this path. Handles are single-use once credential resolution succeeds, so
+/// a failed OS bind requires the host to provision a fresh handle.
+//
+// Returns:
+// * 0 on success - The listener ID is written to **id_u64_ptr**.
+// * 1 on error   - A stable, secret-free error ID is written to **id_u64_ptr**.
+//
+// Traps:
+// * If any referenced address or output memory is outside guest memory.
+#[allow(clippy::too_many_arguments)]
+fn tls_bind_with_credential<T: NetworkingCtx + ErrorCtx + Send>(
+    mut caller: Caller<T>,
+    addr_type: u32,
+    addr_u8_ptr: u32,
+    port: u32,
+    flow_info: u32,
+    scope_id: u32,
+    id_u64_ptr: u32,
+    credential_low: u64,
+    credential_high: u64,
+) -> Box<dyn Future<Output = Result<u32>> + Send + '_> {
+    Box::new(async move {
+        let mut audit = PendingNetworkAudit::new(
+            caller.data(),
+            AuditEvent::NetworkBind,
+            AuditAction::Bind,
+            redacted_network_target(AuditTargetKind::TlsListener, None, audit_port(port)),
+        );
+        let memory = get_memory(&mut caller)?;
+        validate_memory_range(
+            &caller,
+            &memory,
+            id_u64_ptr,
+            std::mem::size_of::<u64>(),
+            "lunatic::networking::tls_bind_with_credential",
+        )?;
+        let socket_addr = socket_address(
+            &caller,
+            &memory,
+            addr_type,
+            addr_u8_ptr,
+            port,
+            flow_info,
+            scope_id,
+        )?;
+
+        let mut credential_handle = [0_u8; 16];
+        credential_handle[..8].copy_from_slice(&credential_low.to_le_bytes());
+        credential_handle[8..].copy_from_slice(&credential_high.to_le_bytes());
+
+        // Authorization is checked without consuming the credential, then a
+        // finite network lease is reserved before the scoped single-use take.
+        let (tls_listener_or_error_id, result, audit_result, audit_reason) =
+            if !caller.data().can_use_tls_credential_handles() {
+                (
+                    caller.data_mut().add_error_resource(anyhow::Error::new(
+                        TlsCredentialAccessError::CapabilityDenied,
+                    )),
+                    1,
+                    AuditResult::Denied,
+                    AuditReason::CapabilityDenied,
+                )
+            } else {
+                match caller.data().reserve_network_handle_lease() {
+                    Ok(lease) => match caller
+                        .data()
+                        .take_tls_listener_credential(credential_handle)
+                    {
+                        Ok(acceptor) => {
+                            audit.set_fallback_reason(AuditReason::RuntimeFailure);
+                            audit.mark_async();
+                            match TcpListener::bind(socket_addr).await {
+                                Ok(listener) => {
+                                    let bound_port = listener
+                                        .local_addr()
+                                        .ok()
+                                        .map(|address| address.port())
+                                        .or_else(|| audit_port(port));
+                                    let id = caller
+                                        .data_mut()
+                                        .tls_listener_resources_mut()
+                                        .add(TlsListener { listener, acceptor });
+                                    lease.into_table_reservation();
+                                    audit.set_target(redacted_network_target(
+                                        AuditTargetKind::TlsListener,
+                                        Some(id),
+                                        bound_port,
+                                    ));
+                                    (id, 0, AuditResult::Succeeded, AuditReason::Completed)
+                                }
+                                Err(error) => (
+                                    caller.data_mut().add_error_resource(error.into()),
+                                    1,
+                                    AuditResult::Failed,
+                                    AuditReason::RuntimeFailure,
+                                ),
+                            }
+                        }
+                        Err(error) => {
+                            let (audit_result, audit_reason) = match error {
+                                TlsCredentialAccessError::CapabilityDenied => {
+                                    (AuditResult::Denied, AuditReason::CapabilityDenied)
+                                }
+                                TlsCredentialAccessError::Unavailable
+                                | TlsCredentialAccessError::Expired => {
+                                    (AuditResult::Denied, AuditReason::PolicyDenied)
+                                }
+                                TlsCredentialAccessError::ProviderFailure => {
+                                    (AuditResult::Failed, AuditReason::RuntimeFailure)
+                                }
+                            };
+                            (
+                                caller
+                                    .data_mut()
+                                    .add_error_resource(anyhow::Error::new(error)),
+                                1,
+                                audit_result,
+                                audit_reason,
+                            )
+                        }
+                    },
+                    Err(error) => (
+                        caller.data_mut().add_error_resource(error),
+                        1,
+                        AuditResult::Denied,
+                        AuditReason::ResourceLimit,
+                    ),
+                }
+            };
+
+        memory
+            .write(
+                &mut caller,
+                id_u64_ptr as usize,
+                &tls_listener_or_error_id.to_le_bytes(),
+            )
+            .or_trap("lunatic::networking::tls_bind_with_credential::write_result")?;
+        audit.finish(audit_result, audit_reason);
         Ok(result)
     })
 }

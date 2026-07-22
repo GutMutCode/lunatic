@@ -129,6 +129,14 @@ pub trait ProcessConfigCtx {
     fn set_can_create_configs(&mut self, can: bool);
     fn can_spawn_processes(&self) -> bool;
     fn set_can_spawn_processes(&mut self, can: bool);
+    /// Whether this process may consume a host-scoped TLS credential handle.
+    ///
+    /// The compatibility default is fail-closed so existing custom contexts
+    /// cannot gain the new authority without opting in explicitly.
+    fn can_use_tls_credential_handles(&self) -> bool {
+        false
+    }
+    fn set_can_use_tls_credential_handles(&mut self, _can: bool) {}
     fn get_max_table_elements(&self) -> u32 {
         0
     }
@@ -542,6 +550,18 @@ where
         "lunatic::process",
         "config_set_can_spawn_processes",
         config_set_can_spawn_processes,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_can_use_tls_credential_handles",
+        |caller: Caller<T>, config_id: u64| {
+            config_can_use_tls_credential_handles(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_can_use_tls_credential_handles",
+        config_set_can_use_tls_credential_handles,
     )?;
 
     linker.func_wrap8_async("lunatic::process", "spawn", spawn)?;
@@ -1177,6 +1197,12 @@ where
                     |config| config.set_max_sqlite_statements(value),
                 )
             }),
+        19 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_use_tls_credential_handles",
+            |config| config.set_can_use_tls_credential_handles(value != 0),
+        ),
         _ => {
             emit_invalid_config_update(caller.data(), config_id);
             Err(anyhow!("unknown config setting ID {setting}"))
@@ -1862,6 +1888,51 @@ where
             config_id,
             "config_set_can_spawn_processes",
             |config| config.set_can_spawn_processes(can != 0),
+        );
+        Ok(())
+    })
+}
+
+// Returns 1 if processes spawned from this configuration may consume scoped host TLS credential
+// handles, otherwise 0.
+//
+// Traps:
+// * If the config ID doesn't exist.
+fn config_can_use_tls_credential_handles<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    let can = caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap(
+            "lunatic::process::config_can_use_tls_credential_handles: Config ID doesn't exist",
+        )?
+        .can_use_tls_credential_handles();
+    Ok(can as u32)
+}
+
+// Controls whether processes spawned from this configuration may consume scoped host TLS
+// credential handles.
+//
+// Invalid or denied legacy mutations are safe no-ops.
+fn config_set_can_use_tls_credential_handles<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    can: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_can_use_tls_credential_handles",
+            |config| config.set_can_use_tls_credential_handles(can != 0),
         );
         Ok(())
     })
@@ -2660,6 +2731,7 @@ mod tests {
         config.set_max_config_bytes(100);
         config.set_max_sqlite_connections(100);
         config.set_max_sqlite_statements(100);
+        config.set_can_use_tls_credential_handles(true);
         assert_eq!(config.get_max_table_elements(), 0);
         assert_eq!(config.get_max_file_descriptors(), 0);
         assert_eq!(config.get_max_network_connections(), 0);
@@ -2680,5 +2752,6 @@ mod tests {
         assert_eq!(config.get_max_config_bytes(), 0);
         assert_eq!(config.get_max_sqlite_connections(), 0);
         assert_eq!(config.get_max_sqlite_statements(), 0);
+        assert!(!config.can_use_tls_credential_handles());
     }
 }

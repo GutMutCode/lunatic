@@ -51,7 +51,8 @@ The implemented boundary records:
 - child configuration creation, mutation, and final delegated-config validation;
 - filesystem preopen delegation and WASI directory operations (`open`, create, remove, link, rename, metadata, and time changes);
 - local spawn, get-or-spawn, distributed spawn authorization, receiver authorization, and receiver spawn results;
-- TCP/TLS bind, accept, and connect; UDP bind, connect, and send-to; DNS resolution;
+- TCP/TLS bind, accept, and connect, including provider-handle TLS bind capability/provider
+  outcomes; UDP bind, connect, and send-to; DNS resolution;
 - operation-level resource denials reached by the covered spawn and network paths;
 - hot-reload transaction commit, rollback, in-doubt, and failure results;
 - local/global distributed-registry changes, coordinator protocol denials, and snapshot application.
@@ -85,13 +86,51 @@ Related runtime `Debug` implementations redact credential-bearing configuration 
 
 Audit redaction is separate from the TLS listener snapshot contract. Version-2 listener entries
 contain only a local address and an opaque provider handle, while the certificate and raw private
-key remain outside the serialized snapshot. The `tls_bind` host path zeroizes its temporary host
-PEM copy but preserves the const guest input needed for SDK address fallback. It therefore does not
-erase the original guest buffer or duplicates elsewhere in Wasm memory and cannot prove that an
-entire `MemorySnapshot` is key-free.
-Intentional distributed credential-delivery APIs are outside that guarantee. See
-[TLS Listener Credential Snapshots](../tls/TLS_LISTENER_CREDENTIALS.md) for the scoped-provider,
-legacy-artifact, and future provider-handle guest ABI requirements.
+key remain outside the serialized snapshot. `tls_bind_with_credential` likewise accepts only
+address fields, an output pointer, and the low/high little-endian scalar halves of that handle. It
+does not read a guest certificate or private-key range, so a guest that uses only this path does not
+add those bytes to `MemorySnapshot`.
+
+The handle halves are not audit metadata. The provider-handle bind emits the same typed
+`network_bind`/`bind` boundary and redacted TLS-listener target as other TLS binds. It includes the
+host-derived environment/process subject and numeric port where available, but never a handle,
+certificate, key, provider message, socket address, hostname, or raw error. This guarantee applies
+to the typed audit record, not separate provider-owned or panic-hook output. A missing
+`can_use_tls_credential_handles` capability is checked without consuming the handle and before
+network quota reservation; it is always `denied`/`capability_denied`, even when the process has no
+remaining network quota. Missing, expired, revoked, consumed, and wrong-scope outcomes are all
+`denied`/`policy_denied`, preserving existence hiding across provider states. A provider error or
+panic is `failed`/`runtime_failure`, quota denial is `denied`/`resource_limit`, and an OS bind error
+is `failed`/`runtime_failure`. Each path returns a stable secret-free guest error and emits one
+terminal event.
+
+Provider `provision`, `take`, and `revoke` unwinds are caught at the state boundary and reduced to
+stable provider failure. A guest bind surfaces that as a stable error and typed
+failed/runtime-failure audit event; snapshot capture/restore surfaces a stable runtime error.
+During listener snapshot capture, failure to revoke any already-provisioned handle while rolling
+back a later provision failure is promoted to stable provider failure. This prevents
+Lunatic-generated audit or diagnostics from claiming clean rollback when the provider could retain
+a credential.
+
+`catch_unwind` does not suppress Rust's process-global panic hook: the hook runs first and may write
+the provider panic payload to stderr or a logger outside the `AuditEventV1` path. Providers must not
+panic, and panic payloads must never contain handles, keys, certificates, credential material, or
+provider detail. Panic-hook output and provider-owned logging are outside this audit-redaction and
+key-free-log contract. Embedders must configure/redact the hook and protect stderr/log collectors.
+Normally returned provider errors and Lunatic-generated logs/audit records retain the secret-free
+contract.
+
+Legacy `tls_bind` remains deprecated compatibility behavior. It zeroizes its temporary host PEM
+copy but preserves the const guest input needed for SDK address fallback, so it cannot establish a
+key-free `MemorySnapshot`. Its audit event is still redacted, but redacted logging does not erase
+the guest buffer.
+
+The raw `lunatic::distributed` CA/signing imports are a separate privileged compatibility boundary,
+not a listener-provider path. They do not inherit the provider-handle key-free or audit guarantee.
+Removing production `test_root_cert` and replacing raw signing imports with an explicit signer
+capability, non-exportable host/HSM provider, and typed audit coverage are tracked in Hanary #1704.
+See [TLS Listener Credential Snapshots](../tls/TLS_LISTENER_CREDENTIALS.md) for the full scope,
+revocation, migration, and distributed-handle restrictions.
 
 ## Delivery and backpressure
 
@@ -141,7 +180,13 @@ registry changes, TCP/UDP bind, DNS resolution, and TLS/port validation. They
 cover successful, denied, failed, and redacted outcomes. The invalid TLS bind
 case also verifies that the const guest key-input range remains unchanged and
 that its marker is absent from the typed audit event; the host-copy zeroization
-is an implementation property, not guest-memory erasure. The live-Wasm reload
+is an implementation property, not guest-memory erasure. Provider-handle TLS
+tests separately exercise actual guest Wasm bind/accept/TLS traffic and denial
+paths, assert one typed terminal event, and check that neither handle halves nor
+known key markers appear in guest memory snapshots or captured audit JSON. The capability case
+uses a zero network quota to prove that authorization is classified before resource pressure; the
+provider-state cases remain existence-hiding policy denials. The provider-panic restore test proves
+stable failure and unwind containment only; it does not prove panic-hook output redaction. The live-Wasm reload
 test captures one record for each commit, rollback, in-doubt, and blocked
 attempt. WASI directory tests cover successful access and cancellation-guard
 behavior. Distributed receiver decode/authorization and atomic-admission

@@ -70,6 +70,30 @@ pub struct TlsListener {
     pub acceptor: TlsAcceptor,
 }
 
+/// Stable, secret-free failures from the TLS credential authority boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsCredentialAccessError {
+    CapabilityDenied,
+    Unavailable,
+    Expired,
+    ProviderFailure,
+}
+
+impl fmt::Display for TlsCredentialAccessError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapabilityDenied => {
+                formatter.write_str("TLS credential handle capability is denied")
+            }
+            Self::Unavailable => formatter.write_str("TLS listener credential is unavailable"),
+            Self::Expired => formatter.write_str("TLS listener credential has expired"),
+            Self::ProviderFailure => formatter.write_str("TLS credential provider failed"),
+        }
+    }
+}
+
+impl std::error::Error for TlsCredentialAccessError {}
+
 impl TlsConnection {
     pub fn new(sock: TlsStream<TcpStream>) -> TlsConnection {
         let (read_half, write_half) = split(sock);
@@ -288,6 +312,27 @@ pub trait NetworkingCtx {
     fn udp_resources_mut(&mut self) -> &mut UdpResources;
     fn dns_resources(&self) -> &DnsResources;
     fn dns_resources_mut(&mut self) -> &mut DnsResources;
+
+    /// Returns whether this process may present scoped TLS credential handles.
+    ///
+    /// This non-consuming check runs before quota reservation so capability
+    /// denials have stable error and audit semantics. Credential resolution
+    /// must validate the capability again at the consumption boundary.
+    fn can_use_tls_credential_handles(&self) -> bool {
+        false
+    }
+
+    /// Resolves a host-owned TLS listener credential for this exact process.
+    ///
+    /// Implementations must validate current capability as well as runtime,
+    /// environment, and process scope before consuming the handle. The
+    /// default is deliberately fail-closed for third-party contexts.
+    fn take_tls_listener_credential(
+        &self,
+        _handle: [u8; 16],
+    ) -> std::result::Result<TlsAcceptor, TlsCredentialAccessError> {
+        Err(TlsCredentialAccessError::CapabilityDenied)
+    }
 
     /// Stable node identity included in typed network audit events, when known.
     fn audit_node_id(&self) -> Option<u64> {

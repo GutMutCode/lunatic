@@ -92,11 +92,15 @@ impl fmt::Display for TlsCredentialProviderError {
 
 impl Error for TlsCredentialProviderError {}
 
-/// Secure boundary used to provision and consume TLS listener credentials.
+/// Secure boundary used to provision and consume TLS listener credentials for
+/// guest provider-handle binds and serialized listener restoration.
 ///
 /// Handles are single-use: a successful `take` removes the credential from the
 /// provider. Implementations must not include handle values or secret material
-/// in returned errors.
+/// in returned errors. Implementations must also avoid panicking, especially
+/// with sensitive payloads: the runtime maps an unwind to `ProviderFailure`,
+/// but Rust's process-global panic hook runs before that unwind is caught and
+/// remains outside this provider error-redaction boundary.
 pub trait TlsCredentialProvider: Send + Sync {
     fn provision(
         &self,
@@ -109,6 +113,18 @@ pub trait TlsCredentialProvider: Send + Sync {
         scope: TlsCredentialScope,
         handle: &TlsCredentialHandle,
     ) -> Result<TlsCredentialMaterial, TlsCredentialProviderError>;
+
+    /// Revokes one credential without revealing whether another scope owns it.
+    ///
+    /// The default preserves provider compatibility and the single-use
+    /// contract by consuming the material through `take` and dropping it.
+    fn revoke(
+        &self,
+        scope: TlsCredentialScope,
+        handle: &TlsCredentialHandle,
+    ) -> Result<(), TlsCredentialProviderError> {
+        self.take(scope, handle).map(drop)
+    }
 }
 
 struct StoredCredential {
@@ -280,6 +296,29 @@ mod tests {
         let error = provider.take(scope(8), &handle).unwrap_err();
         assert_eq!(error, TlsCredentialProviderError::Unavailable);
         provider.take(scope(7), &handle).unwrap();
+    }
+
+    #[test]
+    fn handle_is_not_authority_outside_its_environment() {
+        let provider = EphemeralTlsCredentialProvider::default();
+        let handle = provider.provision(scope(7), material()).unwrap();
+
+        let error = provider
+            .take(TlsCredentialScope::new(12, 7), &handle)
+            .unwrap_err();
+        assert_eq!(error, TlsCredentialProviderError::Unavailable);
+        provider.take(scope(7), &handle).unwrap();
+    }
+
+    #[test]
+    fn revoked_handles_fail_with_the_same_stable_unavailable_error() {
+        let provider = EphemeralTlsCredentialProvider::default();
+        let handle = provider.provision(scope(7), material()).unwrap();
+
+        provider.revoke(scope(7), &handle).unwrap();
+        let error = provider.take(scope(7), &handle).unwrap_err();
+        assert_eq!(error, TlsCredentialProviderError::Unavailable);
+        assert_eq!(error.to_string(), "TLS listener credential is unavailable");
     }
 
     #[test]

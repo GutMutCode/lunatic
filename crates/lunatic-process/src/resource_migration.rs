@@ -23,6 +23,26 @@ impl TlsCredentialHandle {
     pub fn as_bytes(&self) -> &[u8; 16] {
         &self.0
     }
+
+    /// Encodes this opaque handle for the guest TLS provider-handle ABI.
+    ///
+    /// Each half uses little-endian byte order. Passing the handle as scalar
+    /// values keeps even the non-secret locator out of guest linear memory.
+    pub fn to_abi_parts(self) -> (u64, u64) {
+        let mut low = [0_u8; 8];
+        let mut high = [0_u8; 8];
+        low.copy_from_slice(&self.0[..8]);
+        high.copy_from_slice(&self.0[8..]);
+        (u64::from_le_bytes(low), u64::from_le_bytes(high))
+    }
+
+    /// Decodes the two little-endian scalar values used by the guest ABI.
+    pub fn from_abi_parts(low: u64, high: u64) -> Self {
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&low.to_le_bytes());
+        bytes[8..].copy_from_slice(&high.to_le_bytes());
+        Self(bytes)
+    }
 }
 
 impl fmt::Debug for TlsCredentialHandle {
@@ -339,6 +359,20 @@ mod tests {
         let snapshot = ResourceMigrationSnapshot::new();
         assert!(snapshot.is_empty());
         assert_eq!(snapshot.count(), 0);
+    }
+
+    #[test]
+    fn tls_credential_handle_guest_abi_round_trips_little_endian_halves() {
+        let bytes = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let handle = TlsCredentialHandle::from_bytes(bytes);
+
+        let (low, high) = handle.to_abi_parts();
+        assert_eq!(low, 0x7766_5544_3322_1100);
+        assert_eq!(high, 0xffee_ddcc_bbaa_9988);
+        assert_eq!(TlsCredentialHandle::from_abi_parts(low, high), handle);
     }
 
     #[test]

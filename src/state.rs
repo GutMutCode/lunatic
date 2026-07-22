@@ -18,14 +18,16 @@ use lunatic_distributed::{
 use lunatic_error_api::{ErrorCtx, ErrorResource};
 use lunatic_networking_api::{
     DnsIterator, DnsIteratorQuota, NetworkHandleLease, NetworkHandleQuota, NetworkingCtx,
-    TcpConnection, TlsConnection, TlsListener,
+    TcpConnection, TlsConnection, TlsCredentialAccessError, TlsListener,
 };
 use lunatic_process::env::{Environment, LunaticEnvironment};
 use lunatic_process::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use lunatic_process::state::{mailboxes_with_limits, ConfigResources, ProcessState};
 use lunatic_process::{
     config::ProcessConfig,
-    resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot, ResourceTransferReport},
+    resource_migration::{
+        ResourceMigrationSnapshot, ResourceSnapshot, ResourceTransferReport, TlsCredentialHandle,
+    },
     state::{SignalReceiver, SignalSender},
 };
 use lunatic_process::{mailbox::MessageMailbox, message::Message};
@@ -46,7 +48,7 @@ use wasmtime::{Linker, ResourceLimiter};
 use crate::{
     tls_credentials::{
         EphemeralTlsCredentialProvider, TlsCredentialMaterial, TlsCredentialProvider,
-        TlsCredentialScope,
+        TlsCredentialProviderError, TlsCredentialScope,
     },
     DefaultProcessConfig,
 };
@@ -64,6 +66,16 @@ fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
     socket.set_nonblocking(true)?;
     catch_unwind(AssertUnwindSafe(|| UdpSocket::from_std(socket)))
         .map_err(|_| std::io::Error::other("Tokio I/O driver is unavailable"))?
+}
+
+fn map_tls_credential_provider_error(
+    error: TlsCredentialProviderError,
+) -> TlsCredentialAccessError {
+    match error {
+        TlsCredentialProviderError::Unavailable => TlsCredentialAccessError::Unavailable,
+        TlsCredentialProviderError::Expired => TlsCredentialAccessError::Expired,
+        TlsCredentialProviderError::ProviderFailure => TlsCredentialAccessError::ProviderFailure,
+    }
 }
 
 #[derive(Debug)]
@@ -353,7 +365,8 @@ pub struct DefaultProcessState {
     registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
     // Resource usage stats (Phase 3)
     resource_stats: Arc<ResourceStats>,
-    // Host-owned TLS identities used only by serialized listener restoration.
+    // Host-owned TLS identities used by guest provider-handle binds and
+    // serialized listener restoration.
     tls_credential_provider: Arc<dyn TlsCredentialProvider>,
 }
 
@@ -408,6 +421,45 @@ impl DefaultProcessState {
 
     fn tls_credential_scope(&self) -> TlsCredentialScope {
         TlsCredentialScope::new(self.environment.id(), self.id)
+    }
+
+    /// Provisions one process-scoped credential for the guest TLS bind ABI.
+    ///
+    /// The returned opaque handle is single-use and does not contain private
+    /// key material. Provider unwinds map to the stable provider-failure result;
+    /// provider implementations remain responsible for panic-hook payloads.
+    pub fn provision_tls_listener_credential(
+        &self,
+        material: TlsCredentialMaterial,
+    ) -> std::result::Result<TlsCredentialHandle, TlsCredentialProviderError> {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.tls_credential_provider
+                .provision(self.tls_credential_scope(), material)
+        }))
+        .unwrap_or(Err(TlsCredentialProviderError::ProviderFailure))
+    }
+
+    /// Revokes an unused process-scoped guest TLS credential handle.
+    pub fn revoke_tls_listener_credential(
+        &self,
+        handle: &TlsCredentialHandle,
+    ) -> std::result::Result<(), TlsCredentialProviderError> {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.tls_credential_provider
+                .revoke(self.tls_credential_scope(), handle)
+        }))
+        .unwrap_or(Err(TlsCredentialProviderError::ProviderFailure))
+    }
+
+    fn take_tls_listener_credential_material(
+        &self,
+        handle: &TlsCredentialHandle,
+    ) -> std::result::Result<TlsCredentialMaterial, TlsCredentialProviderError> {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.tls_credential_provider
+                .take(self.tls_credential_scope(), handle)
+        }))
+        .unwrap_or(Err(TlsCredentialProviderError::ProviderFailure))
     }
 
     pub fn new(
@@ -887,16 +939,29 @@ impl ProcessState for DefaultProcessState {
             );
         }
 
+        let mut provisioned_tls_credentials = Vec::new();
         for (id, listener) in self.resources.tls_listeners.iter() {
             match listener.listener.local_addr() {
                 Ok(addr) => {
-                    let credential_handle = self
-                        .tls_credential_provider
-                        .provision(
-                            self.tls_credential_scope(),
-                            TlsCredentialMaterial::new(listener.acceptor.clone()),
-                        )
-                        .map_err(anyhow::Error::new)?;
+                    let credential_handle = match self.provision_tls_listener_credential(
+                        TlsCredentialMaterial::new(listener.acceptor.clone()),
+                    ) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            let mut rollback_failed = false;
+                            for handle in &provisioned_tls_credentials {
+                                rollback_failed |=
+                                    self.revoke_tls_listener_credential(handle).is_err();
+                            }
+                            let error = if rollback_failed {
+                                TlsCredentialProviderError::ProviderFailure
+                            } else {
+                                error
+                            };
+                            return Err(anyhow::Error::new(error));
+                        }
+                    };
+                    provisioned_tls_credentials.push(credential_handle);
                     snapshot.add_tls_listener(
                         *id,
                         ResourceSnapshot::TlsListener {
@@ -1037,8 +1102,7 @@ impl ProcessState for DefaultProcessState {
                 .parse::<SocketAddr>()
                 .map_err(|_| anyhow::anyhow!("TLS listener snapshot address is invalid"))?;
             let material = self
-                .tls_credential_provider
-                .take(self.tls_credential_scope(), &credential_handle)
+                .take_tls_listener_credential_material(&credential_handle)
                 .map_err(anyhow::Error::new)?;
             let lease = self
                 .reserve_network_handle_lease()
@@ -1292,6 +1356,25 @@ impl NetworkingCtx for DefaultProcessState {
 
     fn dns_resources_mut(&mut self) -> &mut lunatic_networking_api::DnsResources {
         &mut self.resources.dns_iterators
+    }
+
+    fn can_use_tls_credential_handles(&self) -> bool {
+        self.config.can_use_tls_credential_handles()
+    }
+
+    fn take_tls_listener_credential(
+        &self,
+        handle: [u8; 16],
+    ) -> std::result::Result<tokio_rustls::TlsAcceptor, TlsCredentialAccessError> {
+        if !self.config.can_use_tls_credential_handles() {
+            return Err(TlsCredentialAccessError::CapabilityDenied);
+        }
+
+        let handle = TlsCredentialHandle::from_bytes(handle);
+        let material = self
+            .take_tls_listener_credential_material(&handle)
+            .map_err(map_tls_credential_provider_error)?;
+        Ok(material.into_acceptor())
     }
 
     fn audit_node_id(&self) -> Option<u64> {
@@ -1671,6 +1754,64 @@ mod tests {
                 .map_err(|_| TlsCredentialProviderError::ProviderFailure)?
                 .take()
                 .ok_or(TlsCredentialProviderError::ProviderFailure)
+        }
+    }
+
+    struct PanickingTakeTlsCredentialProvider;
+
+    impl TlsCredentialProvider for PanickingTakeTlsCredentialProvider {
+        fn provision(
+            &self,
+            _scope: TlsCredentialScope,
+            _material: TlsCredentialMaterial,
+        ) -> Result<TlsCredentialHandle, TlsCredentialProviderError> {
+            Err(TlsCredentialProviderError::ProviderFailure)
+        }
+
+        fn take(
+            &self,
+            _scope: TlsCredentialScope,
+            _handle: &TlsCredentialHandle,
+        ) -> Result<TlsCredentialMaterial, TlsCredentialProviderError> {
+            panic!("provider take panic must stay inside the credential boundary")
+        }
+    }
+
+    struct FailingSnapshotRollbackTlsCredentialProvider {
+        provision_calls: Mutex<usize>,
+        revoke_calls: Mutex<usize>,
+    }
+
+    impl TlsCredentialProvider for FailingSnapshotRollbackTlsCredentialProvider {
+        fn provision(
+            &self,
+            _scope: TlsCredentialScope,
+            _material: TlsCredentialMaterial,
+        ) -> Result<TlsCredentialHandle, TlsCredentialProviderError> {
+            let mut calls = self.provision_calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                Ok(TlsCredentialHandle::from_bytes([0x31; 16]))
+            } else {
+                Err(TlsCredentialProviderError::Unavailable)
+            }
+        }
+
+        fn take(
+            &self,
+            _scope: TlsCredentialScope,
+            _handle: &TlsCredentialHandle,
+        ) -> Result<TlsCredentialMaterial, TlsCredentialProviderError> {
+            Err(TlsCredentialProviderError::ProviderFailure)
+        }
+
+        fn revoke(
+            &self,
+            _scope: TlsCredentialScope,
+            _handle: &TlsCredentialHandle,
+        ) -> Result<(), TlsCredentialProviderError> {
+            *self.revoke_calls.lock().unwrap() += 1;
+            Err(TlsCredentialProviderError::ProviderFailure)
         }
     }
 
@@ -2131,6 +2272,80 @@ mod tests {
         assert!(state.resources.tcp_listeners.is_empty());
         assert!(state.resources.tls_listeners.is_empty());
         assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn panicking_tls_provider_take_is_contained_during_serialized_restore(
+    ) -> anyhow::Result<()> {
+        use lunatic_process::state::ProcessState;
+
+        let provider = Arc::new(PanickingTakeTlsCredentialProvider);
+        let (mut state, _module, _config) = test_state_with_tls_provider(provider)?;
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        snapshot.add_tcp_listener(
+            1,
+            ResourceSnapshot::TcpListener {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+        snapshot.add_udp_socket(
+            2,
+            ResourceSnapshot::UdpSocket {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+        snapshot.add_tls_listener(
+            3,
+            ResourceSnapshot::TlsListener {
+                local_addr: "127.0.0.1:0".into(),
+                credential_handle: TlsCredentialHandle::from_bytes([0x9c; 16]),
+            },
+        );
+
+        let restore = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            state.restore_resource_snapshot(snapshot)
+        }));
+        let error = restore
+            .expect("provider take panic must not unwind across the credential boundary")
+            .expect_err("a panicking provider must fail closed");
+        assert_eq!(error.to_string(), "TLS credential provider failed");
+        assert!(state.resources.tcp_listeners.is_empty());
+        assert!(state.resources.udp_sockets.is_empty());
+        assert!(state.resources.tls_listeners.is_empty());
+        assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_rollback_failure_returns_stable_provider_failure() -> anyhow::Result<()> {
+        use lunatic_networking_api::TlsListener;
+        use lunatic_process::state::ProcessState;
+        use tokio::net::TcpListener;
+
+        let provider = Arc::new(FailingSnapshotRollbackTlsCredentialProvider {
+            provision_calls: Mutex::new(0),
+            revoke_calls: Mutex::new(0),
+        });
+        let (mut state, _module, _config) = test_state_with_tls_provider(provider.clone())?;
+        let (acceptor, _connector, _key_der, _key_pem) = test_tls_identity()?;
+        for _ in 0..2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            state.resources.tls_listeners.add(TlsListener {
+                listener,
+                acceptor: acceptor.clone(),
+            });
+            state.reserve_network_handle()?;
+        }
+
+        let error = state
+            .capture_resource_snapshot()
+            .expect_err("failed revocation must override the original provision error");
+        assert_eq!(error.to_string(), "TLS credential provider failed");
+        assert_eq!(*provider.provision_calls.lock().unwrap(), 2);
+        assert_eq!(*provider.revoke_calls.lock().unwrap(), 1);
+        assert_eq!(state.resources.tls_listeners.len(), 2);
+        assert_eq!(state.network_resource_counts(), (2, 2));
         Ok(())
     }
 

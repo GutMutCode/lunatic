@@ -12,6 +12,12 @@
 > serialization. See [TLS listener credentials](../tls/TLS_LISTENER_CREDENTIALS.md) and
 > [TLS stream migration](../tls/TLS_STREAM_MIGRATION.md).
 
+> **GUEST ABI CORRECTION (July 22, 2026)**: New guests can use
+> `lunatic::networking::tls_bind_with_credential` with address fields, an output pointer, and the
+> low/high little-endian `u64` halves of that handle. The host derives environment/process scope
+> and requires the default-denied `can_use_tls_credential_handles` capability; no certificate or
+> key buffer enters Wasm for this call. Raw-key `tls_bind` remains deprecated compatibility only.
+
 Unversioned and unknown-version snapshots are rejected. There is no automatic legacy importer.
 Operators upgrading from the old unversioned format must purge old copies and backups, rotate or
 revoke any key that may have appeared in them, and securely reprovision fresh version-2 handles.
@@ -88,10 +94,17 @@ let bytes = snapshot.to_bytes()?;
 let restored = ResourceMigrationSnapshot::from_bytes(&bytes)?;
 ```
 
-The default listener credential provider is process-local, five-minute, and single-use. Persisted
-or restart restoration requires an explicitly injected provider that can securely reprovision the
-same handle and `(environment_id, process_id)` scope. Because lookup consumes a handle before bind
+The default listener credential provider is process-local, five-minute, single-use, explicitly
+revocable, and capped at 1,024 unexpired entries. Persisted or restart restoration requires an
+explicitly injected provider that can securely reprovision the same handle and
+`(environment_id, process_id)` scope. Guest consumption additionally requires the process's
+`can_use_tls_credential_handles` capability. Because lookup consumes a handle before bind
 completion, every retry requires a fresh snapshot or freshly provisioned handles.
+Provider provision/take/revoke unwinds are caught and reduced to stable provider failure. If a
+later listener provision fails during snapshot capture, earlier handles are revoked; any failed or
+panicking rollback revoke promotes the capture result to provider failure. Serialized restore uses
+the same unwind boundary before publishing resource-table changes. The process-global panic hook
+runs before `catch_unwind` returns and is not suppressed by this contract.
 
 ---
 
@@ -412,14 +425,21 @@ cargo test -p lunatic-process --lib test_resource_snapshot_serialization
 cargo test -p lunatic-process --lib legacy_unversioned_snapshot_is_rejected_without_echoing_secret_bytes
 cargo test -p lunatic-process --lib unknown_and_truncated_versions_are_rejected_without_payload_details
 cargo test -p lunatic-runtime --test tls_resource_migration
+cargo test -p lunatic-runtime --test tls_provider_guest
+cargo test -p lunatic-runtime --test imports_match
 cargo test -p lunatic-runtime --lib state::tests::serialized_tls_listener_reinjects_without_private_key_bytes
+cargo test -p lunatic-runtime --lib state::tests::panicking_tls_provider_take_is_contained_during_serialized_restore
+cargo test -p lunatic-runtime --lib state::tests::snapshot_rollback_failure_returns_stable_provider_failure
 cargo test -p lunatic-runtime --lib state::tests::hot_reload_transfers_live_tls_listener_without_provider_lookup
 cargo test -p lunatic-runtime --test capability_attenuation tcp_dns_and_tls_host_paths_emit_typed_terminal_events_once
 ```
 
 These tests separate versioned serialization, fail-closed legacy rejection, provider-backed
-listener rebind, production live-object transfer, const guest-input preservation, and temporary
-host key-copy zeroization. They do not make active serialized TLS streams restorable.
+listener rebind, provider-handle guest Wasm bind/accept/TLS traffic, capability-before-quota and
+existence-hiding provider denial, revocation, provider unwind containment, rollback-failure
+promotion, key-marker-free guest memory and audit output, production live-object transfer, legacy
+const guest-input preservation, and temporary host key-copy zeroization. They do not make active
+serialized TLS streams restorable or prove panic-hook output redaction.
 
 ### Integration Pattern (Application Responsibility)
 
@@ -645,16 +665,32 @@ Decide what happens if migration fails:
 ### ✅ Security Through Isolation
 
 **Listener snapshots**: Version 2 stores only a local address and an opaque provider handle, not a
-certificate or raw private key. Provider lookup is scoped to environment and process identity.
+certificate or raw private key. Provider lookup is scoped to environment and process identity;
+guest use first checks a default-denied, non-increasing process capability without consuming the
+handle or reserving quota, then rechecks it at scoped take. Normally returned provider errors and
+caught unwinds produce stable runtime results; failed rollback revocation cannot be reported as
+successful cleanup. Providers must not panic, and panic payloads must omit handles, keys,
+certificates, credential material, and provider detail. Provider-owned logging and process-global
+panic-hook stderr/logger output remain outside the key-free log guarantee and require embedder
+controls.
 
 **Live reload**: Ownership of the configured listener/acceptor moves in-process; it is not
 serialized or rebuilt.
 
-**Guest ABI boundary**: `tls_bind` preserves the const guest key-input range required by SDK
-multi-address fallback and zeroizes its temporary host PEM byte copy. The original guest buffer and
-duplicates elsewhere can remain in Wasm memory, and distributed credential delivery is outside
-this snapshot contract. Total avoidance of raw key bytes in Wasm needs a future provider-handle
-guest ABI.
+**Guest ABI boundary**: `tls_bind_with_credential` passes only the handle's low/high little-endian
+scalar halves and never accepts a guest certificate or private-key range. A workload that uses only
+this path does not add listener key bytes to its `MemorySnapshot`. Raw-key `tls_bind` remains
+deprecated for compatibility: it preserves the const guest range required by SDK multi-address
+fallback and zeroizes only the temporary host PEM copy, so no key-free memory claim applies.
+The new path audits capability as `denied`/`capability_denied`, unavailable or expired provider
+state as existence-hiding `denied`/`policy_denied`, and provider failure as
+`failed`/`runtime_failure`.
+
+**Distributed boundary**: The listener handle is process/node-local and is not delegated through
+distributed spawn or messages; copying its bits fails closed without the original scope and
+provider entry. The raw `lunatic::distributed` CA/signing imports are a separate privileged legacy
+boundary. Removing production `test_root_cert` and replacing raw signing with an explicit signer
+capability plus non-exportable host/HSM provider are tracked in Hanary #1704.
 
 ### ✅ Fault Tolerance & HA
 
@@ -709,7 +745,8 @@ Phase 7 delivers **practical resource migration** by:
 
 **Current result boundary**: Production process-local reload transfers supported live resources.
 Version-2 serialized snapshots can rebind TLS listeners only through scoped, single-use provider
-handles; they cannot restore active TLS streams.
+Provider-handle guest binding removes TLS key input from Wasm for migrated workloads, while legacy
+raw bind and distributed CA/signing import removal remain compatibility follow-ups.
 
 **Next**: Phase 8 (Observability) for production debugging capabilities.
 
