@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -29,10 +30,13 @@ use lunatic_process::{
 };
 use lunatic_process::{mailbox::MessageMailbox, message::Message};
 use lunatic_process_api::{ProcessConfigCtx, ProcessCtx};
-use lunatic_sqlite_api::{SQLiteConnections, SQLiteCtx, SQLiteGuestAllocators, SQLiteStatements};
+use lunatic_sqlite_api::{
+    SQLiteConnections, SQLiteCtx, SQLiteGuestAllocators, SQLiteResourceQuota, SQLiteResourceStats,
+    SQLiteStatements,
+};
 use lunatic_stdout_capture::StdoutCapture;
 use lunatic_timer_api::{TimerCtx, TimerResources};
-use lunatic_wasi_api::{build_wasi_with_audit, LunaticWasiCtx};
+use lunatic_wasi_api::{build_wasi_with_audit_and_quota, LunaticWasiCtx, WasiFileDescriptorQuota};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -62,12 +66,34 @@ fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
         .map_err(|_| std::io::Error::other("Tokio I/O driver is unavailable"))?
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DbResources {
-    // sqlite data
-    sqlite_connections: SQLiteConnections,
+    // Statements must drop before connections so sqlite3_close cannot lose a
+    // busy native handle during process teardown.
     sqlite_statements: SQLiteStatements,
+    sqlite_connections: SQLiteConnections,
     sqlite_guest_allocator: SQLiteGuestAllocators,
+    sqlite_stats: Arc<SQLiteResourceStats>,
+}
+
+impl DbResources {
+    fn new(max_connections: u32, max_statements: u32) -> Self {
+        Self {
+            sqlite_statements: SQLiteStatements::default(),
+            sqlite_connections: SQLiteConnections::default(),
+            sqlite_guest_allocator: SQLiteGuestAllocators::default(),
+            sqlite_stats: Arc::new(SQLiteResourceStats::new(max_connections, max_statements)),
+        }
+    }
+}
+
+impl Default for DbResources {
+    fn default() -> Self {
+        Self::new(
+            lunatic_sqlite_api::DEFAULT_MAX_SQLITE_CONNECTIONS,
+            lunatic_sqlite_api::DEFAULT_MAX_SQLITE_STATEMENTS,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -114,14 +140,16 @@ impl ResourceStats {
         Ok(())
     }
 
-    fn release_file_descriptor(&self) {
+    fn release_file_descriptor(&self) -> Result<()> {
         let mut counts = self
             .counts
             .lock()
             .expect("resource accounting mutex poisoned");
-        if counts.open_file_descriptors > 0 {
-            counts.open_file_descriptors -= 1;
+        if counts.open_file_descriptors == 0 {
+            anyhow::bail!("File descriptor resource accounting underflow");
         }
+        counts.open_file_descriptors -= 1;
+        Ok(())
     }
 
     fn reserve_network_connection(&self) -> Result<()> {
@@ -208,6 +236,16 @@ impl ResourceStats {
         counts.max_file_descriptors = max_file_descriptors;
         counts.max_network_connections = max_network_connections;
         counts.max_dns_iterators = max_network_connections;
+    }
+}
+
+impl WasiFileDescriptorQuota for ResourceStats {
+    fn reserve(&self) -> Result<()> {
+        self.reserve_file_descriptor()
+    }
+
+    fn release(&self) -> Result<()> {
+        self.release_file_descriptor()
     }
 }
 
@@ -325,7 +363,8 @@ impl DefaultProcessState {
     }
 
     pub fn close_file_descriptor(&mut self) {
-        self.resource_stats.release_file_descriptor();
+        let result = self.resource_stats.release_file_descriptor();
+        debug_assert!(result.is_ok());
     }
 
     pub fn can_open_network_connection(&mut self) -> anyhow::Result<()> {
@@ -353,6 +392,10 @@ impl DefaultProcessState {
 
     pub fn dns_iterator_count(&self) -> u32 {
         self.resource_stats.dns_iterator_count()
+    }
+
+    pub fn sqlite_resource_counts(&self) -> (u32, u32) {
+        self.db_resources.sqlite_stats.counts()
     }
 
     fn live_network_handle_count(&self) -> usize {
@@ -425,6 +468,17 @@ impl DefaultProcessState {
         if let Some(distributed) = distributed.as_ref() {
             audit_subject = audit_subject.with_node_id(distributed.node_id());
         }
+        let resource_stats = Arc::new(ResourceStats::new(
+            config.get_max_file_descriptors(),
+            config.get_max_network_connections(),
+        ));
+        let wasi = build_wasi_with_audit_and_quota(
+            Some(config.command_line_arguments()),
+            Some(config.environment_variables()),
+            config.preopened_dirs(),
+            audit_subject,
+            resource_stats.clone(),
+        )?;
         let state = Self {
             id,
             environment,
@@ -437,21 +491,16 @@ impl DefaultProcessState {
             signal_mailbox,
             message_mailbox,
             resources: Resources::default(),
-            wasi: build_wasi_with_audit(
-                Some(config.command_line_arguments()),
-                Some(config.environment_variables()),
-                config.preopened_dirs(),
-                audit_subject,
-            )?,
+            wasi,
             wasi_stdout: None,
             wasi_stderr: None,
             initialized: false,
             registry,
-            db_resources: DbResources::default(),
-            resource_stats: Arc::new(ResourceStats::new(
-                config.get_max_file_descriptors(),
-                config.get_max_network_connections(),
-            )),
+            db_resources: DbResources::new(
+                config.get_max_sqlite_connections(),
+                config.get_max_sqlite_statements(),
+            ),
+            resource_stats,
             tls_credential_provider,
         };
         Ok(state)
@@ -491,6 +540,17 @@ impl ProcessState for DefaultProcessState {
         if let Some(distributed) = self.distributed.as_ref() {
             audit_subject = audit_subject.with_node_id(distributed.node_id());
         }
+        let resource_stats = Arc::new(ResourceStats::new(
+            config.get_max_file_descriptors(),
+            config.get_max_network_connections(),
+        ));
+        let wasi = build_wasi_with_audit_and_quota(
+            Some(config.command_line_arguments()),
+            Some(config.environment_variables()),
+            config.preopened_dirs(),
+            audit_subject,
+            resource_stats.clone(),
+        )?;
         let state = Self {
             id,
             environment: self.environment.clone(),
@@ -503,21 +563,16 @@ impl ProcessState for DefaultProcessState {
             signal_mailbox,
             message_mailbox,
             resources: Resources::default(),
-            wasi: build_wasi_with_audit(
-                Some(config.command_line_arguments()),
-                Some(config.environment_variables()),
-                config.preopened_dirs(),
-                audit_subject,
-            )?,
+            wasi,
             wasi_stdout: None,
             wasi_stderr: None,
             initialized: false,
             registry: self.registry.clone(),
-            db_resources: DbResources::default(),
-            resource_stats: Arc::new(ResourceStats::new(
-                config.get_max_file_descriptors(),
-                config.get_max_network_connections(),
-            )),
+            db_resources: DbResources::new(
+                config.get_max_sqlite_connections(),
+                config.get_max_sqlite_statements(),
+            ),
+            resource_stats,
             tls_credential_provider: self.tls_credential_provider.clone(),
         };
         Ok(state)
@@ -539,6 +594,18 @@ impl ProcessState for DefaultProcessState {
             audit_subject = audit_subject.with_node_id(distributed.node_id());
         }
 
+        let resource_stats = Arc::new(ResourceStats::new(
+            config.get_max_file_descriptors(),
+            config.get_max_network_connections(),
+        ));
+        let wasi = build_wasi_with_audit_and_quota(
+            Some(config.command_line_arguments()),
+            Some(config.environment_variables()),
+            config.preopened_dirs(),
+            audit_subject,
+            resource_stats.clone(),
+        )?;
+
         Ok(Self {
             id: self.id,
             environment: self.environment.clone(),
@@ -551,21 +618,16 @@ impl ProcessState for DefaultProcessState {
             signal_mailbox: self.signal_mailbox.clone(),
             message_mailbox: self.message_mailbox.clone(),
             resources: Resources::default(),
-            wasi: build_wasi_with_audit(
-                Some(config.command_line_arguments()),
-                Some(config.environment_variables()),
-                config.preopened_dirs(),
-                audit_subject,
-            )?,
+            wasi,
             wasi_stdout: None,
             wasi_stderr: None,
             initialized: false,
             registry: self.registry.clone(),
-            db_resources: DbResources::default(),
-            resource_stats: Arc::new(ResourceStats::new(
-                config.get_max_file_descriptors(),
-                config.get_max_network_connections(),
-            )),
+            db_resources: DbResources::new(
+                config.get_max_sqlite_connections(),
+                config.get_max_sqlite_statements(),
+            ),
+            resource_stats,
             tls_credential_provider: self.tls_credential_provider.clone(),
         })
     }
@@ -671,8 +733,22 @@ impl ProcessState for DefaultProcessState {
             self.resources.dns_iterators.len(),
             source_dns_iterators,
         );
+        let source_sqlite_counts = self.db_resources.sqlite_stats.counts();
+        anyhow::ensure!(
+            self.db_resources.sqlite_connections.len() <= source_sqlite_counts.0 as usize
+                && self.db_resources.sqlite_statements.len()
+                    == source_sqlite_counts.1 as usize,
+            "source SQLite accounting drifted (connection handles={}, live connections={}, statement handles={}, live statements={})",
+            self.db_resources.sqlite_connections.len(),
+            source_sqlite_counts.0,
+            self.db_resources.sqlite_statements.len(),
+            source_sqlite_counts.1,
+        );
         let target_counts = target.resource_stats.counts();
         let target_dns_iterators = target.resource_stats.dns_iterator_count();
+        let target_sqlite_counts = target.db_resources.sqlite_stats.counts();
+        let target_preopened_dirs = u32::try_from(target.config.preopened_dirs().len())
+            .map_err(|_| anyhow::anyhow!("replacement preopen count exceeds u32"))?;
         anyhow::ensure!(
             target.resources.tcp_listeners.is_empty()
                 && target.resources.tcp_streams.is_empty()
@@ -680,14 +756,67 @@ impl ProcessState for DefaultProcessState {
                 && target.resources.tls_streams.is_empty()
                 && target.resources.udp_sockets.is_empty()
                 && target.resources.dns_iterators.is_empty()
-                && target_counts == (0, 0)
-                && target_dns_iterators == 0,
-            "replacement process state already owns network resources"
+                && target.resources.modules.is_empty()
+                && target.resources.configs.is_empty()
+                && target_counts == (target_preopened_dirs, 0)
+                && target_dns_iterators == 0
+                && target.db_resources.sqlite_connections.is_empty()
+                && target.db_resources.sqlite_statements.is_empty()
+                && target_sqlite_counts == (0, 0),
+            "replacement process state owns resources beyond its configured preopens"
         );
         self.resource_stats.validate_limits(
             target.config.get_max_file_descriptors(),
             target.config.get_max_network_connections(),
         )?;
+        self.db_resources.sqlite_stats.validate_limits(
+            target.config.get_max_sqlite_connections(),
+            target.config.get_max_sqlite_statements(),
+        )?;
+        self.config
+            .validate_retained_values_against(target.config.as_ref())
+            .map_err(anyhow::Error::msg)?;
+        for (_, resolved_path) in self.config.preopened_dirs() {
+            target
+                .config
+                .can_delegate_preopen_dir(std::path::Path::new(resolved_path))
+                .map_err(|reason| {
+                    anyhow::anyhow!(
+                        "source WASI preopen is outside replacement authority: {reason}"
+                    )
+                })?;
+        }
+        anyhow::ensure!(
+            self.resources.modules.len() <= target.config.get_max_modules() as usize,
+            "{} module handles exceed replacement limit {}",
+            self.resources.modules.len(),
+            target.config.get_max_modules(),
+        );
+        for (module_id, module) in self.resources.modules.iter() {
+            let source_bytes = u64::try_from(module.source().bytes.len())
+                .map_err(|_| anyhow::anyhow!("module {module_id} source size exceeds u64"))?;
+            anyhow::ensure!(
+                source_bytes <= target.config.get_max_module_bytes(),
+                "module {module_id} source size {source_bytes} exceeds replacement limit {}",
+                target.config.get_max_module_bytes(),
+            );
+        }
+        anyhow::ensure!(
+            self.resources.configs.len() <= target.config.get_max_configs() as usize,
+            "{} configuration handles exceed replacement limit {}",
+            self.resources.configs.len(),
+            target.config.get_max_configs(),
+        );
+        for (config_id, config) in self.resources.configs.iter() {
+            target
+                .config
+                .validate_child_config(config)
+                .map_err(|reason| {
+                    anyhow::anyhow!(
+                        "configuration {config_id} exceeds replacement authority: {reason}"
+                    )
+                })?;
+        }
 
         let report = ResourceTransferReport {
             tcp_listeners: self.resources.tcp_listeners.len(),
@@ -707,6 +836,10 @@ impl ProcessState for DefaultProcessState {
         self.resource_stats.set_limits(
             target.config.get_max_file_descriptors(),
             target.config.get_max_network_connections(),
+        );
+        self.db_resources.sqlite_stats.set_limits(
+            target.config.get_max_sqlite_connections(),
+            target.config.get_max_sqlite_statements(),
         );
         std::mem::swap(&mut self.resources, &mut target.resources);
         std::mem::swap(&mut self.db_resources, &mut target.db_resources);
@@ -1257,6 +1390,10 @@ impl SQLiteCtx for DefaultProcessState {
         &self.db_resources.sqlite_statements
     }
 
+    fn sqlite_quota(&self) -> Arc<dyn SQLiteResourceQuota> {
+        self.db_resources.sqlite_stats.clone()
+    }
+
     fn sqlite_guest_allocator(&self) -> &SQLiteGuestAllocators {
         &self.db_resources.sqlite_guest_allocator
     }
@@ -1277,6 +1414,13 @@ pub(crate) struct Resources {
     pub(crate) tls_streams: HashMapId<Arc<TlsConnection>>,
     pub(crate) udp_sockets: HashMapId<Arc<UdpSocket>>,
     pub(crate) errors: HashMapId<anyhow::Error>,
+}
+
+impl Drop for Resources {
+    fn drop(&mut self) {
+        lunatic_process_api::module_resource_handles_removed(self.modules.len());
+        lunatic_process_api::config_resource_handles_removed(self.configs.len());
+    }
 }
 
 impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
@@ -1333,6 +1477,17 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             .with_node_id(distributed.node_id())
             .with_environment_id(environment.id())
             .with_process_id(id);
+        let resource_stats = Arc::new(ResourceStats::new(
+            config.get_max_file_descriptors(),
+            config.get_max_network_connections(),
+        ));
+        let wasi = build_wasi_with_audit_and_quota(
+            Some(config.command_line_arguments()),
+            Some(config.environment_variables()),
+            config.preopened_dirs(),
+            audit_subject,
+            resource_stats.clone(),
+        )?;
         let state = Self {
             id,
             environment,
@@ -1345,21 +1500,16 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
             signal_mailbox,
             message_mailbox,
             resources: Resources::default(),
-            wasi: build_wasi_with_audit(
-                Some(config.command_line_arguments()),
-                Some(config.environment_variables()),
-                config.preopened_dirs(),
-                audit_subject,
-            )?,
+            wasi,
             wasi_stdout: None,
             wasi_stderr: None,
             initialized: false,
             registry: Default::default(), // TODO move registry into env?
-            db_resources: DbResources::default(),
-            resource_stats: Arc::new(ResourceStats::new(
-                config.get_max_file_descriptors(),
-                config.get_max_network_connections(),
-            )),
+            db_resources: DbResources::new(
+                config.get_max_sqlite_connections(),
+                config.get_max_sqlite_statements(),
+            ),
+            resource_stats,
             tls_credential_provider: Arc::new(EphemeralTlsCredentialProvider::default()),
         };
         Ok(state)

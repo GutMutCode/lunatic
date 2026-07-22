@@ -7,7 +7,7 @@ use std::{
 use anyhow::{anyhow, Result};
 use lunatic_common_api::{get_memory, IntoTrap, LinkerAsyncExt};
 use lunatic_networking_api::{NetworkHandleLease, NetworkingCtx};
-use lunatic_process_api::ProcessCtx;
+use lunatic_process_api::{ProcessConfigCtx, ProcessCtx};
 use tokio::time::{timeout, Duration};
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
 
@@ -21,7 +21,10 @@ use lunatic_process::{
 // Register the mailbox APIs to the linker
 pub fn register<T: ProcessState + ProcessCtx<T> + NetworkingCtx + Send + 'static>(
     linker: &mut Linker<T>,
-) -> Result<()> {
+) -> Result<()>
+where
+    T::Config: ProcessConfigCtx,
+{
     linker.func_wrap(
         "lunatic::message",
         "create_data",
@@ -480,7 +483,17 @@ fn push_module<T: ProcessState + ProcessCtx<T> + NetworkingCtx + 'static>(
 fn take_module<T: ProcessState + ProcessCtx<T> + NetworkingCtx + 'static>(
     mut caller: Caller<T>,
     index: u64,
-) -> Result<u64> {
+) -> Result<u64>
+where
+    T::Config: ProcessConfigCtx,
+{
+    let max_modules = caller.data().config().get_max_modules() as usize;
+    if caller.data().module_resources().len() >= max_modules {
+        return Err(anyhow!("Module resource limit ({max_modules}) reached"));
+    }
+
+    // Destination admission is checked before taking the message slot so a
+    // quota failure cannot consume the sender-owned module resource.
     let message = caller
         .data_mut()
         .message_scratch_area()
@@ -497,7 +510,9 @@ fn take_module<T: ProcessState + ProcessCtx<T> + NetworkingCtx + 'static>(
             return Err(anyhow!("Unexpected `Message::ProcessDied` in scratch area"))
         }
     };
-    Ok(caller.data_mut().module_resources_mut().add(module))
+    let module_id = caller.data_mut().module_resources_mut().add(module);
+    lunatic_process_api::module_resource_handle_added();
+    Ok(module_id)
 }
 
 // Adds a tcp stream resource to the message that is currently in the scratch area and returns

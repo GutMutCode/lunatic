@@ -13,6 +13,8 @@ use lunatic_stdout_capture::StdoutCapture;
 use lunatic_wasi_api::LunaticWasiCtx;
 use tokio::sync::RwLock;
 
+use super::common::CompiledModuleArgs;
+
 #[derive(Parser, Debug)]
 #[command(version)]
 struct Args {
@@ -57,9 +59,13 @@ struct Args {
     #[arg(long)]
     exact: bool,
 
-    /// Arguments passed to the guest
+    /// Arguments passed to the guest. Use `--` before guest flags that have
+    /// the same name as Lunatic runtime options.
     #[arg()]
     wasm_args: Vec<String>,
+
+    #[command(flatten)]
+    compiled_modules: CompiledModuleArgs,
 }
 
 pub(crate) async fn test(augmented_args: Option<Vec<String>>) -> Result<()> {
@@ -74,6 +80,7 @@ pub(crate) async fn test(augmented_args: Option<Vec<String>>) -> Result<()> {
         Some(a) => Args::parse_from(a),
         None => Args::parse(),
     };
+    let compiled_module_limits = args.compiled_modules.limits();
 
     let mut config = DefaultProcessConfig::default();
     // Allow initial process to compile modules, create configurations and spawn sub-processes
@@ -95,7 +102,10 @@ pub(crate) async fn test(augmented_args: Option<Vec<String>>) -> Result<()> {
 
     // Create wasmtime runtime
     let wasmtime_config = runtimes::wasmtime::default_config();
-    let runtime = runtimes::wasmtime::WasmtimeRuntime::new(&wasmtime_config)?;
+    let runtime = runtimes::wasmtime::WasmtimeRuntime::new_with_module_limits(
+        &wasmtime_config,
+        compiled_module_limits,
+    )?;
 
     // Load and compile wasm module
     let path = args.wasm;
@@ -444,6 +454,32 @@ pub(crate) async fn test(augmented_args: Option<Vec<String>>) -> Result<()> {
         // Returning an error lets the top-level runtime perform bounded audit
         // flushing before reporting a non-zero exit status to cargo.
         Err(anyhow::anyhow!("{} test(s) failed", failures.len()))
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    #[test]
+    fn cargo_test_runner_accepts_module_limits_and_escaped_guest_flags() {
+        let args = Args::try_parse_from([
+            "lunatic",
+            "run",
+            "tests.wasm",
+            "--max-single-module-bytes",
+            "2048",
+            "filter",
+            "--",
+            "--max-single-module-bytes",
+        ])
+        .unwrap();
+
+        assert_eq!(args.compiled_modules.limits().single_module_bytes, 2048);
+        assert_eq!(args.filter.as_deref(), Some("filter"));
+        assert_eq!(args.wasm_args, ["--max-single-module-bytes"]);
     }
 }
 

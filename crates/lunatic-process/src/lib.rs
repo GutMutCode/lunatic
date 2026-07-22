@@ -652,6 +652,12 @@ pub fn describe_metrics() {
         Unit::Count,
         "Number of currently active environments"
     );
+
+    describe_gauge!(
+        "lunatic.process.node.process.count",
+        Unit::Count,
+        "Number of processes currently admitted across all node environments"
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -738,7 +744,7 @@ impl Process for NativeProcess {
         let labels = [("process_kind", "native")];
         #[cfg(all(feature = "metrics", feature = "detailed_metrics"))]
         let labels = [
-            ("process_kind", "native"),
+            ("process_kind", "native".to_owned()),
             ("process_id", self.id().to_string()),
         ];
         #[cfg(feature = "metrics")]

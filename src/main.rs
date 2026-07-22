@@ -20,10 +20,16 @@ fn is_run_implied() -> bool {
     // lunatic <foo.wasm> -> Implied run
     // lunatic run <foo.wasm> -> Explicit run
     // lunatic fdskl <foo.wasm> -> Not implied run
-    let test_re = Regex::new(r"^(--bench|--dir|.+\.wasm)")
+    is_run_implied_by_first_argument(&std::env::args().nth(1).unwrap())
+}
+
+fn is_run_implied_by_first_argument(first: &str) -> bool {
+    let test_re = Regex::new(
+        r"^(--bench|--dir|--watch|--max-compiled-modules|--max-compiled-module-bytes|--max-single-module-bytes|.+\.wasm)",
+    )
         .expect("BUG: Regex error with lunatic::mode::execution::is_run_implied()");
 
-    test_re.is_match(&std::env::args().nth(1).unwrap())
+    test_re.is_match(first)
 }
 
 #[tokio::main]
@@ -89,4 +95,21 @@ async fn main() -> Result<()> {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_run_implied_by_first_argument;
+
+    #[test]
+    fn runtime_module_limit_flags_support_implied_run() {
+        assert!(is_run_implied_by_first_argument("--max-compiled-modules"));
+        assert!(is_run_implied_by_first_argument(
+            "--max-compiled-module-bytes"
+        ));
+        assert!(is_run_implied_by_first_argument(
+            "--max-single-module-bytes"
+        ));
+        assert!(!is_run_implied_by_first_argument("node"));
+    }
 }

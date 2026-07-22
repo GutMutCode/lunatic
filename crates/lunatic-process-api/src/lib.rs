@@ -2,10 +2,14 @@ use std::{
     convert::{TryFrom, TryInto},
     future::Future,
     io::Write,
+    ops::Range,
     path::Path,
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
+
+#[cfg(feature = "metrics")]
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use hash_map_id::HashMapId;
@@ -152,6 +156,34 @@ pub trait ProcessConfigCtx {
         lunatic_process::config::DEFAULT_MAX_MESSAGE_RESOURCES
     }
     fn set_max_message_resources(&mut self, _max: u32) {}
+    fn get_max_modules(&self) -> u32 {
+        0
+    }
+    fn set_max_modules(&mut self, _max: u32) {}
+    fn get_max_configs(&self) -> u32 {
+        0
+    }
+    fn set_max_configs(&mut self, _max: u32) {}
+    fn get_max_module_bytes(&self) -> u64 {
+        0
+    }
+    fn set_max_module_bytes(&mut self, _max: u64) {}
+    fn get_max_config_entries(&self) -> u32 {
+        0
+    }
+    fn set_max_config_entries(&mut self, _max: u32) {}
+    fn get_max_config_bytes(&self) -> u64 {
+        0
+    }
+    fn set_max_config_bytes(&mut self, _max: u64) {}
+    fn get_max_sqlite_connections(&self) -> u32 {
+        0
+    }
+    fn set_max_sqlite_connections(&mut self, _max: u32) {}
+    fn get_max_sqlite_statements(&self) -> u32 {
+        0
+    }
+    fn set_max_sqlite_statements(&mut self, _max: u32) {}
     fn can_access_fs_location(&self, path: &Path) -> Result<(), String>;
 }
 
@@ -161,6 +193,37 @@ pub trait ProcessCtx<S: ProcessState> {
     fn module_resources(&self) -> &ModuleResources<S>;
     fn module_resources_mut(&mut self) -> &mut ModuleResources<S>;
     fn environment(&self) -> Arc<dyn Environment>;
+}
+
+/// Records admission of one guest-visible module handle.
+///
+/// This is public so resource transfers implemented by sibling host-API
+/// crates use the same metric semantics as `compile_module`.
+pub fn module_resource_handle_added() {
+    #[cfg(feature = "metrics")]
+    metrics::increment_gauge!("lunatic.process.modules.active", 1.0);
+}
+
+/// Reconciles guest-visible module handles released by table teardown.
+pub fn module_resource_handles_removed(_count: usize) {
+    #[cfg(feature = "metrics")]
+    if _count > 0 {
+        metrics::decrement_gauge!("lunatic.process.modules.active", _count as f64);
+    }
+}
+
+/// Records admission of one guest-visible child-configuration handle.
+pub fn config_resource_handle_added() {
+    #[cfg(feature = "metrics")]
+    metrics::increment_gauge!("lunatic.process.configs.active", 1.0);
+}
+
+/// Reconciles guest-visible child configurations released by table teardown.
+pub fn config_resource_handles_removed(_count: usize) {
+    #[cfg(feature = "metrics")]
+    if _count > 0 {
+        metrics::decrement_gauge!("lunatic.process.configs.active", _count as f64);
+    }
 }
 
 // Register the process APIs to the linker
@@ -200,7 +263,7 @@ where
     metrics::describe_gauge!(
         "lunatic.process.modules.active",
         metrics::Unit::Count,
-        "number of modules currently in memory"
+        "number of guest-visible module handles currently in process resource tables"
     );
 
     #[cfg(feature = "metrics")]
@@ -241,7 +304,7 @@ where
     metrics::describe_gauge!(
         "lunatic.process.configs.active",
         metrics::Unit::Count,
-        "number of configs currently in memory"
+        "number of guest-visible configuration handles currently in process resource tables"
     );
 
     linker.func_wrap("lunatic::process", "create_config", create_config)?;
@@ -358,6 +421,90 @@ where
             config_get_max_message_resources(caller, config_id).to_wasmtime_result()
         },
     )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_modules",
+        config_set_max_modules,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_modules",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_modules(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_configs",
+        config_set_max_configs,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_configs",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_configs(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_module_bytes",
+        config_set_max_module_bytes,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_module_bytes",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_module_bytes(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_config_entries",
+        config_set_max_config_entries,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_config_entries",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_config_entries(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_config_bytes",
+        config_set_max_config_bytes,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_config_bytes",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_config_bytes(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_sqlite_connections",
+        config_set_max_sqlite_connections,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_sqlite_connections",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_sqlite_connections(caller, config_id).to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap2_async(
+        "lunatic::process",
+        "config_set_max_sqlite_statements",
+        config_set_max_sqlite_statements,
+    )?;
+    linker.func_wrap(
+        "lunatic::process",
+        "config_get_max_sqlite_statements",
+        |caller: Caller<T>, config_id: u64| {
+            config_get_max_sqlite_statements(caller, config_id).to_wasmtime_result()
+        },
+    )?;
     linker.func_wrap("lunatic::process", "config_set_checked", config_set_checked)?;
     linker.func_wrap(
         "lunatic::process",
@@ -472,52 +619,131 @@ where
         return Ok(-1);
     }
 
-    #[cfg(feature = "metrics")]
-    metrics::increment_counter!("lunatic.process.modules.compiled");
+    let memory = get_memory(&mut caller)?;
+    let memory_len = memory.data_size(&caller);
+    let output_range = checked_guest_memory_range(
+        memory_len,
+        id_ptr,
+        u64::BITS / 8,
+        "lunatic::process::compile_module output",
+    )?;
+    let input_range = checked_guest_memory_range(
+        memory_len,
+        module_data_ptr,
+        module_data_len,
+        "lunatic::process::compile_module input",
+    )?;
 
-    #[cfg(feature = "metrics")]
-    metrics::increment_gauge!("lunatic.process.modules.active", 1.0);
+    let max_module_bytes = caller.data().config().get_max_module_bytes();
+    let max_modules = caller.data().config().get_max_modules() as usize;
+    let quota_error = if u64::from(module_data_len) > max_module_bytes {
+        Some(anyhow!(
+            "module input size {} exceeds max_module_bytes {max_module_bytes}",
+            module_data_len
+        ))
+    } else if caller.data().module_resources().len() >= max_modules {
+        Some(anyhow!("module handle limit ({max_modules}) reached"))
+    } else {
+        None
+    };
+
+    if let Some(error) = quota_error {
+        let previous_error_count = caller.data().error_resources().len();
+        let error_id = caller.data_mut().add_error_resource(error);
+        if let Err(error) = memory.write(&mut caller, output_range.start, &error_id.to_le_bytes()) {
+            if caller.data().error_resources().len() > previous_error_count {
+                caller.data_mut().error_resources_mut().remove(error_id);
+            }
+            audit.finish(AuditResult::Failed, AuditReason::InvalidInput);
+            return Err(anyhow!(
+                "lunatic::process::compile_module: write error ID: {error}"
+            ));
+        }
+        audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
+        return Ok(1);
+    }
+
+    // Bounds and quotas are checked before reserving a host allocation.
+    let source = memory
+        .data(&caller)
+        .get(input_range)
+        .or_trap("lunatic::process::compile_module input")?;
+    let mut module_bytes = Vec::new();
+    module_bytes
+        .try_reserve_exact(source.len())
+        .map_err(|error| anyhow!("could not allocate module input: {error}"))?;
+    module_bytes.extend_from_slice(source);
 
     #[cfg(feature = "metrics")]
     let start = Instant::now();
 
-    let mut module = vec![0; module_data_len as usize];
-    let memory = get_memory(&mut caller)?;
-    memory
-        .read(&caller, module_data_ptr as usize, module.as_mut_slice())
-        .or_trap("lunatic::process::compile_module")?;
-
-    let module = RawWasm::new(None, module);
-    let (mod_or_error_id, result) = match caller.data().runtime().compile_module(module) {
-        Ok(module) => {
-            let module_id = caller
-                .data_mut()
-                .module_resources_mut()
-                .add(Arc::new(module));
-            audit.finish_with_target(
-                AuditResult::Succeeded,
-                AuditReason::Completed,
-                AuditTarget::new(AuditTargetKind::Module)
-                    .with_resource_id(module_id)
-                    .with_sensitive_data(SensitiveData::Redacted),
-            );
-            (module_id, 0)
-        }
+    let module = RawWasm::new(None, module_bytes);
+    let module = match caller.data().runtime().compile_module(module) {
+        Ok(module) => module,
         Err(error) => {
+            let previous_error_count = caller.data().error_resources().len();
+            let error_id = caller.data_mut().add_error_resource(error);
+            if let Err(error) =
+                memory.write(&mut caller, output_range.start, &error_id.to_le_bytes())
+            {
+                if caller.data().error_resources().len() > previous_error_count {
+                    caller.data_mut().error_resources_mut().remove(error_id);
+                }
+                audit.finish(AuditResult::Failed, AuditReason::InvalidInput);
+                return Err(anyhow!(
+                    "lunatic::process::compile_module: write error ID: {error}"
+                ));
+            }
             audit.finish(AuditResult::Failed, AuditReason::RuntimeFailure);
-            (caller.data_mut().add_error_resource(error), 1)
+            return Ok(1);
         }
     };
 
-    #[cfg(feature = "metrics")]
-    let duration = Instant::now() - start;
-    #[cfg(feature = "metrics")]
-    metrics::histogram!("lunatic.process.modules.compiled.duration", duration);
+    let module_id = caller
+        .data_mut()
+        .module_resources_mut()
+        .add(Arc::new(module));
+    if let Err(error) = memory.write(&mut caller, output_range.start, &module_id.to_le_bytes()) {
+        caller.data_mut().module_resources_mut().remove(module_id);
+        audit.finish(AuditResult::Failed, AuditReason::InvalidInput);
+        return Err(anyhow!(
+            "lunatic::process::compile_module: write module ID: {error}"
+        ));
+    }
 
-    memory
-        .write(&mut caller, id_ptr as usize, &mod_or_error_id.to_le_bytes())
-        .or_trap("lunatic::process::compile_module")?;
-    Ok(result)
+    #[cfg(feature = "metrics")]
+    {
+        metrics::increment_counter!("lunatic.process.modules.compiled");
+        metrics::histogram!(
+            "lunatic.process.modules.compiled.duration",
+            Instant::now() - start
+        );
+    }
+    module_resource_handle_added();
+    audit.finish_with_target(
+        AuditResult::Succeeded,
+        AuditReason::Completed,
+        AuditTarget::new(AuditTargetKind::Module)
+            .with_resource_id(module_id)
+            .with_sensitive_data(SensitiveData::Redacted),
+    );
+    Ok(0)
+}
+
+fn checked_guest_memory_range(
+    memory_len: usize,
+    pointer: u32,
+    length: u32,
+    operation: &'static str,
+) -> Result<Range<usize>> {
+    let end = pointer
+        .checked_add(length)
+        .ok_or_else(|| anyhow!("{operation}: guest pointer overflow"))?;
+    let range = pointer as usize..end as usize;
+    if range.end > memory_len {
+        return Err(anyhow!("{operation}: guest range is outside memory"));
+    }
+    Ok(range)
 }
 
 // Drops the module from resources.
@@ -528,17 +754,16 @@ fn drop_module<T: ProcessState + ProcessCtx<T>>(
     mut caller: Caller<T>,
     module_id: u64,
 ) -> Result<()> {
-    #[cfg(feature = "metrics")]
-    metrics::increment_counter!("lunatic.process.modules.dropped");
-
-    #[cfg(feature = "metrics")]
-    metrics::decrement_gauge!("lunatic.process.modules.active", 1.0);
-
     caller
         .data_mut()
         .module_resources_mut()
         .remove(module_id)
         .or_trap("lunatic::process::drop_module: Module ID doesn't exist")?;
+    #[cfg(feature = "metrics")]
+    {
+        metrics::increment_counter!("lunatic.process.modules.dropped");
+    }
+    module_resource_handles_removed(1);
     Ok(())
 }
 
@@ -565,6 +790,11 @@ where
         audit.finish(AuditResult::Denied, AuditReason::CapabilityDenied);
         return -1;
     }
+    let max_configs = caller.data().config().get_max_configs() as usize;
+    if caller.data().config_resources().len() >= max_configs {
+        audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
+        return -1;
+    }
     let config = match caller.data().config().new_child_config() {
         Ok(config) => config,
         Err(_reason) => {
@@ -572,11 +802,12 @@ where
             return -1;
         }
     };
-    #[cfg(feature = "metrics")]
-    metrics::increment_counter!("lunatic.process.configs.created");
-    #[cfg(feature = "metrics")]
-    metrics::increment_gauge!("lunatic.process.configs.active", 1.0);
     let config_id = caller.data_mut().config_resources_mut().add(config);
+    #[cfg(feature = "metrics")]
+    {
+        metrics::increment_counter!("lunatic.process.configs.created");
+    }
+    config_resource_handle_added();
     audit.finish_with_target(
         AuditResult::Allowed,
         AuditReason::PolicyAllowed,
@@ -602,8 +833,7 @@ fn drop_config<T: ProcessState + ProcessCtx<T>>(
         .or_trap("lunatic::process::drop_config: Config ID doesn't exist")?;
     #[cfg(feature = "metrics")]
     metrics::increment_counter!("lunatic.process.configs.dropped");
-    #[cfg(feature = "metrics")]
-    metrics::decrement_gauge!("lunatic.process.configs.active", 1.0);
+    config_resource_handles_removed(1);
     Ok(())
 }
 
@@ -751,7 +981,9 @@ fn emit_registry_change<T: ProcessState>(
 // Setting IDs: 0=memory, 1=fuel, 2=table elements, 3=file descriptors,
 // 4=network connections, 5=compile, 6=create-config, 7=spawn,
 // 8=mailbox messages, 9=signal queue, 10=message bytes,
-// 11=message resources.
+// 11=message resources, 12=module handles, 13=config handles,
+// 14=single module bytes, 15=config entries, 16=config retained bytes,
+// 17=SQLite connections, 18=SQLite statements.
 fn config_set_checked<T>(mut caller: Caller<T>, config_id: u64, setting: u32, value: u64) -> i64
 where
     T: ProcessState + ProcessCtx<T> + ErrorCtx,
@@ -871,6 +1103,77 @@ where
                     config_id,
                     "config_set_max_message_resources",
                     |config| ProcessConfigCtx::set_max_message_resources(config, value),
+                )
+            }),
+        12 => u32::try_from(value)
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_modules exceeds u32")
+            })
+            .and_then(|value| {
+                mutate_child_config(&mut caller, config_id, "config_set_max_modules", |config| {
+                    config.set_max_modules(value)
+                })
+            }),
+        13 => u32::try_from(value)
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_configs exceeds u32")
+            })
+            .and_then(|value| {
+                mutate_child_config(&mut caller, config_id, "config_set_max_configs", |config| {
+                    config.set_max_configs(value)
+                })
+            }),
+        14 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_module_bytes",
+            |config| config.set_max_module_bytes(value),
+        ),
+        15 => u32::try_from(value)
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_config_entries exceeds u32")
+            })
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_config_entries",
+                    |config| config.set_max_config_entries(value),
+                )
+            }),
+        16 => mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_config_bytes",
+            |config| config.set_max_config_bytes(value),
+        ),
+        17 => u32::try_from(value)
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_sqlite_connections exceeds u32")
+            })
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_sqlite_connections",
+                    |config| config.set_max_sqlite_connections(value),
+                )
+            }),
+        18 => u32::try_from(value)
+            .map_err(|_| {
+                emit_invalid_config_update(caller.data(), config_id);
+                anyhow!("max_sqlite_statements exceeds u32")
+            })
+            .and_then(|value| {
+                mutate_child_config(
+                    &mut caller,
+                    config_id,
+                    "config_set_max_sqlite_statements",
+                    |config| config.set_max_sqlite_statements(value),
                 )
             }),
         _ => {
@@ -1209,6 +1512,231 @@ where
             "lunatic::process::config_get_max_message_resources: Config ID doesn't exist",
         )?;
     Ok(ProcessConfigCtx::get_max_message_resources(config))
+}
+
+fn config_set_max_modules<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(&mut caller, config_id, "config_set_max_modules", |config| {
+            config.set_max_modules(max)
+        });
+        Ok(())
+    })
+}
+
+fn config_get_max_modules<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_modules: Config ID doesn't exist")?
+        .get_max_modules())
+}
+
+fn config_set_max_configs<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(&mut caller, config_id, "config_set_max_configs", |config| {
+            config.set_max_configs(max)
+        });
+        Ok(())
+    })
+}
+
+fn config_get_max_configs<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_configs: Config ID doesn't exist")?
+        .get_max_configs())
+}
+
+fn config_set_max_module_bytes<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u64,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_module_bytes",
+            |config| config.set_max_module_bytes(max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_module_bytes<T>(caller: Caller<T>, config_id: u64) -> Result<u64>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_module_bytes: Config ID doesn't exist")?
+        .get_max_module_bytes())
+}
+
+fn config_set_max_config_entries<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_config_entries",
+            |config| config.set_max_config_entries(max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_config_entries<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_config_entries: Config ID doesn't exist")?
+        .get_max_config_entries())
+}
+
+fn config_set_max_config_bytes<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u64,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_config_bytes",
+            |config| config.set_max_config_bytes(max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_config_bytes<T>(caller: Caller<T>, config_id: u64) -> Result<u64>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_config_bytes: Config ID doesn't exist")?
+        .get_max_config_bytes())
+}
+
+fn config_set_max_sqlite_connections<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_sqlite_connections",
+            |config| config.set_max_sqlite_connections(max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_sqlite_connections<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_sqlite_connections: Config ID doesn't exist")?
+        .get_max_sqlite_connections())
+}
+
+fn config_set_max_sqlite_statements<T>(
+    mut caller: Caller<T>,
+    config_id: u64,
+    max: u32,
+) -> Box<dyn Future<Output = Result<()>> + Send + '_>
+where
+    T: ProcessState + ProcessCtx<T> + Send,
+    T::Config: ProcessConfigCtx,
+{
+    Box::new(async move {
+        let _ = mutate_child_config(
+            &mut caller,
+            config_id,
+            "config_set_max_sqlite_statements",
+            |config| config.set_max_sqlite_statements(max),
+        );
+        Ok(())
+    })
+}
+
+fn config_get_max_sqlite_statements<T>(caller: Caller<T>, config_id: u64) -> Result<u32>
+where
+    T: ProcessState + ProcessCtx<T>,
+    T::Config: ProcessConfigCtx,
+{
+    Ok(caller
+        .data()
+        .config_resources()
+        .get(config_id)
+        .or_trap("lunatic::process::config_get_max_sqlite_statements: Config ID doesn't exist")?
+        .get_max_sqlite_statements())
 }
 
 // Returns 1 if processes spawned from this configuration can compile Wasm modules, otherwise 0.
@@ -2132,6 +2660,13 @@ mod tests {
         config.set_max_signal_queue(100);
         config.set_max_message_size(100);
         config.set_max_message_resources(100);
+        config.set_max_modules(100);
+        config.set_max_configs(100);
+        config.set_max_module_bytes(100);
+        config.set_max_config_entries(100);
+        config.set_max_config_bytes(100);
+        config.set_max_sqlite_connections(100);
+        config.set_max_sqlite_statements(100);
         assert_eq!(config.get_max_table_elements(), 0);
         assert_eq!(config.get_max_file_descriptors(), 0);
         assert_eq!(config.get_max_network_connections(), 0);
@@ -2145,5 +2680,12 @@ mod tests {
             config.get_max_message_resources(),
             DEFAULT_MAX_MESSAGE_RESOURCES
         );
+        assert_eq!(config.get_max_modules(), 0);
+        assert_eq!(config.get_max_configs(), 0);
+        assert_eq!(config.get_max_module_bytes(), 0);
+        assert_eq!(config.get_max_config_entries(), 0);
+        assert_eq!(config.get_max_config_bytes(), 0);
+        assert_eq!(config.get_max_sqlite_connections(), 0);
+        assert_eq!(config.get_max_sqlite_statements(), 0);
     }
 }

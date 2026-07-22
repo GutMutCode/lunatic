@@ -1,6 +1,9 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use wasmtime::ResourceLimiter;
 
 use crate::{
@@ -11,20 +14,149 @@ use crate::{
 
 use super::RawWasm;
 
+/// Default node-wide ceiling for compiled modules retained by one runtime.
+pub const DEFAULT_MAX_COMPILED_MODULES: usize = 1_024;
+/// Default node-wide ceiling for source bytes retained by compiled modules.
+pub const DEFAULT_MAX_COMPILED_MODULE_BYTES: usize = 512 * 1024 * 1024;
+/// Default maximum source size accepted for one module compilation.
+pub const DEFAULT_MAX_MODULE_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompiledModuleLimits {
+    pub modules: usize,
+    pub source_bytes: usize,
+    pub single_module_bytes: usize,
+}
+
+impl Default for CompiledModuleLimits {
+    fn default() -> Self {
+        Self {
+            modules: DEFAULT_MAX_COMPILED_MODULES,
+            source_bytes: DEFAULT_MAX_COMPILED_MODULE_BYTES,
+            single_module_bytes: DEFAULT_MAX_MODULE_BYTES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CompiledModuleUsage {
+    pub modules: usize,
+    pub source_bytes: usize,
+}
+
+struct CompiledModuleBudget {
+    limits: CompiledModuleLimits,
+    usage: Mutex<CompiledModuleUsage>,
+}
+
+impl CompiledModuleBudget {
+    fn new(limits: CompiledModuleLimits) -> Self {
+        Self {
+            limits,
+            usage: Mutex::new(CompiledModuleUsage::default()),
+        }
+    }
+
+    fn usage(&self) -> CompiledModuleUsage {
+        *self
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn try_reserve(self: &Arc<Self>, source_bytes: usize) -> Result<CompiledModuleReservation> {
+        if source_bytes > self.limits.single_module_bytes {
+            return Err(anyhow!(
+                "module source size {source_bytes} exceeds single-module limit {}",
+                self.limits.single_module_bytes
+            ));
+        }
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let modules = usage
+            .modules
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("compiled-module count overflow"))?;
+        let retained_source_bytes = usage
+            .source_bytes
+            .checked_add(source_bytes)
+            .ok_or_else(|| anyhow!("compiled-module source-byte accounting overflow"))?;
+
+        if modules > self.limits.modules {
+            return Err(anyhow!(
+                "compiled-module limit ({}) reached",
+                self.limits.modules
+            ));
+        }
+        if retained_source_bytes > self.limits.source_bytes {
+            return Err(anyhow!(
+                "compiled-module source-byte limit ({}) exceeded",
+                self.limits.source_bytes
+            ));
+        }
+
+        usage.modules = modules;
+        usage.source_bytes = retained_source_bytes;
+        Ok(CompiledModuleReservation {
+            budget: Arc::clone(self),
+            source_bytes,
+        })
+    }
+
+    fn release(&self, source_bytes: usize) {
+        let mut usage = self
+            .usage
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        usage.modules = usage
+            .modules
+            .checked_sub(1)
+            .expect("compiled-module reservation count underflow");
+        usage.source_bytes = usage
+            .source_bytes
+            .checked_sub(source_bytes)
+            .expect("compiled-module reservation byte underflow");
+    }
+}
+
+struct CompiledModuleReservation {
+    budget: Arc<CompiledModuleBudget>,
+    source_bytes: usize,
+}
+
+impl Drop for CompiledModuleReservation {
+    fn drop(&mut self) {
+        self.budget.release(self.source_bytes);
+    }
+}
+
 #[derive(Clone)]
 pub struct WasmtimeRuntime {
     engine: wasmtime::Engine,
+    compiled_module_budget: Arc<CompiledModuleBudget>,
 }
 
 impl WasmtimeRuntime {
     pub fn new(config: &wasmtime::Config) -> Result<Self> {
+        Self::new_with_module_limits(config, CompiledModuleLimits::default())
+    }
+
+    pub fn new_with_module_limits(
+        config: &wasmtime::Config,
+        limits: CompiledModuleLimits,
+    ) -> Result<Self> {
         let engine = wasmtime::Engine::new(config)?;
         // Each runtime owns a distinct Engine. Every Engine therefore needs its
         // own epoch ticker; a process-wide "started" flag leaves all later
         // runtimes unable to yield CPU-bound guests for signals or reloads.
         Self::start_epoch_ticker(engine.clone());
 
-        Ok(Self { engine })
+        Ok(Self {
+            engine,
+            compiled_module_budget: Arc::new(CompiledModuleBudget::new(limits)),
+        })
     }
 
     pub fn engine_handle(&self) -> wasmtime::Engine {
@@ -33,6 +165,14 @@ impl WasmtimeRuntime {
 
     pub fn engine(&self) -> &wasmtime::Engine {
         &self.engine
+    }
+
+    pub fn compiled_module_limits(&self) -> CompiledModuleLimits {
+        self.compiled_module_budget.limits
+    }
+
+    pub fn compiled_module_usage(&self) -> CompiledModuleUsage {
+        self.compiled_module_budget.usage()
     }
 
     /// Starts one epoch ticker shared by all processes using this Engine.
@@ -54,12 +194,16 @@ impl WasmtimeRuntime {
     where
         T: ProcessState + 'static,
     {
+        let reservation = self
+            .compiled_module_budget
+            .try_reserve(data.as_slice().len())?;
         let module = wasmtime::Module::new(&self.engine, data.as_slice())?;
         let mut linker = wasmtime::Linker::new(&self.engine);
         // Register host functions to linker.
         <T as ProcessState>::register(&mut linker)?;
         let instance_pre = linker.instantiate_pre(&module)?;
-        let compiled_module = WasmtimeCompiledModule::new(data, module, instance_pre);
+        let compiled_module =
+            WasmtimeCompiledModule::new_budgeted(data, module, instance_pre, reservation);
         Ok(compiled_module)
     }
 
@@ -116,6 +260,7 @@ pub struct WasmtimeCompiledModuleInner<T> {
     source: RawWasm,
     module: wasmtime::Module,
     instance_pre: wasmtime::InstancePre<T>,
+    _reservation: Option<CompiledModuleReservation>,
 }
 
 impl<T> WasmtimeCompiledModule<T> {
@@ -128,6 +273,22 @@ impl<T> WasmtimeCompiledModule<T> {
             source,
             module,
             instance_pre,
+            _reservation: None,
+        });
+        Self { inner }
+    }
+
+    fn new_budgeted(
+        source: RawWasm,
+        module: wasmtime::Module,
+        instance_pre: wasmtime::InstancePre<T>,
+        reservation: CompiledModuleReservation,
+    ) -> WasmtimeCompiledModule<T> {
+        let inner = Arc::new(WasmtimeCompiledModuleInner {
+            source,
+            module,
+            instance_pre,
+            _reservation: Some(reservation),
         });
         Self { inner }
     }
@@ -147,6 +308,10 @@ impl<T> WasmtimeCompiledModule<T> {
     /// Get the underlying wasmtime Module for compatibility checking
     pub fn module(&self) -> &wasmtime::Module {
         &self.inner.module
+    }
+
+    pub(super) fn has_unique_inner(&self) -> bool {
+        Arc::strong_count(&self.inner) == 1
     }
 }
 
@@ -315,4 +480,54 @@ pub fn default_config() -> wasmtime::Config {
         .allocation_strategy(wasmtime::InstanceAllocationStrategy::pooling())
         .memory_may_move(false);
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompiledModuleBudget, CompiledModuleLimits, CompiledModuleUsage};
+    use std::sync::Arc;
+
+    #[test]
+    fn compiled_module_budget_is_atomic_and_released_by_raii() {
+        let budget = Arc::new(CompiledModuleBudget::new(CompiledModuleLimits {
+            modules: 1,
+            source_bytes: 4,
+            single_module_bytes: 4,
+        }));
+        let reservation = budget.try_reserve(4).unwrap();
+        assert_eq!(
+            budget.usage(),
+            CompiledModuleUsage {
+                modules: 1,
+                source_bytes: 4,
+            }
+        );
+
+        assert!(budget.try_reserve(1).is_err());
+        assert_eq!(
+            budget.usage(),
+            CompiledModuleUsage {
+                modules: 1,
+                source_bytes: 4,
+            }
+        );
+
+        drop(reservation);
+        assert_eq!(budget.usage(), CompiledModuleUsage::default());
+        let reservation = budget.try_reserve(3).unwrap();
+        assert_eq!(budget.usage().source_bytes, 3);
+        drop(reservation);
+        assert_eq!(budget.usage(), CompiledModuleUsage::default());
+    }
+
+    #[test]
+    fn compiled_module_budget_rejects_oversized_source_without_mutation() {
+        let budget = Arc::new(CompiledModuleBudget::new(CompiledModuleLimits {
+            modules: 2,
+            source_bytes: 3,
+            single_module_bytes: 3,
+        }));
+        assert!(budget.try_reserve(4).is_err());
+        assert_eq!(budget.usage(), CompiledModuleUsage::default());
+    }
 }

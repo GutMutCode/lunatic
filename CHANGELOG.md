@@ -9,11 +9,31 @@
   encoded and decoded through `to_bytes`/`from_bytes` instead of blanket serde implementations.
 - `lunatic-networking-api::TlsListener` now owns a configured `TlsAcceptor` instead of exposing
   certificate and private-key fields.
+- `LunaticEnvironments` now retains environments weakly so environment quota is recovered after
+  the last owner drops. Callers must keep the `Arc<LunaticEnvironment>` returned by `create` or
+  `create_with_registry` for as long as the environment must remain addressable. Process IDs are
+  allocated monotonically across recreated environment generations to prevent stale-address ABA.
+- `ProcessConfigCtx` adds module/config/SQLite ceiling getters whose compatibility defaults are
+  intentionally fail-closed. External implementations must provide finite values to admit those
+  resources. `SQLiteCtx` now requires a shared `sqlite_quota`, and its connection/statement table
+  values own quota leases rather than exposing the previous raw aliases.
+- `lunatic-wasi-api::register` now installs both preview0 (`wasi_unstable`) and preview1 WASI
+  imports. It temporarily enables Wasmtime linker shadowing for descriptor-producing wrappers and
+  leaves shadowing disabled when it returns; embedders that need a different linker policy must
+  set it again after registration.
 
 These public Rust API and wire-contract changes require the next published Lunatic line to be
 `0.14.0` or another explicitly semver-breaking release; they must not ship as a `0.13.x` patch.
 
 ### Added
+
+- Finite, configurable ceilings and exact release accounting for compiled modules, process module
+  and configuration handles, SQLite connections/statements, WASI descriptors, environments, and
+  per-environment/node process admission. `run`, cargo-test runner, and `node` expose compiled
+  module limits; `node` also exposes the independent distributed module-cache ceiling. During a
+  rolling cluster upgrade, the new distributed ceilings are guaranteed only after every receiving
+  node has been upgraded because older receivers do not understand the added config fields. Use
+  `--` before guest arguments whose names collide with the new `--max-*` runtime options.
 
 - Lunatic Cloud CLI credentials now use macOS Keychain, Windows Credential Manager, or Linux
   Secret Service behind an opaque configuration reference. Legacy plaintext login records migrate

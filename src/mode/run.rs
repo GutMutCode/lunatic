@@ -10,7 +10,7 @@ use lunatic_process::{
 };
 use lunatic_runtime::DefaultProcessState;
 
-use super::common::{run_wasm, RunWasm};
+use super::common::{run_wasm, CompiledModuleArgs, RunWasm};
 
 #[derive(Parser, Debug)]
 #[command(version)]
@@ -27,13 +27,17 @@ pub struct Args {
     #[arg(index = 1)]
     pub path: PathBuf,
 
-    /// Arguments passed to the guest
+    /// Arguments passed to the guest. Use `--` before guest flags that have
+    /// the same name as Lunatic runtime options.
     #[arg(index = 2)]
     pub wasm_args: Vec<String>,
 
     /// Watch for file changes and automatically reload
     #[arg(long)]
     pub watch: bool,
+
+    #[command(flatten)]
+    compiled_modules: CompiledModuleArgs,
 
     #[cfg(feature = "prometheus")]
     #[command(flatten)]
@@ -48,7 +52,10 @@ pub(crate) async fn start(mut args: Args) -> Result<()> {
 
     // Create wasmtime runtime
     let wasmtime_config = runtimes::wasmtime::default_config();
-    let runtime = runtimes::wasmtime::WasmtimeRuntime::new(&wasmtime_config)?;
+    let runtime = runtimes::wasmtime::WasmtimeRuntime::new_with_module_limits(
+        &wasmtime_config,
+        args.compiled_modules.limits(),
+    )?;
     let envs = Arc::new(LunaticEnvironments::default());
 
     if args.bench {
@@ -261,4 +268,40 @@ async fn run_with_watch(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use lunatic_process::runtimes::wasmtime::CompiledModuleLimits;
+
+    use super::Args;
+
+    #[test]
+    fn run_module_limits_are_configurable_and_double_dash_preserves_guest_flags() {
+        let args = Args::try_parse_from([
+            "run",
+            "--max-compiled-modules",
+            "5",
+            "--max-compiled-module-bytes",
+            "4096",
+            "--max-single-module-bytes",
+            "1024",
+            "app.wasm",
+            "--",
+            "--max-single-module-bytes",
+            "guest-value",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.compiled_modules.limits(),
+            CompiledModuleLimits {
+                modules: 5,
+                source_bytes: 4096,
+                single_module_bytes: 1024,
+            }
+        );
+        assert_eq!(args.wasm_args, ["--max-single-module-bytes", "guest-value"]);
+    }
 }

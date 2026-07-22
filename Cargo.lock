@@ -2754,14 +2754,17 @@ version = "0.13.2"
 dependencies = [
  "anyhow",
  "async-trait",
+ "io-extras",
  "lunatic-common-api",
  "lunatic-error-api",
  "lunatic-process",
  "lunatic-stdout-capture",
+ "rustix 1.1.4",
  "serde_json",
  "tokio",
  "wasi-common",
  "wasmtime",
+ "wiggle",
 ]
 
 [[package]]
@@ -5327,6 +5330,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-environ",
  "wiggle-macro",
+ "witx",
 ]
 
 [[package]]

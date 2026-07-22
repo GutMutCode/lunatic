@@ -7,7 +7,11 @@ use lunatic_distributed::DistributedProcessState;
 use lunatic_process::{
     env::{Environment, LunaticEnvironment, LunaticEnvironments},
     runtimes::{
-        wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime},
+        wasmtime::{
+            CompiledModuleLimits, WasmtimeCompiledModule, WasmtimeRuntime,
+            DEFAULT_MAX_COMPILED_MODULES, DEFAULT_MAX_COMPILED_MODULE_BYTES,
+            DEFAULT_MAX_MODULE_BYTES,
+        },
         RawWasm,
     },
     wasm::{spawn_wasm_with_options, WasmSpawnOptions},
@@ -15,8 +19,30 @@ use lunatic_process::{
 use lunatic_process_api::ProcessConfigCtx;
 use lunatic_runtime::{DefaultProcessConfig, DefaultProcessState};
 
-#[derive(Args, Debug)]
-pub struct WasmArgs {}
+#[derive(Args, Clone, Debug)]
+pub struct CompiledModuleArgs {
+    /// Maximum compiled modules retained by this runtime.
+    #[arg(long, default_value_t = DEFAULT_MAX_COMPILED_MODULES)]
+    pub max_compiled_modules: usize,
+
+    /// Maximum aggregate source bytes retained by compiled modules.
+    #[arg(long, default_value_t = DEFAULT_MAX_COMPILED_MODULE_BYTES)]
+    pub max_compiled_module_bytes: usize,
+
+    /// Maximum source bytes accepted for one compiled module.
+    #[arg(long, default_value_t = DEFAULT_MAX_MODULE_BYTES)]
+    pub max_single_module_bytes: usize,
+}
+
+impl CompiledModuleArgs {
+    pub fn limits(&self) -> CompiledModuleLimits {
+        CompiledModuleLimits {
+            modules: self.max_compiled_modules,
+            source_bytes: self.max_compiled_module_bytes,
+            single_module_bytes: self.max_single_module_bytes,
+        }
+    }
+}
 
 pub struct RunWasm {
     pub path: PathBuf,

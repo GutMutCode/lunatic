@@ -15,13 +15,16 @@ use lunatic_distributed::{
     quic,
 };
 use lunatic_process::{
-    env::{Environments, LunaticEnvironments},
-    runtimes::{self, Modules},
+    env::{
+        Environments, LunaticEnvironments, DEFAULT_MAX_ENVIRONMENTS, DEFAULT_MAX_NODE_PROCESSES,
+        DEFAULT_MAX_PROCESSES,
+    },
+    runtimes::{self, Modules, DEFAULT_MAX_CACHED_MODULES},
 };
 use lunatic_runtime::DefaultProcessState;
 use uuid::Uuid;
 
-use crate::mode::common::{run_wasm, RunWasm};
+use crate::mode::common::{run_wasm, CompiledModuleArgs, RunWasm};
 
 #[derive(Parser, Debug)]
 pub(crate) struct Args {
@@ -74,6 +77,25 @@ pub(crate) struct Args {
     /// Maximum live nodes admitted to registry topology and outbound managers.
     #[arg(long, default_value_t = 1_024)]
     registry_max_topology_nodes: usize,
+
+    /// Maximum simultaneously live environments on this node.
+    #[arg(long, default_value_t = DEFAULT_MAX_ENVIRONMENTS)]
+    max_environments: usize,
+
+    /// Maximum simultaneously live processes in one environment.
+    #[arg(long, default_value_t = DEFAULT_MAX_PROCESSES)]
+    max_processes_per_environment: usize,
+
+    /// Maximum aggregate simultaneously live processes across this node.
+    #[arg(long, default_value_t = DEFAULT_MAX_NODE_PROCESSES)]
+    max_node_processes: usize,
+
+    #[command(flatten)]
+    compiled_modules: CompiledModuleArgs,
+
+    /// Maximum distributed module IDs retained in the node cache.
+    #[arg(long, default_value_t = DEFAULT_MAX_CACHED_MODULES)]
+    max_cached_modules: usize,
 
     #[cfg(feature = "prometheus")]
     #[command(flatten)]
@@ -174,13 +196,20 @@ pub(crate) async fn start(args: Args) -> Result<()> {
     .await?;
 
     let wasmtime_config = runtimes::wasmtime::default_config();
-    let runtime = runtimes::wasmtime::WasmtimeRuntime::new(&wasmtime_config)?;
-    let envs = Arc::new(LunaticEnvironments::default());
+    let runtime = runtimes::wasmtime::WasmtimeRuntime::new_with_module_limits(
+        &wasmtime_config,
+        args.compiled_modules.limits(),
+    )?;
+    let envs = Arc::new(LunaticEnvironments::with_limits(
+        args.max_environments,
+        args.max_processes_per_environment,
+        args.max_node_processes,
+    ));
 
     let mut node = tokio::task::spawn(lunatic_distributed::distributed::server::node_server(
         ServerCtx {
             envs: envs.clone(),
-            modules: Modules::<DefaultProcessState>::default(),
+            modules: Modules::<DefaultProcessState>::with_max_entries(args.max_cached_modules),
             distributed: dist.clone(),
             runtime: runtime.clone(),
             node_client: distributed_client.clone(),
@@ -251,5 +280,73 @@ fn parse_key_val(s: &str) -> Result<(String, String)> {
         Ok((key.to_string(), value.to_string()))
     } else {
         Err(anyhow!(format!("Tag '{s}' is not formatted as key=value")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_process_and_environment_limits_have_finite_defaults() {
+        let args = Args::try_parse_from(["node"]).unwrap();
+        assert_eq!(args.max_environments, DEFAULT_MAX_ENVIRONMENTS);
+        assert_eq!(args.max_processes_per_environment, DEFAULT_MAX_PROCESSES);
+        assert_eq!(args.max_node_processes, DEFAULT_MAX_NODE_PROCESSES);
+        assert_eq!(
+            args.compiled_modules.limits(),
+            lunatic_process::runtimes::wasmtime::CompiledModuleLimits::default()
+        );
+        assert_eq!(args.max_cached_modules, DEFAULT_MAX_CACHED_MODULES);
+    }
+
+    #[test]
+    fn node_aggregate_limit_may_be_stricter_than_per_environment_limit() {
+        let args = Args::try_parse_from([
+            "node",
+            "--max-environments",
+            "3",
+            "--max-processes-per-environment",
+            "100",
+            "--max-node-processes",
+            "7",
+        ])
+        .unwrap();
+
+        let environments = LunaticEnvironments::with_limits(
+            args.max_environments,
+            args.max_processes_per_environment,
+            args.max_node_processes,
+        );
+        assert_eq!(environments.max_environments(), 3);
+        assert_eq!(environments.max_processes_per_environment(), 100);
+        assert_eq!(environments.max_node_processes(), 7);
+    }
+
+    #[test]
+    fn node_compiled_module_limit_overrides_map_to_runtime_limits() {
+        let args = Args::try_parse_from([
+            "node",
+            "--max-compiled-modules",
+            "5",
+            "--max-compiled-module-bytes",
+            "4096",
+            "--max-single-module-bytes",
+            "1024",
+            "--max-cached-modules",
+            "3",
+        ])
+        .unwrap();
+
+        let limits = args.compiled_modules.limits();
+        assert_eq!(
+            limits,
+            lunatic_process::runtimes::wasmtime::CompiledModuleLimits {
+                modules: 5,
+                source_bytes: 4096,
+                single_module_bytes: 1024,
+            }
+        );
+        assert_eq!(args.max_cached_modules, 3);
     }
 }

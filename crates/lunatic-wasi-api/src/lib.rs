@@ -1,4 +1,13 @@
-use std::{any::Any, ops::Range, path::PathBuf};
+use std::{
+    any::Any,
+    io::{IoSlice, IoSliceMut, SeekFrom},
+    ops::Range,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{anyhow, Result};
 use lunatic_common_api::{
@@ -10,11 +19,82 @@ use lunatic_process::{config::ProcessConfig, state::ProcessState};
 use lunatic_stdout_capture::StdoutCapture;
 use wasi_common::{
     dir::{OpenResult, ReaddirCursor, ReaddirEntity, WasiDir},
-    file::{FdFlags, Filestat, OFlags},
+    file::{Advice, FdFlags, FileType, Filestat, OFlags, RiFlags, RoFlags, SdFlags, SiFlags},
+    snapshots::preview_1::types::Errno,
     sync::{ambient_authority, dir::Dir as SyncDir, Dir, WasiCtxBuilder},
-    Error, SystemTimeSpec, WasiCtx,
+    Error, SystemTimeSpec, WasiCtx, WasiFile,
 };
-use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
+use wasmtime::{Caller, Extern, Linker, ToWasmtimeResult as _};
+
+pub const DEFAULT_WASI_FILE_DESCRIPTOR_LIMIT: u32 = 1024;
+
+/// Shared accounting boundary for every non-stdio descriptor retained by a
+/// WASI context. Implementations must reserve and release exactly one unit for
+/// each successful lease.
+pub trait WasiFileDescriptorQuota: Send + Sync {
+    fn reserve(&self) -> Result<()>;
+    fn release(&self) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct LocalWasiFileDescriptorQuota {
+    open: AtomicU32,
+    max: u32,
+}
+
+impl LocalWasiFileDescriptorQuota {
+    fn new(max: u32) -> Self {
+        Self {
+            open: AtomicU32::new(0),
+            max,
+        }
+    }
+}
+
+impl WasiFileDescriptorQuota for LocalWasiFileDescriptorQuota {
+    fn reserve(&self) -> Result<()> {
+        self.open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                (open < self.max).then_some(open + 1)
+            })
+            .map(|_| ())
+            .map_err(|_| anyhow!("Max WASI file descriptors ({}) reached", self.max))
+    }
+
+    fn release(&self) -> Result<()> {
+        self.open
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
+                open.checked_sub(1)
+            })
+            .map(|_| ())
+            .map_err(|_| anyhow!("WASI file descriptor accounting underflow"))
+    }
+}
+
+struct WasiFileDescriptorLease {
+    quota: Arc<dyn WasiFileDescriptorQuota>,
+}
+
+impl WasiFileDescriptorLease {
+    fn acquire(quota: Arc<dyn WasiFileDescriptorQuota>) -> Result<Self> {
+        quota.reserve()?;
+        Ok(Self { quota })
+    }
+
+    fn acquire_for_guest(
+        quota: Arc<dyn WasiFileDescriptorQuota>,
+    ) -> std::result::Result<Self, Error> {
+        quota.reserve().map_err(|_| Error::from(Errno::Mfile))?;
+        Ok(Self { quota })
+    }
+}
+
+impl Drop for WasiFileDescriptorLease {
+    fn drop(&mut self) {
+        let result = self.quota.release();
+        debug_assert!(result.is_ok());
+    }
+}
 
 /// Create a `WasiCtx` from configuration settings.
 pub fn build_wasi(
@@ -34,6 +114,26 @@ pub fn build_wasi_with_audit(
     dirs: &[(String, String)],
     subject: AuditSubject,
 ) -> Result<WasiCtx> {
+    build_wasi_with_audit_and_quota(
+        args,
+        envs,
+        dirs,
+        subject,
+        Arc::new(LocalWasiFileDescriptorQuota::new(
+            DEFAULT_WASI_FILE_DESCRIPTOR_LIMIT,
+        )),
+    )
+}
+
+/// Creates a WASI context tied to the process-wide descriptor accounting
+/// shared with Lunatic networking handles.
+pub fn build_wasi_with_audit_and_quota(
+    args: Option<&Vec<String>>,
+    envs: Option<&Vec<(String, String)>>,
+    dirs: &[(String, String)],
+    subject: AuditSubject,
+    quota: Arc<dyn WasiFileDescriptorQuota>,
+) -> Result<WasiCtx> {
     let mut wasi = WasiCtxBuilder::new();
     wasi.inherit_stdio();
     if let Some(envs) = envs {
@@ -44,10 +144,16 @@ pub fn build_wasi_with_audit(
     }
     let wasi = wasi.build();
     for (preopen_dir_path, resolved_path) in dirs {
+        let lease = WasiFileDescriptorLease::acquire(Arc::clone(&quota))?;
         let preopen_dir = Dir::open_ambient_dir(resolved_path, ambient_authority())?;
         let preopen_dir = SyncDir::from_cap_std(preopen_dir);
         wasi.push_preopened_dir(
-            Box::new(AuditedWasiDir::new(Box::new(preopen_dir), subject)),
+            Box::new(AuditedWasiDir::with_lease(
+                Box::new(preopen_dir),
+                subject,
+                Arc::clone(&quota),
+                lease,
+            )),
             preopen_dir_path,
         )?;
     }
@@ -57,11 +163,33 @@ pub fn build_wasi_with_audit(
 struct AuditedWasiDir {
     inner: Box<dyn WasiDir>,
     subject: AuditSubject,
+    quota: Arc<dyn WasiFileDescriptorQuota>,
+    _lease: WasiFileDescriptorLease,
 }
 
 impl AuditedWasiDir {
+    #[cfg(test)]
     fn new(inner: Box<dyn WasiDir>, subject: AuditSubject) -> Self {
-        Self { inner, subject }
+        let quota: Arc<dyn WasiFileDescriptorQuota> = Arc::new(LocalWasiFileDescriptorQuota::new(
+            DEFAULT_WASI_FILE_DESCRIPTOR_LIMIT,
+        ));
+        let lease = WasiFileDescriptorLease::acquire(Arc::clone(&quota))
+            .expect("default WASI descriptor quota must have capacity");
+        Self::with_lease(inner, subject, quota, lease)
+    }
+
+    fn with_lease(
+        inner: Box<dyn WasiDir>,
+        subject: AuditSubject,
+        quota: Arc<dyn WasiFileDescriptorQuota>,
+        lease: WasiFileDescriptorLease,
+    ) -> Self {
+        Self {
+            inner,
+            subject,
+            quota,
+            _lease: lease,
+        }
     }
 
     fn target() -> AuditTarget {
@@ -74,11 +202,183 @@ impl AuditedWasiDir {
             .map_or(dir, |audited| audited.inner.as_ref())
     }
 
-    fn wrap_open_result(&self, result: OpenResult) -> OpenResult {
+    fn wrap_open_result(&self, result: OpenResult, lease: WasiFileDescriptorLease) -> OpenResult {
         match result {
-            OpenResult::File(file) => OpenResult::File(file),
-            OpenResult::Dir(dir) => OpenResult::Dir(Box::new(Self::new(dir, self.subject))),
+            OpenResult::File(file) => OpenResult::File(Box::new(QuotaWasiFile::new(
+                file,
+                Arc::clone(&self.quota),
+                lease,
+            ))),
+            OpenResult::Dir(dir) => OpenResult::Dir(Box::new(Self::with_lease(
+                dir,
+                self.subject,
+                Arc::clone(&self.quota),
+                lease,
+            ))),
         }
+    }
+}
+
+struct QuotaWasiFile {
+    inner: Box<dyn WasiFile>,
+    quota: Arc<dyn WasiFileDescriptorQuota>,
+    _lease: WasiFileDescriptorLease,
+}
+
+impl QuotaWasiFile {
+    fn new(
+        inner: Box<dyn WasiFile>,
+        quota: Arc<dyn WasiFileDescriptorQuota>,
+        lease: WasiFileDescriptorLease,
+    ) -> Self {
+        Self {
+            inner,
+            quota,
+            _lease: lease,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WasiFile for QuotaWasiFile {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn get_filetype(&self) -> std::result::Result<FileType, Error> {
+        self.inner.get_filetype().await
+    }
+
+    #[cfg(unix)]
+    fn pollable(&self) -> Option<rustix::fd::BorrowedFd<'_>> {
+        self.inner.pollable()
+    }
+
+    #[cfg(windows)]
+    fn pollable(&self) -> Option<io_extras::os::windows::RawHandleOrSocket> {
+        self.inner.pollable()
+    }
+
+    fn isatty(&self) -> bool {
+        self.inner.isatty()
+    }
+
+    async fn sock_accept(&self, fdflags: FdFlags) -> std::result::Result<Box<dyn WasiFile>, Error> {
+        let lease = WasiFileDescriptorLease::acquire_for_guest(Arc::clone(&self.quota))?;
+        let accepted = self.inner.sock_accept(fdflags).await?;
+        Ok(Box::new(Self::new(
+            accepted,
+            Arc::clone(&self.quota),
+            lease,
+        )))
+    }
+
+    async fn sock_recv<'a>(
+        &self,
+        data: &mut [IoSliceMut<'a>],
+        flags: RiFlags,
+    ) -> std::result::Result<(u64, RoFlags), Error> {
+        self.inner.sock_recv(data, flags).await
+    }
+
+    async fn sock_send<'a>(
+        &self,
+        data: &[IoSlice<'a>],
+        flags: SiFlags,
+    ) -> std::result::Result<u64, Error> {
+        self.inner.sock_send(data, flags).await
+    }
+
+    async fn sock_shutdown(&self, how: SdFlags) -> std::result::Result<(), Error> {
+        self.inner.sock_shutdown(how).await
+    }
+
+    async fn datasync(&self) -> std::result::Result<(), Error> {
+        self.inner.datasync().await
+    }
+
+    async fn sync(&self) -> std::result::Result<(), Error> {
+        self.inner.sync().await
+    }
+
+    async fn get_fdflags(&self) -> std::result::Result<FdFlags, Error> {
+        self.inner.get_fdflags().await
+    }
+
+    async fn set_fdflags(&mut self, flags: FdFlags) -> std::result::Result<(), Error> {
+        self.inner.set_fdflags(flags).await
+    }
+
+    async fn get_filestat(&self) -> std::result::Result<Filestat, Error> {
+        self.inner.get_filestat().await
+    }
+
+    async fn set_filestat_size(&self, size: u64) -> std::result::Result<(), Error> {
+        self.inner.set_filestat_size(size).await
+    }
+
+    async fn advise(
+        &self,
+        offset: u64,
+        len: u64,
+        advice: Advice,
+    ) -> std::result::Result<(), Error> {
+        self.inner.advise(offset, len, advice).await
+    }
+
+    async fn set_times(
+        &self,
+        atime: Option<SystemTimeSpec>,
+        mtime: Option<SystemTimeSpec>,
+    ) -> std::result::Result<(), Error> {
+        self.inner.set_times(atime, mtime).await
+    }
+
+    async fn read_vectored<'a>(
+        &self,
+        bufs: &mut [IoSliceMut<'a>],
+    ) -> std::result::Result<u64, Error> {
+        self.inner.read_vectored(bufs).await
+    }
+
+    async fn read_vectored_at<'a>(
+        &self,
+        bufs: &mut [IoSliceMut<'a>],
+        offset: u64,
+    ) -> std::result::Result<u64, Error> {
+        self.inner.read_vectored_at(bufs, offset).await
+    }
+
+    async fn write_vectored<'a>(&self, bufs: &[IoSlice<'a>]) -> std::result::Result<u64, Error> {
+        self.inner.write_vectored(bufs).await
+    }
+
+    async fn write_vectored_at<'a>(
+        &self,
+        bufs: &[IoSlice<'a>],
+        offset: u64,
+    ) -> std::result::Result<u64, Error> {
+        self.inner.write_vectored_at(bufs, offset).await
+    }
+
+    async fn seek(&self, pos: SeekFrom) -> std::result::Result<u64, Error> {
+        self.inner.seek(pos).await
+    }
+
+    async fn peek(&self, buf: &mut [u8]) -> std::result::Result<u64, Error> {
+        self.inner.peek(buf).await
+    }
+
+    fn num_ready_bytes(&self) -> std::result::Result<u64, Error> {
+        self.inner.num_ready_bytes()
+    }
+
+    async fn readable(&self) -> std::result::Result<(), Error> {
+        self.inner.readable().await
+    }
+
+    async fn writable(&self) -> std::result::Result<(), Error> {
+        self.inner.writable().await
     }
 }
 
@@ -143,11 +443,19 @@ impl WasiDir for AuditedWasiDir {
         fdflags: FdFlags,
     ) -> std::result::Result<OpenResult, Error> {
         let audit = PendingWasiAudit::new(self.subject, AuditAction::Open);
+        let lease = match WasiFileDescriptorLease::acquire_for_guest(Arc::clone(&self.quota)) {
+            Ok(lease) => lease,
+            Err(error) => {
+                let result = Err(error);
+                audit.finish(&result);
+                return result;
+            }
+        };
         let result = self
             .inner
             .open_file(symlink_follow, path, oflags, read, write, fdflags)
             .await
-            .map(|opened| self.wrap_open_result(opened));
+            .map(|opened| self.wrap_open_result(opened, lease));
         audit.finish(&result);
         result
     }
@@ -270,7 +578,7 @@ impl WasiDir for AuditedWasiDir {
 mod tests {
     use std::{
         fs, io,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, OnceLock},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -293,12 +601,25 @@ mod tests {
         }
     }
 
+    fn shared_audit_records() -> Arc<Mutex<Vec<String>>> {
+        static RECORDS: OnceLock<Arc<Mutex<Vec<String>>>> = OnceLock::new();
+        RECORDS
+            .get_or_init(|| {
+                let records = Arc::new(Mutex::new(Vec::new()));
+                let dispatcher = AuditDispatcher::new(
+                    AuditConfig::default(),
+                    RecordingSink(Arc::clone(&records)),
+                );
+                install_global_audit_dispatcher(dispatcher)
+                    .expect("test audit dispatcher is installed exactly once");
+                records
+            })
+            .clone()
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn audited_directory_records_identity_without_collecting_paths() -> Result<()> {
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let dispatcher =
-            AuditDispatcher::new(AuditConfig::default(), RecordingSink(Arc::clone(&records)));
-        assert!(install_global_audit_dispatcher(dispatcher).is_ok());
+        let records = shared_audit_records();
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -334,9 +655,18 @@ mod tests {
             AuditFlushOutcome::Flushed
         );
         let events = records.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(!events[0].contains(sentinel));
-        let event: serde_json::Value = serde_json::from_str(&events[0])?;
+        let matching = events
+            .iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(event))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|event| {
+                event["subject"]["environment_id"] == 41 && event["subject"]["process_id"] == 99
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1);
+        assert!(!events.iter().any(|event| event.contains(sentinel)));
+        let event = &matching[0];
         assert_eq!(event["event"], "filesystem_access");
         assert_eq!(event["action"], "open");
         assert_eq!(event["result"], "succeeded");
@@ -356,8 +686,17 @@ mod tests {
             AuditFlushOutcome::Flushed
         );
         let events = records.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        let cancelled: serde_json::Value = serde_json::from_str(&events[1])?;
+        let matching = events
+            .iter()
+            .map(|event| serde_json::from_str::<serde_json::Value>(event))
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|event| {
+                event["subject"]["environment_id"] == 41 && event["subject"]["process_id"] == 99
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 2);
+        let cancelled = &matching[1];
         assert_eq!(cancelled["result"], "cancelled");
         assert_eq!(cancelled["reason"], "cancelled");
         drop(events);
@@ -366,6 +705,124 @@ mod tests {
         drop(audited);
         fs::remove_dir_all(root)?;
         Ok(())
+    }
+
+    #[test]
+    fn descriptor_leases_reject_at_boundary_and_reuse_released_slots() -> Result<()> {
+        let quota: Arc<dyn WasiFileDescriptorQuota> =
+            Arc::new(LocalWasiFileDescriptorQuota::new(1));
+        let lease = WasiFileDescriptorLease::acquire(Arc::clone(&quota))?;
+        assert!(WasiFileDescriptorLease::acquire(Arc::clone(&quota)).is_err());
+        drop(lease);
+        let replacement = WasiFileDescriptorLease::acquire(quota)?;
+        drop(replacement);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_and_closed_opens_release_descriptor_quota() -> Result<()> {
+        let _records = shared_audit_records();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "lunatic-wasi-quota-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)?;
+
+        let quota = Arc::new(LocalWasiFileDescriptorQuota::new(2));
+        let root_lease = WasiFileDescriptorLease::acquire(quota.clone())?;
+        let cap_dir = Dir::open_ambient_dir(&root, ambient_authority())?;
+        let audited = AuditedWasiDir::with_lease(
+            Box::new(SyncDir::from_cap_std(cap_dir)),
+            AuditSubject::new(),
+            quota.clone(),
+            root_lease,
+        );
+
+        assert!(audited
+            .open_file(
+                false,
+                "missing",
+                OFlags::empty(),
+                true,
+                false,
+                FdFlags::empty(),
+            )
+            .await
+            .is_err());
+        let first = audited
+            .open_file(false, "first", OFlags::CREATE, true, true, FdFlags::empty())
+            .await?;
+        assert!(audited
+            .open_file(
+                false,
+                "second",
+                OFlags::CREATE,
+                true,
+                true,
+                FdFlags::empty(),
+            )
+            .await
+            .is_err());
+        drop(first);
+        let replacement = audited
+            .open_file(
+                false,
+                "second",
+                OFlags::CREATE,
+                true,
+                true,
+                FdFlags::empty(),
+            )
+            .await?;
+        drop(replacement);
+        drop(audited);
+        assert_eq!(quota.open.load(Ordering::Acquire), 0);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn partial_preopen_build_rolls_back_all_descriptor_leases() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "lunatic-wasi-preopen-quota-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root)?;
+        let dirs = vec![
+            ("/one".to_string(), root.to_string_lossy().into_owned()),
+            ("/two".to_string(), root.to_string_lossy().into_owned()),
+        ];
+        let quota = Arc::new(LocalWasiFileDescriptorQuota::new(1));
+
+        assert!(build_wasi_with_audit_and_quota(
+            None,
+            None,
+            &dirs,
+            AuditSubject::new(),
+            quota.clone(),
+        )
+        .is_err());
+        assert_eq!(quota.open.load(Ordering::Acquire), 0);
+
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wasi_descriptor_result_pointer_is_preflighted() {
+        assert!(validate_wasi_fd_result_pointer(16, 4, "test").is_ok());
+        assert!(validate_wasi_fd_result_pointer(16, 3, "test").is_err());
+        assert!(validate_wasi_fd_result_pointer(16, 16, "test").is_err());
+        assert!(validate_wasi_fd_result_pointer(16, -1, "test").is_err());
     }
 }
 
@@ -420,7 +877,241 @@ fn checked_guest_range(pointer: u32, length: u32, operation: &'static str) -> Re
     Ok(pointer as usize..end as usize)
 }
 
-// Register WASI APIs to the linker
+fn validate_wasi_fd_result_pointer(
+    memory_len: usize,
+    pointer: i32,
+    operation: &'static str,
+) -> Result<()> {
+    let pointer = pointer as u32;
+    anyhow::ensure!(
+        pointer.is_multiple_of(std::mem::align_of::<u32>() as u32),
+        "{operation}: unaligned guest result pointer"
+    );
+    let range = checked_guest_range(pointer, std::mem::size_of::<u32>() as u32, operation)?;
+    anyhow::ensure!(
+        range.end <= memory_len,
+        "{operation}: guest result pointer is out of bounds"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wasi_path_open_preflight<T>(
+    mut caller: Caller<'_, T>,
+    fd: i32,
+    dirflags: i32,
+    path_ptr: i32,
+    path_len: i32,
+    oflags: i32,
+    rights_base: i64,
+    rights_inheriting: i64,
+    fdflags: i32,
+    result_ptr: i32,
+) -> Result<i32>
+where
+    T: LunaticWasiCtx,
+{
+    let export = caller.get_export("memory");
+    match &export {
+        Some(Extern::Memory(memory)) => {
+            validate_wasi_fd_result_pointer(
+                memory.data_size(&caller),
+                result_ptr,
+                "wasi_snapshot_preview1::path_open",
+            )?;
+            let (memory, state) = memory.data_and_store_mut(&mut caller);
+            let mut memory = wiggle::GuestMemory::Unshared(memory);
+            let result = async {
+                Ok(
+                    wasi_common::snapshots::preview_1::wasi_snapshot_preview1::path_open(
+                        state.wasi_mut(),
+                        &mut memory,
+                        fd,
+                        dirflags,
+                        path_ptr,
+                        path_len,
+                        oflags,
+                        rights_base,
+                        rights_inheriting,
+                        fdflags,
+                        result_ptr,
+                    )
+                    .await?,
+                )
+            };
+            wiggle::run_in_dummy_executor(result)?
+        }
+        Some(Extern::SharedMemory(memory)) => {
+            validate_wasi_fd_result_pointer(
+                memory.data().len(),
+                result_ptr,
+                "wasi_snapshot_preview1::path_open",
+            )?;
+            let mut memory = wiggle::GuestMemory::Shared(memory.data());
+            let state = caller.data_mut();
+            let result = async {
+                Ok(
+                    wasi_common::snapshots::preview_1::wasi_snapshot_preview1::path_open(
+                        state.wasi_mut(),
+                        &mut memory,
+                        fd,
+                        dirflags,
+                        path_ptr,
+                        path_len,
+                        oflags,
+                        rights_base,
+                        rights_inheriting,
+                        fdflags,
+                        result_ptr,
+                    )
+                    .await?,
+                )
+            };
+            wiggle::run_in_dummy_executor(result)?
+        }
+        _ => Err(anyhow!("missing required memory export")),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wasi_unstable_path_open_preflight<T>(
+    mut caller: Caller<'_, T>,
+    fd: i32,
+    dirflags: i32,
+    path_ptr: i32,
+    path_len: i32,
+    oflags: i32,
+    rights_base: i64,
+    rights_inheriting: i64,
+    fdflags: i32,
+    result_ptr: i32,
+) -> Result<i32>
+where
+    T: LunaticWasiCtx,
+{
+    let export = caller.get_export("memory");
+    match &export {
+        Some(Extern::Memory(memory)) => {
+            validate_wasi_fd_result_pointer(
+                memory.data_size(&caller),
+                result_ptr,
+                "wasi_unstable::path_open",
+            )?;
+            let (memory, state) = memory.data_and_store_mut(&mut caller);
+            let mut memory = wiggle::GuestMemory::Unshared(memory);
+            let result = async {
+                Ok(wasi_common::snapshots::preview_0::wasi_unstable::path_open(
+                    state.wasi_mut(),
+                    &mut memory,
+                    fd,
+                    dirflags,
+                    path_ptr,
+                    path_len,
+                    oflags,
+                    rights_base,
+                    rights_inheriting,
+                    fdflags,
+                    result_ptr,
+                )
+                .await?)
+            };
+            wiggle::run_in_dummy_executor(result)?
+        }
+        Some(Extern::SharedMemory(memory)) => {
+            validate_wasi_fd_result_pointer(
+                memory.data().len(),
+                result_ptr,
+                "wasi_unstable::path_open",
+            )?;
+            let mut memory = wiggle::GuestMemory::Shared(memory.data());
+            let state = caller.data_mut();
+            let result = async {
+                Ok(wasi_common::snapshots::preview_0::wasi_unstable::path_open(
+                    state.wasi_mut(),
+                    &mut memory,
+                    fd,
+                    dirflags,
+                    path_ptr,
+                    path_len,
+                    oflags,
+                    rights_base,
+                    rights_inheriting,
+                    fdflags,
+                    result_ptr,
+                )
+                .await?)
+            };
+            wiggle::run_in_dummy_executor(result)?
+        }
+        _ => Err(anyhow!("missing required memory export")),
+    }
+}
+
+fn wasi_sock_accept_preflight<T>(
+    mut caller: Caller<'_, T>,
+    fd: i32,
+    flags: i32,
+    result_ptr: i32,
+) -> Result<i32>
+where
+    T: LunaticWasiCtx,
+{
+    let export = caller.get_export("memory");
+    match &export {
+        Some(Extern::Memory(memory)) => {
+            validate_wasi_fd_result_pointer(
+                memory.data_size(&caller),
+                result_ptr,
+                "wasi_snapshot_preview1::sock_accept",
+            )?;
+            let (memory, state) = memory.data_and_store_mut(&mut caller);
+            let mut memory = wiggle::GuestMemory::Unshared(memory);
+            let result = async {
+                Ok(
+                    wasi_common::snapshots::preview_1::wasi_snapshot_preview1::sock_accept(
+                        state.wasi_mut(),
+                        &mut memory,
+                        fd,
+                        flags,
+                        result_ptr,
+                    )
+                    .await?,
+                )
+            };
+            wiggle::run_in_dummy_executor(result)?
+        }
+        Some(Extern::SharedMemory(memory)) => {
+            validate_wasi_fd_result_pointer(
+                memory.data().len(),
+                result_ptr,
+                "wasi_snapshot_preview1::sock_accept",
+            )?;
+            let mut memory = wiggle::GuestMemory::Shared(memory.data());
+            let state = caller.data_mut();
+            let result = async {
+                Ok(
+                    wasi_common::snapshots::preview_1::wasi_snapshot_preview1::sock_accept(
+                        state.wasi_mut(),
+                        &mut memory,
+                        fd,
+                        flags,
+                        result_ptr,
+                    )
+                    .await?,
+                )
+            };
+            wiggle::run_in_dummy_executor(result)?
+        }
+        _ => Err(anyhow!("missing required memory export")),
+    }
+}
+
+/// Registers preview0, preview1, and Lunatic WASI APIs with descriptor-safe wrappers.
+///
+/// The generated WASI functions must be shadowed for `path_open` and `sock_accept`, so this
+/// function temporarily enables [`Linker`] shadowing and leaves it disabled on return. Embedders
+/// that intentionally allow later registrations to shadow existing definitions must re-enable
+/// that policy after this call.
 pub fn register<T>(linker: &mut Linker<T>) -> Result<()>
 where
     T: ProcessState + LunaticWasiCtx + Send + 'static,
@@ -430,6 +1121,78 @@ where
     wasi_common::sync::snapshots::preview_1::add_wasi_snapshot_preview1_to_linker(linker, |ctx| {
         ctx.wasi_mut()
     })?;
+    wasi_common::sync::snapshots::preview_0::add_wasi_unstable_to_linker(linker, |ctx| {
+        ctx.wasi_mut()
+    })?;
+
+    // Wiggle writes result pointers only after the WASI trait call has inserted
+    // the new descriptor. Preflight the descriptor-producing imports so a
+    // catchable bad-pointer trap cannot retain an unreachable table entry.
+    linker.allow_shadowing(true);
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "path_open",
+        |caller: Caller<'_, T>,
+         fd: i32,
+         dirflags: i32,
+         path_ptr: i32,
+         path_len: i32,
+         oflags: i32,
+         rights_base: i64,
+         rights_inheriting: i64,
+         fdflags: i32,
+         result_ptr: i32| {
+            wasi_path_open_preflight(
+                caller,
+                fd,
+                dirflags,
+                path_ptr,
+                path_len,
+                oflags,
+                rights_base,
+                rights_inheriting,
+                fdflags,
+                result_ptr,
+            )
+            .to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "wasi_unstable",
+        "path_open",
+        |caller: Caller<'_, T>,
+         fd: i32,
+         dirflags: i32,
+         path_ptr: i32,
+         path_len: i32,
+         oflags: i32,
+         rights_base: i64,
+         rights_inheriting: i64,
+         fdflags: i32,
+         result_ptr: i32| {
+            wasi_unstable_path_open_preflight(
+                caller,
+                fd,
+                dirflags,
+                path_ptr,
+                path_len,
+                oflags,
+                rights_base,
+                rights_inheriting,
+                fdflags,
+                result_ptr,
+            )
+            .to_wasmtime_result()
+        },
+    )?;
+    linker.func_wrap(
+        "wasi_snapshot_preview1",
+        "sock_accept",
+        |caller: Caller<'_, T>, fd: i32, flags: i32, result_ptr: i32| {
+            wasi_sock_accept_preflight(caller, fd, flags, result_ptr).to_wasmtime_result()
+        },
+    )?;
+    linker.allow_shadowing(false);
 
     // Register host functions to configure wasi
     linker.func_wrap(
@@ -516,12 +1279,27 @@ where
             .or_trap("lunatic::wasi::config_add_environment_variable")?
             .to_string();
 
-        caller
+        let parent_config = caller.data().config().clone();
+        let mut candidate = caller
+            .data()
+            .config_resources()
+            .get(config_id)
+            .or_trap("lunatic::wasi::config_add_environment_variable: Config ID doesn't exist")?
+            .clone();
+        candidate.add_environment_variable(key, value);
+        parent_config
+            .validate_child_config(&candidate)
+            .map_err(|reason| {
+                anyhow!(
+                    "lunatic::wasi::config_add_environment_variable: delegation denied: {reason}"
+                )
+            })?;
+        *caller
             .data_mut()
             .config_resources_mut()
             .get_mut(config_id)
-            .or_trap("lunatic::wasi::config_add_environment_variable: Config ID doesn't exist")?
-            .add_environment_variable(key, value);
+            .or_trap("lunatic::wasi::config_add_environment_variable: Config ID doesn't exist")? =
+            candidate;
         Ok(())
     })();
     audit_config_update(caller.data(), config_id, &operation);
@@ -558,12 +1336,25 @@ where
             .or_trap("lunatic::wasi::add_command_line_argument")?
             .to_string();
 
-        caller
+        let parent_config = caller.data().config().clone();
+        let mut candidate = caller
+            .data()
+            .config_resources()
+            .get(config_id)
+            .or_trap("lunatic::wasi::add_command_line_argument: Config ID doesn't exist")?
+            .clone();
+        candidate.add_command_line_argument(argument);
+        parent_config
+            .validate_child_config(&candidate)
+            .map_err(|reason| {
+                anyhow!("lunatic::wasi::add_command_line_argument: delegation denied: {reason}")
+            })?;
+        *caller
             .data_mut()
             .config_resources_mut()
             .get_mut(config_id)
-            .or_trap("lunatic::wasi::add_command_line_argument: Config ID doesn't exist")?
-            .add_command_line_argument(argument);
+            .or_trap("lunatic::wasi::add_command_line_argument: Config ID doesn't exist")? =
+            candidate;
         Ok(())
     })();
     audit_config_update(caller.data(), config_id, &operation);

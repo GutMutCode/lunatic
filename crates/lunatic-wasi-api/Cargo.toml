@@ -17,6 +17,13 @@ anyhow = { workspace = true }
 async-trait = "0.1"
 wasmtime = { workspace = true }
 wasi-common = { workspace = true }
+wiggle = "46.0.1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = "1.1"
+
+[target.'cfg(windows)'.dependencies]
+io-extras = "0.18"
 
 [dev-dependencies]
 serde_json = "1.0.89"

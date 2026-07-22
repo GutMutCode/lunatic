@@ -9,12 +9,25 @@ pub mod sqlite_guest_bindings {
         ///
         /// returns the connection_id which can be used for later calls and
         /// can be safely transported between guest and host
-        pub fn open(path: *const u8, path_len: usize, connection_id: *mut u32) -> u64;
+        pub fn open(path: *const u8, path_len: usize, connection_id: *mut u64) -> u64;
+
+        /// Removes the guest-visible connection handle. The native connection
+        /// remains alive until all statements prepared from it are finalized.
+        pub fn sqlite3_close(connection_id: u64);
 
         ///
         /// Creates a new prepared statement and returns the id of the prepared statement
         /// to the guest so that values can be bound to the statement at a later point
         pub fn query_prepare(connection_id: u64, query_str: *const u8, query_str_len: u32) -> u64;
+
+        /// Checked statement creation. Returns -1 and writes `statement_id` on
+        /// success, or returns a guest-readable error-resource ID.
+        pub fn query_prepare_checked(
+            connection_id: u64,
+            query_str: *const u8,
+            query_str_len: u32,
+            statement_id: *mut u64,
+        ) -> i64;
 
         /// Executes the passed query and returns the SQLite response code
         pub fn execute(connection_id: u64, exec_str: *const u8, exec_str_len: u32) -> u32;
@@ -56,9 +69,9 @@ pub mod sqlite_guest_bindings {
         /// data to be pulled from the previous query
         pub fn sqlite3_step(connection_id: u64) -> u32;
 
-        /// Drops the connection identified by `connection_id` in the host and
-        /// closes the connection to SQLite
-        pub fn sqlite3_finalize(connection_id: u64);
+        /// Finalizes and drops the prepared statement identified by
+        /// `statement_id`.
+        pub fn sqlite3_finalize(statement_id: u64);
 
         /// returns the count of columns for the executed statement
         pub fn column_count(statement_id: u64) -> u32;

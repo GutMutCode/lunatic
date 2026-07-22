@@ -8,7 +8,10 @@ use lunatic_common_api::{
 
 use lunatic_process::{
     config::ProcessConfig,
-    env::{Environment, Environments, ProcessLimitReached},
+    env::{
+        Environment, EnvironmentLimitReached, Environments, NodeProcessLimitReached,
+        ProcessLimitReached,
+    },
     message::{DataMessage, Message},
     runtimes::{wasmtime::WasmtimeRuntime, Modules, RawWasm},
     state::{ProcessState, SignalSendErrorKind},
@@ -140,7 +143,10 @@ fn request_authorization_event(
 }
 
 fn classify_spawn_error(error: &anyhow::Error) -> (AuditResult, AuditReason) {
-    if error.downcast_ref::<ProcessLimitReached>().is_some() {
+    if error.downcast_ref::<ProcessLimitReached>().is_some()
+        || error.downcast_ref::<NodeProcessLimitReached>().is_some()
+        || error.downcast_ref::<EnvironmentLimitReached>().is_some()
+    {
         (AuditResult::Denied, AuditReason::ResourceLimit)
     } else {
         (AuditResult::Failed, AuditReason::RuntimeFailure)
@@ -490,7 +496,14 @@ where
             audit.mark_async();
             let created = ctx.envs.create(environment_id).await;
             audit.mark_failed(AuditReason::RuntimeFailure);
-            created?
+            match created {
+                Ok(environment) => environment,
+                Err(error) => {
+                    let (result, reason) = classify_spawn_error(&error);
+                    audit.finish(result, reason);
+                    return Err(error);
+                }
+            }
         }
     };
 
@@ -498,7 +511,8 @@ where
     let can_spawn = env.can_spawn_next_process().await;
     audit.mark_failed(AuditReason::RuntimeFailure);
     if let Err(error) = can_spawn {
-        audit.finish(AuditResult::Denied, AuditReason::ResourceLimit);
+        let (result, reason) = classify_spawn_error(&error);
+        audit.finish(result, reason);
         return Err(error);
     }
 
@@ -601,7 +615,10 @@ mod tests {
     use lunatic_common_api::{AuditReason, AuditResult};
     use lunatic_process::{
         config::ProcessConfig,
-        env::{Environment, Environments, LunaticEnvironments, ProcessLimitReached},
+        env::{
+            Environment, EnvironmentLimitReached, Environments, LunaticEnvironments,
+            NodeProcessLimitReached, ProcessLimitReached,
+        },
         state::SignalSendError,
         Process, Signal,
     };
@@ -657,11 +674,16 @@ mod tests {
 
     #[test]
     fn atomic_process_admission_failure_is_a_resource_denial() {
-        let error = anyhow::Error::new(ProcessLimitReached::new(7, 0));
-        assert_eq!(
-            classify_spawn_error(&error),
-            (AuditResult::Denied, AuditReason::ResourceLimit)
-        );
+        for error in [
+            anyhow::Error::new(ProcessLimitReached::new(7, 0)),
+            anyhow::Error::new(NodeProcessLimitReached::new(7, 0)),
+            anyhow::Error::new(EnvironmentLimitReached::new(7, 0)),
+        ] {
+            assert_eq!(
+                classify_spawn_error(&error),
+                (AuditResult::Denied, AuditReason::ResourceLimit)
+            );
+        }
         assert_eq!(
             classify_spawn_error(&anyhow::anyhow!("runtime failure")),
             (AuditResult::Failed, AuditReason::RuntimeFailure)
@@ -676,7 +698,7 @@ mod tests {
             Err(ClientError::EnvironmentNotFound)
         );
 
-        environments.create(7).await.unwrap();
+        let _environment = environments.create(7).await.unwrap();
         assert_eq!(
             deliver_process_message(&environments, 7, 11, None, vec![]).await,
             Err(ClientError::ProcessNotFound)

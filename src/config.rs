@@ -1,4 +1,5 @@
 use std::{
+    convert::TryFrom,
     fmt::Debug,
     fs,
     path::{Component, Path, PathBuf},
@@ -11,6 +12,15 @@ use lunatic_process::config::{
 use lunatic_process_api::ProcessConfigCtx;
 use lunatic_wasi_api::LunaticWasiConfigCtx;
 use serde::{Deserialize, Serialize};
+
+pub const DEFAULT_MAX_MODULES: u32 = 64;
+pub const DEFAULT_MAX_CONFIGS: u32 = 64;
+pub const DEFAULT_MAX_MODULE_BYTES: u64 =
+    lunatic_process::runtimes::wasmtime::DEFAULT_MAX_MODULE_BYTES as u64;
+pub const DEFAULT_MAX_CONFIG_ENTRIES: u32 = 256;
+pub const DEFAULT_MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+pub const DEFAULT_MAX_SQLITE_CONNECTIONS: u32 = 64;
+pub const DEFAULT_MAX_SQLITE_STATEMENTS: u32 = 256;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DefaultProcessConfig {
@@ -40,6 +50,20 @@ pub struct DefaultProcessConfig {
     max_message_size: u64,
     #[serde(default = "default_max_message_resources")]
     max_message_resources: u32,
+    #[serde(default = "default_max_modules")]
+    max_modules: u32,
+    #[serde(default = "default_max_configs")]
+    max_configs: u32,
+    #[serde(default = "default_max_module_bytes")]
+    max_module_bytes: u64,
+    #[serde(default = "default_max_config_entries")]
+    max_config_entries: u32,
+    #[serde(default = "default_max_config_bytes")]
+    max_config_bytes: u64,
+    #[serde(default = "default_max_sqlite_connections")]
+    max_sqlite_connections: u32,
+    #[serde(default = "default_max_sqlite_statements")]
+    max_sqlite_statements: u32,
 }
 
 const fn default_max_mailbox_messages() -> u32 {
@@ -56,6 +80,34 @@ const fn default_max_message_size() -> u64 {
 
 const fn default_max_message_resources() -> u32 {
     DEFAULT_MAX_MESSAGE_RESOURCES
+}
+
+const fn default_max_modules() -> u32 {
+    DEFAULT_MAX_MODULES
+}
+
+const fn default_max_configs() -> u32 {
+    DEFAULT_MAX_CONFIGS
+}
+
+const fn default_max_module_bytes() -> u64 {
+    DEFAULT_MAX_MODULE_BYTES
+}
+
+const fn default_max_config_entries() -> u32 {
+    DEFAULT_MAX_CONFIG_ENTRIES
+}
+
+const fn default_max_config_bytes() -> u64 {
+    DEFAULT_MAX_CONFIG_BYTES
+}
+
+const fn default_max_sqlite_connections() -> u32 {
+    DEFAULT_MAX_SQLITE_CONNECTIONS
+}
+
+const fn default_max_sqlite_statements() -> u32 {
+    DEFAULT_MAX_SQLITE_STATEMENTS
 }
 
 impl Default for DefaultProcessConfig {
@@ -76,6 +128,13 @@ impl Default for DefaultProcessConfig {
             max_signal_queue: DEFAULT_MAX_SIGNAL_QUEUE,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             max_message_resources: DEFAULT_MAX_MESSAGE_RESOURCES,
+            max_modules: DEFAULT_MAX_MODULES,
+            max_configs: DEFAULT_MAX_CONFIGS,
+            max_module_bytes: DEFAULT_MAX_MODULE_BYTES,
+            max_config_entries: DEFAULT_MAX_CONFIG_ENTRIES,
+            max_config_bytes: DEFAULT_MAX_CONFIG_BYTES,
+            max_sqlite_connections: DEFAULT_MAX_SQLITE_CONNECTIONS,
+            max_sqlite_statements: DEFAULT_MAX_SQLITE_STATEMENTS,
         }
     }
 }
@@ -101,6 +160,13 @@ impl Debug for DefaultProcessConfig {
             .field("max_signal_queue", &self.max_signal_queue)
             .field("max_message_size", &self.max_message_size)
             .field("max_message_resources", &self.max_message_resources)
+            .field("max_modules", &self.max_modules)
+            .field("max_configs", &self.max_configs)
+            .field("max_module_bytes", &self.max_module_bytes)
+            .field("max_config_entries", &self.max_config_entries)
+            .field("max_config_bytes", &self.max_config_bytes)
+            .field("max_sqlite_connections", &self.max_sqlite_connections)
+            .field("max_sqlite_statements", &self.max_sqlite_statements)
             .finish()
     }
 }
@@ -171,6 +237,13 @@ impl ProcessConfig for DefaultProcessConfig {
             max_signal_queue: self.max_signal_queue,
             max_message_size: self.max_message_size,
             max_message_resources: self.max_message_resources,
+            max_modules: self.max_modules,
+            max_configs: self.max_configs,
+            max_module_bytes: self.max_module_bytes,
+            max_config_entries: self.max_config_entries,
+            max_config_bytes: self.max_config_bytes,
+            max_sqlite_connections: self.max_sqlite_connections,
+            max_sqlite_statements: self.max_sqlite_statements,
         })
     }
 
@@ -245,6 +318,48 @@ impl ProcessConfig for DefaultProcessConfig {
                 child.max_message_resources, self.max_message_resources
             ));
         }
+        if child.max_modules > self.max_modules {
+            return Err(format!(
+                "max_modules {} exceeds parent ceiling {}",
+                child.max_modules, self.max_modules
+            ));
+        }
+        if child.max_configs > self.max_configs {
+            return Err(format!(
+                "max_configs {} exceeds parent ceiling {}",
+                child.max_configs, self.max_configs
+            ));
+        }
+        if child.max_module_bytes > self.max_module_bytes {
+            return Err(format!(
+                "max_module_bytes {} exceeds parent ceiling {}",
+                child.max_module_bytes, self.max_module_bytes
+            ));
+        }
+        if child.max_config_entries > self.max_config_entries {
+            return Err(format!(
+                "max_config_entries {} exceeds parent ceiling {}",
+                child.max_config_entries, self.max_config_entries
+            ));
+        }
+        if child.max_config_bytes > self.max_config_bytes {
+            return Err(format!(
+                "max_config_bytes {} exceeds parent ceiling {}",
+                child.max_config_bytes, self.max_config_bytes
+            ));
+        }
+        if child.max_sqlite_connections > self.max_sqlite_connections {
+            return Err(format!(
+                "max_sqlite_connections {} exceeds parent ceiling {}",
+                child.max_sqlite_connections, self.max_sqlite_connections
+            ));
+        }
+        if child.max_sqlite_statements > self.max_sqlite_statements {
+            return Err(format!(
+                "max_sqlite_statements {} exceeds parent ceiling {}",
+                child.max_sqlite_statements, self.max_sqlite_statements
+            ));
+        }
         for (_, dir) in &child.preopened_dirs {
             self.can_delegate_preopen_dir(Path::new(dir))?;
         }
@@ -311,6 +426,48 @@ impl ProcessConfig for DefaultProcessConfig {
                 self.max_message_resources, receiver_ceiling.max_message_resources
             ));
         }
+        if self.max_modules > receiver_ceiling.max_modules {
+            return Err(format!(
+                "max_modules {} exceeds receiver ceiling {}",
+                self.max_modules, receiver_ceiling.max_modules
+            ));
+        }
+        if self.max_configs > receiver_ceiling.max_configs {
+            return Err(format!(
+                "max_configs {} exceeds receiver ceiling {}",
+                self.max_configs, receiver_ceiling.max_configs
+            ));
+        }
+        if self.max_module_bytes > receiver_ceiling.max_module_bytes {
+            return Err(format!(
+                "max_module_bytes {} exceeds receiver ceiling {}",
+                self.max_module_bytes, receiver_ceiling.max_module_bytes
+            ));
+        }
+        if self.max_config_entries > receiver_ceiling.max_config_entries {
+            return Err(format!(
+                "max_config_entries {} exceeds receiver ceiling {}",
+                self.max_config_entries, receiver_ceiling.max_config_entries
+            ));
+        }
+        if self.max_config_bytes > receiver_ceiling.max_config_bytes {
+            return Err(format!(
+                "max_config_bytes {} exceeds receiver ceiling {}",
+                self.max_config_bytes, receiver_ceiling.max_config_bytes
+            ));
+        }
+        if self.max_sqlite_connections > receiver_ceiling.max_sqlite_connections {
+            return Err(format!(
+                "max_sqlite_connections {} exceeds receiver ceiling {}",
+                self.max_sqlite_connections, receiver_ceiling.max_sqlite_connections
+            ));
+        }
+        if self.max_sqlite_statements > receiver_ceiling.max_sqlite_statements {
+            return Err(format!(
+                "max_sqlite_statements {} exceeds receiver ceiling {}",
+                self.max_sqlite_statements, receiver_ceiling.max_sqlite_statements
+            ));
+        }
         if !self.preopened_dirs.is_empty() {
             return Err(
                 "filesystem preopens are host-local and cannot be delegated to a remote node without an explicit receiver policy"
@@ -345,6 +502,48 @@ impl DefaultProcessConfig {
         }
         if self.max_message_size == 0 {
             return Err("max_message_size must be greater than zero".into());
+        }
+        self.validate_retained_config_limits()?;
+        Ok(())
+    }
+
+    fn validate_retained_config_limits(&self) -> Result<(), String> {
+        self.validate_retained_values_against(self)
+    }
+
+    pub(crate) fn validate_retained_values_against(&self, ceiling: &Self) -> Result<(), String> {
+        let entries = self
+            .command_line_arguments
+            .len()
+            .checked_add(self.environment_variables.len())
+            .and_then(|entries| entries.checked_add(self.preopened_dirs.len()))
+            .ok_or_else(|| "retained config entry accounting overflow".to_owned())?;
+        let entries = u64::try_from(entries)
+            .map_err(|_| "retained config entry accounting overflow".to_owned())?;
+        if entries > u64::from(ceiling.max_config_entries) {
+            return Err(format!(
+                "retained config entry count {entries} exceeds max_config_entries {}",
+                ceiling.max_config_entries
+            ));
+        }
+
+        let mut bytes = 0_u64;
+        for argument in &self.command_line_arguments {
+            bytes = checked_add_retained_bytes(bytes, argument.len())?;
+        }
+        for (key, value) in &self.environment_variables {
+            bytes = checked_add_retained_bytes(bytes, key.len())?;
+            bytes = checked_add_retained_bytes(bytes, value.len())?;
+        }
+        for (guest_path, resolved_path) in &self.preopened_dirs {
+            bytes = checked_add_retained_bytes(bytes, guest_path.len())?;
+            bytes = checked_add_retained_bytes(bytes, resolved_path.len())?;
+        }
+        if bytes > ceiling.max_config_bytes {
+            return Err(format!(
+                "retained config byte count {bytes} exceeds max_config_bytes {}",
+                ceiling.max_config_bytes
+            ));
         }
         Ok(())
     }
@@ -409,6 +608,62 @@ impl DefaultProcessConfig {
         self.max_message_resources = max;
     }
 
+    pub fn get_max_modules(&self) -> u32 {
+        self.max_modules
+    }
+
+    pub fn set_max_modules(&mut self, max: u32) {
+        self.max_modules = max;
+    }
+
+    pub fn get_max_configs(&self) -> u32 {
+        self.max_configs
+    }
+
+    pub fn set_max_configs(&mut self, max: u32) {
+        self.max_configs = max;
+    }
+
+    pub fn get_max_module_bytes(&self) -> u64 {
+        self.max_module_bytes
+    }
+
+    pub fn set_max_module_bytes(&mut self, max: u64) {
+        self.max_module_bytes = max;
+    }
+
+    pub fn get_max_config_entries(&self) -> u32 {
+        self.max_config_entries
+    }
+
+    pub fn set_max_config_entries(&mut self, max: u32) {
+        self.max_config_entries = max;
+    }
+
+    pub fn get_max_config_bytes(&self) -> u64 {
+        self.max_config_bytes
+    }
+
+    pub fn set_max_config_bytes(&mut self, max: u64) {
+        self.max_config_bytes = max;
+    }
+
+    pub fn get_max_sqlite_connections(&self) -> u32 {
+        self.max_sqlite_connections
+    }
+
+    pub fn set_max_sqlite_connections(&mut self, max: u32) {
+        self.max_sqlite_connections = max;
+    }
+
+    pub fn get_max_sqlite_statements(&self) -> u32 {
+        self.max_sqlite_statements
+    }
+
+    pub fn set_max_sqlite_statements(&mut self, max: u32) {
+        self.max_sqlite_statements = max;
+    }
+
     /// Grant access to the given directory with this config.
     pub fn preopen_dir<S: Into<String>>(&mut self, dir: S) {
         self.add_preopened_dir(dir.into());
@@ -441,7 +696,7 @@ impl DefaultProcessConfig {
             .push((dir, resolved_path.to_string_lossy().into_owned()));
     }
 
-    fn can_delegate_preopen_dir(&self, path: &Path) -> Result<(), String> {
+    pub(crate) fn can_delegate_preopen_dir(&self, path: &Path) -> Result<(), String> {
         let requested = fs::canonicalize(path).map_err(|error| {
             format!(
                 "preopen directory '{}' cannot be resolved: {error}",
@@ -553,6 +808,62 @@ impl ProcessConfigCtx for DefaultProcessConfig {
         self.max_message_resources = max;
     }
 
+    fn get_max_modules(&self) -> u32 {
+        self.max_modules
+    }
+
+    fn set_max_modules(&mut self, max: u32) {
+        self.max_modules = max;
+    }
+
+    fn get_max_configs(&self) -> u32 {
+        self.max_configs
+    }
+
+    fn set_max_configs(&mut self, max: u32) {
+        self.max_configs = max;
+    }
+
+    fn get_max_module_bytes(&self) -> u64 {
+        self.max_module_bytes
+    }
+
+    fn set_max_module_bytes(&mut self, max: u64) {
+        self.max_module_bytes = max;
+    }
+
+    fn get_max_config_entries(&self) -> u32 {
+        self.max_config_entries
+    }
+
+    fn set_max_config_entries(&mut self, max: u32) {
+        self.max_config_entries = max;
+    }
+
+    fn get_max_config_bytes(&self) -> u64 {
+        self.max_config_bytes
+    }
+
+    fn set_max_config_bytes(&mut self, max: u64) {
+        self.max_config_bytes = max;
+    }
+
+    fn get_max_sqlite_connections(&self) -> u32 {
+        self.max_sqlite_connections
+    }
+
+    fn set_max_sqlite_connections(&mut self, max: u32) {
+        self.max_sqlite_connections = max;
+    }
+
+    fn get_max_sqlite_statements(&self) -> u32 {
+        self.max_sqlite_statements
+    }
+
+    fn set_max_sqlite_statements(&mut self, max: u32) {
+        self.max_sqlite_statements = max;
+    }
+
     fn can_access_fs_location(&self, path: &std::path::Path) -> Result<(), String> {
         let (file_path, parent_dir) = match strip_file(path) {
             Ok(p) => p,
@@ -572,6 +883,15 @@ impl ProcessConfigCtx for DefaultProcessConfig {
         }
     }
 }
+
+fn checked_add_retained_bytes(current: u64, bytes: usize) -> Result<u64, String> {
+    let bytes =
+        u64::try_from(bytes).map_err(|_| "retained config byte accounting overflow".to_owned())?;
+    current
+        .checked_add(bytes)
+        .ok_or_else(|| "retained config byte accounting overflow".to_owned())
+}
+
 fn path_is_ancestor(ancestor: &Path, descendant: &Path) -> bool {
     if !ancestor.is_dir() {
         return false;
@@ -667,7 +987,11 @@ mod tests {
     use lunatic_process::config::ProcessConfig;
     use lunatic_process_api::ProcessConfigCtx;
 
-    use super::{normalize_path, DefaultProcessConfig};
+    use super::{
+        normalize_path, DefaultProcessConfig, DEFAULT_MAX_CONFIGS, DEFAULT_MAX_CONFIG_BYTES,
+        DEFAULT_MAX_CONFIG_ENTRIES, DEFAULT_MAX_MODULES, DEFAULT_MAX_MODULE_BYTES,
+        DEFAULT_MAX_SQLITE_CONNECTIONS, DEFAULT_MAX_SQLITE_STATEMENTS,
+    };
 
     #[test]
     fn default_config_denies_privileged_capabilities() {
@@ -677,6 +1001,123 @@ mod tests {
         assert!(!config.can_create_configs());
         assert!(!config.can_spawn_processes());
         assert!(config.preopened_dirs().is_empty());
+        assert_eq!(config.get_max_modules(), DEFAULT_MAX_MODULES);
+        assert_eq!(config.get_max_configs(), DEFAULT_MAX_CONFIGS);
+        assert_eq!(config.get_max_module_bytes(), DEFAULT_MAX_MODULE_BYTES);
+        assert_eq!(config.get_max_config_entries(), DEFAULT_MAX_CONFIG_ENTRIES);
+        assert_eq!(config.get_max_config_bytes(), DEFAULT_MAX_CONFIG_BYTES);
+        assert_eq!(
+            config.get_max_sqlite_connections(),
+            DEFAULT_MAX_SQLITE_CONNECTIONS
+        );
+        assert_eq!(
+            config.get_max_sqlite_statements(),
+            DEFAULT_MAX_SQLITE_STATEMENTS
+        );
+    }
+
+    #[test]
+    fn new_resource_ceilings_use_serde_defaults_for_legacy_configs() {
+        let mut serialized = serde_json::to_value(DefaultProcessConfig::default()).unwrap();
+        let object = serialized.as_object_mut().unwrap();
+        for field in [
+            "max_modules",
+            "max_configs",
+            "max_module_bytes",
+            "max_config_entries",
+            "max_config_bytes",
+            "max_sqlite_connections",
+            "max_sqlite_statements",
+        ] {
+            object.remove(field);
+        }
+
+        let config: DefaultProcessConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(config.get_max_modules(), DEFAULT_MAX_MODULES);
+        assert_eq!(config.get_max_configs(), DEFAULT_MAX_CONFIGS);
+        assert_eq!(config.get_max_module_bytes(), DEFAULT_MAX_MODULE_BYTES);
+        assert_eq!(config.get_max_config_entries(), DEFAULT_MAX_CONFIG_ENTRIES);
+        assert_eq!(config.get_max_config_bytes(), DEFAULT_MAX_CONFIG_BYTES);
+        assert_eq!(
+            config.get_max_sqlite_connections(),
+            DEFAULT_MAX_SQLITE_CONNECTIONS
+        );
+        assert_eq!(
+            config.get_max_sqlite_statements(),
+            DEFAULT_MAX_SQLITE_STATEMENTS
+        );
+    }
+
+    #[test]
+    fn retained_config_limits_count_entries_and_utf8_bytes() {
+        let mut config = DefaultProcessConfig::default();
+        config.set_max_config_entries(2);
+        config.set_max_config_bytes(7);
+        config.set_command_line_arguments(vec!["é".into()]);
+        config.set_environment_variables(vec![("KEY".into(), "ok".into())]);
+        config.validate_runtime_limits().unwrap();
+
+        config.set_max_config_bytes(6);
+        assert!(config
+            .validate_runtime_limits()
+            .unwrap_err()
+            .contains("max_config_bytes"));
+
+        config.set_max_config_bytes(7);
+        config.set_command_line_arguments(vec!["é".into(), "extra".into()]);
+        assert!(config
+            .validate_runtime_limits()
+            .unwrap_err()
+            .contains("max_config_entries"));
+    }
+
+    #[test]
+    fn child_and_distributed_validation_attenuate_new_ceilings() {
+        let mut parent = DefaultProcessConfig::default();
+        parent.set_max_modules(4);
+        parent.set_max_configs(3);
+        parent.set_max_module_bytes(2_048);
+        parent.set_max_config_entries(8);
+        parent.set_max_config_bytes(4_096);
+        parent.set_max_sqlite_connections(2);
+        parent.set_max_sqlite_statements(5);
+        let child = parent.new_child_config().unwrap();
+        parent.validate_child_config(&child).unwrap();
+
+        let mut escalated = child.clone();
+        escalated.set_max_modules(5);
+        assert!(parent
+            .validate_child_config(&escalated)
+            .unwrap_err()
+            .contains("max_modules"));
+
+        let mut escalated = child.clone();
+        escalated.set_max_config_bytes(4_097);
+        assert!(parent
+            .validate_child_config(&escalated)
+            .unwrap_err()
+            .contains("max_config_bytes"));
+
+        let mut escalated = child;
+        escalated.set_max_sqlite_statements(6);
+        assert!(parent
+            .validate_child_config(&escalated)
+            .unwrap_err()
+            .contains("max_sqlite_statements"));
+
+        let mut remote = DefaultProcessConfig::default();
+        remote.set_max_module_bytes(DEFAULT_MAX_MODULE_BYTES + 1);
+        assert!(remote
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("receiver ceiling"));
+
+        let mut remote = DefaultProcessConfig::default();
+        remote.set_max_sqlite_connections(DEFAULT_MAX_SQLITE_CONNECTIONS + 1);
+        assert!(remote
+            .validate_distributed_config()
+            .unwrap_err()
+            .contains("receiver ceiling"));
     }
 
     #[test]
