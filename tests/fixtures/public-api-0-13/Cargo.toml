@@ -1,0 +1,10 @@
+[package]
+name = "lunatic-public-api-0-13-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lunatic-process = "=0.13.2"
+
+[workspace]

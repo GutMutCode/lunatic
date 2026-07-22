@@ -2,8 +2,46 @@
 
 ## Unreleased
 
+Target release: v0.14.0. Host integrations must follow the
+[0.13 to 0.14 migration guide](docs/MIGRATING_0.13_TO_0.14.md); the workspace release contract
+does not permit these changes to ship on the 0.13 line. The new, independently versioned
+`lunatic-otp-patterns` crate remains at 0.1.0 while requiring the Lunatic 0.14 release train.
+
 ### Breaking changes
 
+- Process and environment delivery is now bounded and ownership preserving:
+  `Process::send` and `Environment::send` return `SignalSendError`, `MessageMailbox::push` returns
+  `MailboxPushError`, `Environment::add_process` returns admission failure, and
+  `Environment::remove_process` reports whether it removed a process. Recover rejected values with
+  `SignalSendError::into_signal` and `MailboxPushError::into_message`/`into_parts`.
+- `lunatic_process::spawn` returns `Result`, and its state bound includes `ReloadableState` and
+  `wasmtime::ResourceLimiter`. Use `spawn_native` for host processes without Wasm state.
+- Custom `Environment`/`Environments` implementations must provide broadcast and registry-backed
+  creation. Environment creation returns `Result`; callers must retain the returned `Arc` while
+  the weakly registered environment must remain discoverable.
+- Public signal/message constructors changed for monitor acknowledgements and explicit death
+  reasons. The public Tokio unbounded signal aliases were replaced by bounded
+  `SignalSender`/`SignalReceiver`/`SignalEnvelope` types.
+- `DefaultProcessConfig::preopened_dirs` and `lunatic-wasi-api::build_wasi` now use
+  `(guest_path, resolved_host_path)` pairs. Public Wasmtime/WASI types moved from version 8 to
+  46.0.1, and serialized process configs are not wire-compatible with 0.13 nodes.
+- SQLite connection/statement aliases now own quota leases and `SQLiteCtx` requires a shared
+  finite quota. The guest `open` output handle is now 64-bit; `sqlite3_finalize` takes a statement
+  handle, and the new `sqlite3_close` closes a connection.
+- Public networking resource shapes changed: TCP connections expose peer/local addresses, TLS
+  connections expose optional client metadata, and TLS listeners store a configured
+  `TlsAcceptor` instead of raw certificates and keys. Rustls/tokio-rustls public types moved to
+  0.23.42/0.26.4.
+- The distributed client now accepts `SendParams`/`SpawnParams`, returns message IDs and explicit
+  delivery errors, and uses native Quinn 0.11 connections instead of the old stream wrappers.
+  Request/response MessagePack shapes changed, so 0.13 and 0.14 nodes cannot share a rolling
+  cluster.
+- Control registration now uses non-cloneable typed bearer tokens, generations, and typed client
+  operations. Control-axum routes use `NodeAuth`; direct `ControlServer` construction and the old
+  raw client request helpers are no longer public extension points.
+- `TimerResources::add` is no longer public; schedule with the registered `send_after` host call.
+  Messaging registration now requires `T::Config: ProcessConfigCtx`, and version registration
+  requires `T: 'static`.
 - TLS listener resource snapshots use a version-2 address-plus-opaque-handle contract. The
   `ResourceSnapshot::TlsListener` fields changed, and `ResourceMigrationSnapshot` must now be
   encoded and decoded through `to_bytes`/`from_bytes` instead of blanket serde implementations.
@@ -21,9 +59,12 @@
   imports. It temporarily enables Wasmtime linker shadowing for descriptor-producing wrappers and
   leaves shadowing disabled when it returns; embedders that need a different linker policy must
   set it again after registration.
+- Public Wasmtime-facing types now follow Wasmtime 46 instead of Wasmtime 8. The distributed and
+  control-plane Rust APIs now use authenticated bearer generations, bounded delivery errors, and
+  the rcgen 0.14 certificate/signer wrappers described in the migration guide.
 
-These public Rust API and wire-contract changes require the next published Lunatic line to be
-`0.14.0` or another explicitly semver-breaking release; they must not ship as a `0.13.x` patch.
+These public Rust API and wire-contract changes will be released as `0.14.0`; they must not ship as
+a `0.13.x` patch.
 
 ### Added
 
@@ -31,9 +72,9 @@ These public Rust API and wire-contract changes require the next published Lunat
   and configuration handles, SQLite connections/statements, WASI descriptors, environments, and
   per-environment/node process admission. `run`, cargo-test runner, and `node` expose compiled
   module limits; `node` also exposes the independent distributed module-cache ceiling. During a
-  rolling cluster upgrade, the new distributed ceilings are guaranteed only after every receiving
-  node has been upgraded because older receivers do not understand the added config fields. Use
-  `--` before guest arguments whose names collide with the new `--max-*` runtime options.
+  coordinated 0.14 cluster cutover, the new distributed ceilings take effect after every receiving
+  node has been upgraded; 0.13 nodes cannot decode the new wire/config shapes. Use `--` before
+  guest arguments whose names collide with the new `--max-*` runtime options.
 
 - Lunatic Cloud CLI credentials now use macOS Keychain, Windows Credential Manager, or Linux
   Secret Service behind an opaque configuration reference. Legacy plaintext login records migrate

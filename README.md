@@ -140,6 +140,13 @@ We intend to eventually make Lunatic completely compatible with [WASI][10]. Idea
 compile it to WebAssembly and run on top of Lunatic; creating the best developer experience possible. We're not
 quite there yet.
 
+The Rust host/runtime crates follow a coordinated release train. Version 0.14 intentionally changes
+process delivery, spawning, mailbox backpressure, resource snapshots, and several embedding types;
+host integrations upgrading from 0.13 must follow the
+[0.13 to 0.14 migration guide](docs/MIGRATING_0.13_TO_0.14.md). Guest ABI compatibility and any
+temporary legacy imports are called out separately in that guide. The new `lunatic-otp-patterns`
+crate is independently versioned at 0.1.0 and requires the 0.14 runtime crates.
+
 ## License
 
 Licensed under either of

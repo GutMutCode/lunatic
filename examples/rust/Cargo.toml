@@ -2,6 +2,7 @@
 name = "lunatic-rust-examples"
 version = "0.1.0"
 edition = "2021"
+publish = false
 
 [workspace]
 # Keep this package separate from the main workspace

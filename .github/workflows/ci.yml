@@ -10,6 +10,71 @@ on:
 name: Test & (release)
 
 jobs:
+  release_contract:
+    name: Release contract
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+      - name: Validate workspace versions and changelog contract
+        run: python scripts/check_release_contract.py
+
+  public_api:
+    name: Public API compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code and baseline history
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Select the public API baseline
+        id: api_baseline
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GIT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            baseline="$PR_BASE_SHA"
+          elif [[ "$GIT_REF" == refs/tags/* ]]; then
+            baseline="$(git describe --tags --match 'v[0-9]*' --abbrev=0 HEAD^ 2>/dev/null || true)"
+            if [[ -z "$baseline" ]]; then
+              baseline="0b325fb264f005b0a35648e142637e4fb14ad387"
+            fi
+          else
+            baseline="$EVENT_BEFORE"
+            if [[ -z "$baseline" || "$baseline" =~ ^0+$ ]]; then
+              baseline="$(git merge-base HEAD "origin/$DEFAULT_BRANCH" 2>/dev/null || true)"
+            fi
+            if [[ -z "$baseline" || "$baseline" == "$(git rev-parse HEAD)" ]]; then
+              baseline="$(git rev-parse HEAD^ 2>/dev/null || true)"
+            fi
+            if [[ -z "$baseline" ]]; then
+              baseline="0b325fb264f005b0a35648e142637e4fb14ad387"
+            fi
+          fi
+          git cat-file -e "${baseline}^{commit}"
+          echo "rev=$baseline" >> "$GITHUB_OUTPUT"
+      - name: Check workspace SemVer against the selected baseline
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          baseline-rev: ${{ steps.api_baseline.outputs.rev }}
+          exclude: lunatic-otp-patterns
+      - name: Compile the locked 0.13 downstream contract
+        run: cargo check --locked --manifest-path tests/fixtures/public-api-0-13/Cargo.toml
+      - name: Run the migrated downstream contract
+        run: cargo test -p lunatic-process --test public_api_0_13_migration
+      - name: Compile the locked 0.14 Rust examples
+        run: cargo check --locked --manifest-path examples/rust/Cargo.toml
+
   test_or_release:
     name: Test & (release)
     runs-on: ${{ matrix.os }}
@@ -51,7 +116,7 @@ jobs:
       - name: "Run clippy check"
         run: cargo clippy --examples --tests --benches -- -D warnings
       - name: "Check formatting"
-        run: cargo fmt -- --check
+        run: cargo fmt --all -- --check
       - name: "Verify Windows Wasm lifecycle semantics"
         if: runner.os == 'Windows'
         run: cargo test --test wasm_link_death
@@ -118,8 +183,8 @@ jobs:
 
   release:
     name: Publish draft release
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: test_or_release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [public_api, release_contract, test_or_release]
     runs-on: ubuntu-latest
     permissions:
       contents: write
