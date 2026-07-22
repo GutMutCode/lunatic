@@ -4,7 +4,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex as StdMutex, OnceLock, Weak,
     },
 };
 
@@ -84,7 +84,6 @@ pub struct SignalEnvelope {
     // smaller than the physical signal queue. This keeps lifecycle control
     // enqueueable during a data flood at normal configured capacities.
     _data_queue_permit: Option<OwnedSemaphorePermit>,
-    link_permit: Option<OwnedSemaphorePermit>,
     monitor_permit: Option<OwnedSemaphorePermit>,
     monitor_notification: Option<MonitorNotification>,
 }
@@ -95,7 +94,6 @@ impl SignalEnvelope {
             signal,
             mailbox_permit: None,
             _data_queue_permit: None,
-            link_permit: None,
             monitor_permit: None,
             monitor_notification: None,
         }
@@ -125,13 +123,11 @@ impl SignalEnvelope {
         Signal,
         Option<MailboxPermit>,
         Option<OwnedSemaphorePermit>,
-        Option<OwnedSemaphorePermit>,
         Option<MonitorNotification>,
     ) {
         (
             self.signal,
             self.mailbox_permit,
-            self.link_permit,
             self.monitor_permit,
             self.monitor_notification,
         )
@@ -251,6 +247,492 @@ fn complete_exited_monitor(
     }
 }
 
+#[derive(Debug)]
+struct LinkToken {
+    counted_alive: AtomicBool,
+}
+
+impl LinkToken {
+    fn new() -> Self {
+        Self {
+            counted_alive: AtomicBool::new(true),
+        }
+    }
+}
+
+struct LinkRelation {
+    token: Arc<LinkToken>,
+    peer_state: Weak<LinkState>,
+    // `SignalSender` holds only a weak reference back to its LinkState, so retaining this
+    // bounded, core-owned delivery path cannot form an A -> B -> A relation cycle.
+    peer_sender: SignalSender,
+    exit_tag: Option<i64>,
+    permit: OwnedSemaphorePermit,
+}
+
+#[derive(Default)]
+struct LinkStateInner {
+    terminal_reason: Option<crate::DeathReason>,
+    relations: HashMap<u64, LinkRelation>,
+}
+
+#[derive(Default)]
+struct LinkState {
+    process_id: OnceLock<u64>,
+    inner: StdMutex<LinkStateInner>,
+}
+
+impl LinkState {
+    fn lock(&self) -> std::sync::MutexGuard<'_, LinkStateInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+fn deliver_link_death(
+    peer_sender: &SignalSender,
+    peer_id: u64,
+    process_id: u64,
+    exit_tag: Option<i64>,
+    reason: crate::DeathReason,
+) {
+    if let Err(error) =
+        peer_sender.send_to_process(peer_id, Signal::LinkDied(process_id, exit_tag, reason))
+    {
+        log::warn!("Failed to notify linked process that process {process_id} died: {error}");
+        if matches!(
+            reason,
+            crate::DeathReason::Failure | crate::DeathReason::NoProcess
+        ) {
+            peer_sender.request_kill();
+        }
+    }
+}
+
+#[cfg(feature = "metrics")]
+fn record_link_delta(process_id: Option<u64>, increment: bool) {
+    #[cfg(all(feature = "metrics", not(feature = "detailed_metrics")))]
+    let labels: [(String, String); 0] = [];
+    #[cfg(all(feature = "metrics", not(feature = "detailed_metrics")))]
+    let _ = process_id;
+    #[cfg(all(feature = "metrics", feature = "detailed_metrics"))]
+    let labels = [(
+        "process_id",
+        process_id
+            .expect("detailed link metrics require a process identity")
+            .to_string(),
+    )];
+
+    // Metrics recorders are application supplied. Keep telemetry failures from
+    // unwinding through lifecycle cleanup after the core state has committed.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if increment {
+            metrics::increment_gauge!("lunatic.process.links.alive", 1.0, &labels);
+        } else {
+            metrics::decrement_gauge!("lunatic.process.links.alive", 1.0, &labels);
+        }
+    }));
+}
+
+fn record_link_created(left_process_id: u64, right_process_id: u64) {
+    #[cfg(all(feature = "metrics", feature = "detailed_metrics"))]
+    {
+        record_link_delta(Some(left_process_id), true);
+        record_link_delta(Some(right_process_id), true);
+    }
+    #[cfg(all(feature = "metrics", not(feature = "detailed_metrics")))]
+    {
+        let _ = (left_process_id, right_process_id);
+        record_link_delta(None, true);
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (left_process_id, right_process_id);
+}
+
+fn record_link_removed(
+    token: &LinkToken,
+    first_process_id: Option<u64>,
+    second_process_id: Option<u64>,
+) {
+    let first_pair_removal = token.counted_alive.swap(false, Ordering::AcqRel);
+    #[cfg(all(feature = "metrics", feature = "detailed_metrics"))]
+    {
+        let _ = first_pair_removal;
+        for process_id in [first_process_id, second_process_id].iter().flatten() {
+            record_link_delta(Some(*process_id), false);
+        }
+    }
+    #[cfg(all(feature = "metrics", not(feature = "detailed_metrics")))]
+    {
+        let _ = (first_process_id, second_process_id);
+        if first_pair_removal {
+            record_link_delta(None, false);
+        }
+    }
+    #[cfg(not(feature = "metrics"))]
+    let _ = (first_pair_removal, first_process_id, second_process_id);
+}
+
+impl Drop for LinkState {
+    fn drop(&mut self) {
+        let state = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let relations = std::mem::take(&mut state.relations);
+        let Some(process_id) = self.process_id.get().copied() else {
+            return;
+        };
+        let mut removal_events = Vec::with_capacity(relations.len());
+        let mut notifications = Vec::with_capacity(relations.len());
+
+        for (peer_id, relation) in relations {
+            let LinkRelation {
+                token,
+                peer_state,
+                peer_sender,
+                exit_tag,
+                permit,
+            } = relation;
+            drop(permit);
+            let Some(peer_state) = peer_state.upgrade() else {
+                removal_events.push((token, None));
+                continue;
+            };
+            let removed = {
+                let mut peer_state = peer_state.lock();
+                let matches = peer_state
+                    .relations
+                    .get(&process_id)
+                    .is_some_and(|relation| Arc::ptr_eq(&relation.token, &token));
+                if matches {
+                    peer_state.relations.remove(&process_id);
+                }
+                matches
+            };
+            removal_events.push((token, removed.then_some(peer_id)));
+            if removed {
+                notifications.push((
+                    peer_sender,
+                    peer_id,
+                    process_id,
+                    exit_tag,
+                    crate::DeathReason::NoProcess,
+                ));
+            }
+        }
+
+        for (peer_sender, peer_id, process_id, exit_tag, reason) in notifications {
+            deliver_link_death(&peer_sender, peer_id, process_id, exit_tag, reason);
+        }
+        for (token, peer_process_id) in removal_events {
+            record_link_removed(&token, Some(process_id), peer_process_id);
+        }
+    }
+}
+
+/// Opaque access to the bounded lifecycle state owned by a built-in process.
+///
+/// Its fields cannot be constructed directly. Handles obtained from built-in process/mailbox
+/// adapters always refer to core-owned bounded state, so lifecycle operations never retain an
+/// arbitrary custom callback or trust one to provide its own admission accounting.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ProcessLifecycleHandle {
+    process_id: u64,
+    link_state: Arc<LinkState>,
+    signal_sender: SignalSender,
+}
+
+impl ProcessLifecycleHandle {
+    pub fn process_id(&self) -> u64 {
+        self.process_id
+    }
+
+    pub(crate) fn link_pair(
+        left: &Self,
+        left_exit_tag: Option<i64>,
+        right: &Self,
+        right_exit_tag: Option<i64>,
+    ) -> std::result::Result<(), crate::LinkError> {
+        if Arc::ptr_eq(&left.link_state, &right.link_state) {
+            return if left.process_id == right.process_id {
+                Ok(())
+            } else {
+                Err(crate::LinkError::IdentityMismatch {
+                    process_id: left.process_id,
+                })
+            };
+        }
+        if left.process_id == right.process_id {
+            return Err(crate::LinkError::IdentityMismatch {
+                process_id: left.process_id,
+            });
+        }
+
+        fn install(
+            left: &ProcessLifecycleHandle,
+            left_exit_tag: Option<i64>,
+            left_state: &mut LinkStateInner,
+            right: &ProcessLifecycleHandle,
+            right_exit_tag: Option<i64>,
+            right_state: &mut LinkStateInner,
+        ) -> std::result::Result<bool, crate::LinkError> {
+            if left_state.terminal_reason.is_some()
+                || left.signal_sender.terminal_reason().is_some()
+                || left.signal_sender.is_closed()
+            {
+                return Err(crate::LinkError::Terminated {
+                    process_id: left.process_id,
+                });
+            }
+            if right_state.terminal_reason.is_some()
+                || right.signal_sender.terminal_reason().is_some()
+                || right.signal_sender.is_closed()
+            {
+                return Err(crate::LinkError::Terminated {
+                    process_id: right.process_id,
+                });
+            }
+
+            match (
+                left_state.relations.get(&right.process_id),
+                right_state.relations.get(&left.process_id),
+            ) {
+                (Some(left_relation), Some(right_relation))
+                    if Arc::ptr_eq(&left_relation.token, &right_relation.token) =>
+                {
+                    left_state
+                        .relations
+                        .get_mut(&right.process_id)
+                        .expect("checked relation must remain present")
+                        .exit_tag = left_exit_tag;
+                    right_state
+                        .relations
+                        .get_mut(&left.process_id)
+                        .expect("checked relation must remain present")
+                        .exit_tag = right_exit_tag;
+                    return Ok(false);
+                }
+                (None, None) => {}
+                _ => {
+                    return Err(crate::LinkError::InconsistentState {
+                        left_process_id: left.process_id,
+                        right_process_id: right.process_id,
+                    });
+                }
+            }
+
+            let left_permit = Arc::clone(&left.signal_sender.link_admission)
+                .try_acquire_owned()
+                .map_err(|_| crate::LinkError::CapacityExhausted {
+                    process_id: left.process_id,
+                })?;
+            let right_permit = Arc::clone(&right.signal_sender.link_admission)
+                .try_acquire_owned()
+                .map_err(|_| crate::LinkError::CapacityExhausted {
+                    process_id: right.process_id,
+                })?;
+            let token = Arc::new(LinkToken::new());
+
+            left_state.relations.insert(
+                right.process_id,
+                LinkRelation {
+                    token: token.clone(),
+                    peer_state: Arc::downgrade(&right.link_state),
+                    peer_sender: right.signal_sender.clone(),
+                    exit_tag: left_exit_tag,
+                    permit: left_permit,
+                },
+            );
+            right_state.relations.insert(
+                left.process_id,
+                LinkRelation {
+                    token,
+                    peer_state: Arc::downgrade(&left.link_state),
+                    peer_sender: left.signal_sender.clone(),
+                    exit_tag: right_exit_tag,
+                    permit: right_permit,
+                },
+            );
+            Ok(true)
+        }
+
+        let left_address = Arc::as_ptr(&left.link_state) as usize;
+        let right_address = Arc::as_ptr(&right.link_state) as usize;
+        let created = if left_address < right_address {
+            let mut left_state = left.link_state.lock();
+            let mut right_state = right.link_state.lock();
+            install(
+                left,
+                left_exit_tag,
+                &mut left_state,
+                right,
+                right_exit_tag,
+                &mut right_state,
+            )
+        } else {
+            let mut right_state = right.link_state.lock();
+            let mut left_state = left.link_state.lock();
+            install(
+                left,
+                left_exit_tag,
+                &mut left_state,
+                right,
+                right_exit_tag,
+                &mut right_state,
+            )
+        }?;
+        if created {
+            record_link_created(left.process_id, right.process_id);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn unlink_peer(&self, peer_id: u64) -> bool {
+        let relation = {
+            let state = self.link_state.lock();
+            state
+                .relations
+                .get(&peer_id)
+                .map(|relation| (relation.token.clone(), relation.peer_state.clone()))
+        };
+        let Some((token, peer_state)) = relation else {
+            return false;
+        };
+
+        let Some(peer_state) = peer_state.upgrade() else {
+            let matches = {
+                let mut state = self.link_state.lock();
+                let matches = state
+                    .relations
+                    .get(&peer_id)
+                    .is_some_and(|relation| Arc::ptr_eq(&relation.token, &token));
+                if matches {
+                    state.relations.remove(&peer_id);
+                }
+                matches
+            };
+            if matches {
+                record_link_removed(&token, Some(self.process_id), None);
+            }
+            return matches;
+        };
+
+        let self_address = Arc::as_ptr(&self.link_state) as usize;
+        let peer_address = Arc::as_ptr(&peer_state) as usize;
+        let remove = |self_state: &mut LinkStateInner, peer_state: &mut LinkStateInner| {
+            let self_matches = self_state
+                .relations
+                .get(&peer_id)
+                .is_some_and(|relation| Arc::ptr_eq(&relation.token, &token));
+            let peer_matches = peer_state
+                .relations
+                .get(&self.process_id)
+                .is_some_and(|relation| Arc::ptr_eq(&relation.token, &token));
+            if self_matches {
+                self_state.relations.remove(&peer_id);
+            }
+            if peer_matches {
+                peer_state.relations.remove(&self.process_id);
+            }
+            (self_matches, peer_matches)
+        };
+
+        let (self_removed, peer_removed) = if self_address < peer_address {
+            let mut self_state = self.link_state.lock();
+            let mut peer_state = peer_state.lock();
+            remove(&mut self_state, &mut peer_state)
+        } else {
+            let mut peer_state = peer_state.lock();
+            let mut self_state = self.link_state.lock();
+            remove(&mut self_state, &mut peer_state)
+        };
+        let removed = self_removed || peer_removed;
+        if removed {
+            record_link_removed(
+                &token,
+                self_removed.then_some(self.process_id),
+                peer_removed.then_some(peer_id),
+            );
+        }
+        removed
+    }
+
+    pub(crate) fn terminate(&self, reason: crate::DeathReason) {
+        self.signal_sender.publish_terminal_reason(reason);
+        let relations = {
+            let mut state = self.link_state.lock();
+            if state.terminal_reason.is_some() {
+                return;
+            }
+            state.terminal_reason = Some(reason);
+            std::mem::take(&mut state.relations)
+        };
+        let mut removal_events = Vec::with_capacity(relations.len());
+        let mut notifications = Vec::with_capacity(relations.len());
+
+        for (peer_id, relation) in relations {
+            let LinkRelation {
+                token,
+                peer_state,
+                peer_sender,
+                exit_tag,
+                permit,
+            } = relation;
+            // Reclaim the terminating process's relation capacity before attempting delivery.
+            drop(permit);
+
+            let Some(peer_state) = peer_state.upgrade() else {
+                removal_events.push((token, None));
+                continue;
+            };
+            let peer_removed = {
+                let mut peer_state = peer_state.lock();
+                let matches = peer_state
+                    .relations
+                    .get(&self.process_id)
+                    .is_some_and(|relation| Arc::ptr_eq(&relation.token, &token));
+                if matches {
+                    peer_state.relations.remove(&self.process_id);
+                }
+                matches
+            };
+            removal_events.push((token, peer_removed.then_some(peer_id)));
+            if !peer_removed {
+                continue;
+            }
+            notifications.push((peer_sender, peer_id, exit_tag));
+        }
+
+        for (peer_sender, peer_id, exit_tag) in notifications {
+            deliver_link_death(&peer_sender, peer_id, self.process_id, exit_tag, reason);
+        }
+        for (token, peer_process_id) in removal_events {
+            record_link_removed(&token, Some(self.process_id), peer_process_id);
+        }
+    }
+
+    pub(crate) fn relation_count(&self) -> usize {
+        self.link_state.lock().relations.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn available_link_capacity(&self) -> usize {
+        self.signal_sender.link_admission.available_permits()
+    }
+}
+
+impl fmt::Debug for ProcessLifecycleHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProcessLifecycleHandle")
+            .field("process_id", &self.process_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for SignalEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -266,6 +748,7 @@ pub struct SignalSender {
     sender: mpsc::Sender<SignalEnvelope>,
     kill: Arc<KillSignal>,
     lifecycle: Arc<ProcessLifecycle>,
+    link_state: Weak<LinkState>,
     data_admission: Arc<Semaphore>,
     link_admission: Arc<Semaphore>,
     monitor_admission: Arc<Semaphore>,
@@ -304,6 +787,12 @@ impl SignalSender {
         signal: Signal,
         target_process_id: Option<u64>,
     ) -> Result<(), SignalSendError> {
+        // Link relations require a bilateral transaction over runtime-owned lifecycle state.
+        // Retaining the legacy signal form would allow callers to create one-sided relations.
+        if matches!(&signal, Signal::Link(_, _) | Signal::UnLink { .. }) {
+            return Err(SignalSendError::Closed(signal));
+        }
+
         if let Some(process_id) = target_process_id {
             if let Some(reason) = self.lifecycle.death_reason.get().copied() {
                 return self.complete_monitor_after_exit(process_id, reason, signal);
@@ -379,15 +868,6 @@ impl SignalSender {
             None
         };
 
-        let link_permit = if matches!(signal, Signal::Link(_, _)) {
-            match Arc::clone(&self.link_admission).try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => return Err(SignalSendError::QueueFull(signal)),
-            }
-        } else {
-            None
-        };
-
         let monitor_permit = if matches!(signal, Signal::Monitor { .. }) {
             match Arc::clone(&self.monitor_admission).try_acquire_owned() {
                 Ok(permit) => Some(permit),
@@ -420,7 +900,6 @@ impl SignalSender {
             signal,
             mailbox_permit,
             _data_queue_permit: data_queue_permit,
-            link_permit,
             monitor_permit,
             monitor_notification,
         };
@@ -490,6 +969,29 @@ impl SignalSender {
         self.lifecycle.death_reason.get().copied()
     }
 
+    pub(crate) fn lifecycle_handle(&self, process_id: u64) -> Option<ProcessLifecycleHandle> {
+        let link_state = self.link_state.upgrade()?;
+        if link_state.process_id.set(process_id).is_err()
+            && link_state.process_id.get().copied() != Some(process_id)
+        {
+            return None;
+        }
+        Some(ProcessLifecycleHandle {
+            process_id,
+            link_state,
+            signal_sender: self.clone(),
+        })
+    }
+
+    fn publish_terminal_reason(&self, reason: crate::DeathReason) {
+        let _ = self.lifecycle.death_reason.set(reason);
+    }
+
+    fn request_kill(&self) {
+        self.kill.requested.store(true, Ordering::Release);
+        self.kill.notify.notify_one();
+    }
+
     /// Returns the configured signal queue capacity.
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -539,6 +1041,13 @@ pub struct SignalReceiver {
     receiver: Arc<Mutex<mpsc::Receiver<SignalEnvelope>>>,
     kill: Arc<KillSignal>,
     lifecycle: Arc<ProcessLifecycle>,
+    _lifetime: Arc<SignalReceiverLifetime>,
+}
+
+struct SignalReceiverLifetime {
+    lifecycle: Arc<ProcessLifecycle>,
+    lifecycle_sender: SignalSender,
+    link_state: Arc<LinkState>,
 }
 
 #[derive(Debug, Default)]
@@ -604,6 +1113,24 @@ impl SignalReceiver {
     }
 }
 
+impl Drop for SignalReceiverLifetime {
+    fn drop(&mut self) {
+        let Some(process_id) = self.link_state.process_id.get().copied() else {
+            return;
+        };
+        let Some(lifecycle) = self.lifecycle_sender.lifecycle_handle(process_id) else {
+            return;
+        };
+        let reason = self
+            .lifecycle
+            .death_reason
+            .get()
+            .copied()
+            .unwrap_or(crate::DeathReason::NoProcess);
+        lifecycle.terminate(reason);
+    }
+}
+
 impl fmt::Debug for SignalReceiver {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("SignalReceiver { .. }")
@@ -621,7 +1148,8 @@ pub enum SignalSendErrorKind {
     MailboxFull,
     /// The bounded signal ingress itself has no free queue slots.
     QueueFull,
-    /// The receiving side has been closed or dropped.
+    /// The receiving side has been closed or dropped, or the requested operation requires a
+    /// runtime-owned lifecycle transaction instead of a one-sided signal.
     Closed,
 }
 
@@ -764,28 +1292,34 @@ pub fn signal_mailbox_with_limits(
     let (sender, receiver) = mpsc::channel(signal_capacity);
     let kill = Arc::new(KillSignal::default());
     let lifecycle = Arc::new(ProcessLifecycle::default());
+    let link_state = Arc::new(LinkState::default());
     // Capacity-one queues retain their legacy ability to carry a message;
     // larger queues reserve one physical slot from data admission.
     let data_capacity = signal_capacity.saturating_sub(1).max(1);
-    (
-        SignalSender {
-            sender,
-            kill: kill.clone(),
-            lifecycle: lifecycle.clone(),
-            data_admission: Arc::new(Semaphore::new(data_capacity)),
-            link_admission: Arc::new(Semaphore::new(signal_capacity)),
-            monitor_admission: Arc::new(Semaphore::new(signal_capacity)),
-            message_mailbox: message_mailbox.clone(),
-            capacity: signal_capacity,
-            max_message_bytes,
-            max_message_resources,
-        },
-        SignalReceiver {
-            receiver: Arc::new(Mutex::new(receiver)),
-            kill,
+    let signal_sender = SignalSender {
+        sender,
+        kill: kill.clone(),
+        lifecycle: lifecycle.clone(),
+        link_state: Arc::downgrade(&link_state),
+        data_admission: Arc::new(Semaphore::new(data_capacity)),
+        link_admission: Arc::new(Semaphore::new(signal_capacity)),
+        monitor_admission: Arc::new(Semaphore::new(signal_capacity)),
+        message_mailbox: message_mailbox.clone(),
+        capacity: signal_capacity,
+        max_message_bytes,
+        max_message_resources,
+    };
+    let signal_receiver = SignalReceiver {
+        receiver: Arc::new(Mutex::new(receiver)),
+        kill,
+        lifecycle: lifecycle.clone(),
+        _lifetime: Arc::new(SignalReceiverLifetime {
             lifecycle,
-        },
-    )
+            lifecycle_sender: signal_sender.clone(),
+            link_state,
+        }),
+    };
+    (signal_sender, signal_receiver)
 }
 
 /// Creates bounded signal and message mailboxes with explicit capacities.
@@ -932,17 +1466,23 @@ pub trait ProcessState: Sized + crate::reloadable_state::ReloadableState {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Barrier},
+        time::Duration,
+    };
 
     use crate::{
+        link_processes,
         mailbox::MessageMailbox,
         message::{DataMessage, Message},
-        DeathReason, NativeProcess, Signal,
+        DeathReason, LinkError, NativeProcess, Process, Signal,
     };
 
     use super::{
-        ensure_registry_insert_capacity_with_limit, signal_mailbox, signal_mailbox_with_limits,
-        SignalSendErrorKind, MAX_REGISTRY_NAME_BYTES,
+        ensure_registry_insert_capacity_with_limit, mailboxes_with_capacity, signal_mailbox,
+        signal_mailbox_with_limits, SignalReceiver, SignalSendError, SignalSendErrorKind,
+        MAX_REGISTRY_NAME_BYTES,
     };
 
     #[test]
@@ -1124,7 +1664,7 @@ mod tests {
         assert_eq!(observer_sender.available_capacity(), 0);
 
         let envelope = target_receiver.recv().await.unwrap();
-        let (signal, _, _, monitor_permit, notification) = envelope.into_process_parts();
+        let (signal, _, monitor_permit, notification) = envelope.into_process_parts();
         assert!(matches!(signal, Signal::Monitor { .. }));
         assert!(monitor_permit.is_some());
         notification
@@ -1421,5 +1961,422 @@ mod tests {
         }
         drop(permit);
         assert_eq!(mailbox.available_capacity(), 1);
+    }
+
+    fn bounded_process(id: u64) -> (NativeProcess, SignalReceiver) {
+        let ((sender, receiver), _mailbox) = mailboxes_with_capacity(1, 1);
+        (
+            NativeProcess {
+                id,
+                signal_mailbox: sender,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn bilateral_link_admission_rolls_back_when_either_side_is_full() {
+        let (process_a, _receiver_a) = bounded_process(100);
+        let (process_b, _receiver_b) = bounded_process(101);
+        let (process_c, _receiver_c) = bounded_process(102);
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+        let handle_c = process_c.lifecycle_handle().unwrap();
+
+        link_processes(&process_b, Some(101), None, &process_c, Some(102), None).unwrap();
+        assert_eq!(handle_b.available_link_capacity(), 0);
+
+        let error = link_processes(
+            &process_a,
+            Some(100),
+            Some(7),
+            &process_b,
+            Some(101),
+            Some(7),
+        )
+        .unwrap_err();
+        assert_eq!(error, LinkError::CapacityExhausted { process_id: 101 });
+        assert_eq!(handle_a.relation_count(), 0);
+        assert_eq!(handle_a.available_link_capacity(), 1);
+        assert_eq!(handle_b.relation_count(), 1);
+
+        assert!(handle_b.unlink_peer(102));
+        assert_eq!(handle_b.available_link_capacity(), 1);
+        assert_eq!(handle_c.available_link_capacity(), 1);
+        link_processes(
+            &process_a,
+            Some(100),
+            Some(8),
+            &process_b,
+            Some(101),
+            Some(8),
+        )
+        .unwrap();
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (1, 1)
+        );
+
+        handle_a.terminate(DeathReason::Normal);
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (0, 0)
+        );
+        assert_eq!(handle_b.available_link_capacity(), 1);
+    }
+
+    #[tokio::test]
+    async fn every_exit_reason_reclaims_links_before_saturated_delivery() {
+        for (offset, reason) in [
+            (0, DeathReason::Normal),
+            (10, DeathReason::Failure),
+            (20, DeathReason::NoProcess),
+        ] {
+            let (process_a, _receiver_a) = bounded_process(200 + offset);
+            let (process_b, receiver_b) = bounded_process(201 + offset);
+            let handle_a = process_a.lifecycle_handle().unwrap();
+            let handle_b = process_b.lifecycle_handle().unwrap();
+
+            link_processes(
+                &process_a,
+                Some(200 + offset),
+                Some(11),
+                &process_b,
+                Some(201 + offset),
+                Some(12),
+            )
+            .unwrap();
+            process_b.send(Signal::DieWhenLinkDies(false)).unwrap();
+            assert_eq!(process_b.signal_mailbox.available_capacity(), 0);
+
+            handle_a.terminate(reason);
+            assert_eq!(
+                (handle_a.relation_count(), handle_b.relation_count()),
+                (0, 0)
+            );
+            assert_eq!(handle_a.available_link_capacity(), 1);
+            assert_eq!(handle_b.available_link_capacity(), 1);
+
+            // Termination is idempotent and cannot release either permit twice.
+            handle_a.terminate(reason);
+            assert_eq!(handle_a.available_link_capacity(), 1);
+            assert_eq!(handle_b.available_link_capacity(), 1);
+
+            let delivered = receiver_b.recv().await.unwrap().into_signal();
+            match reason {
+                DeathReason::Normal => assert!(matches!(delivered, Signal::DieWhenLinkDies(false))),
+                DeathReason::Failure | DeathReason::NoProcess => {
+                    assert!(matches!(delivered, Signal::Kill));
+                }
+            }
+            handle_b.terminate(DeathReason::Normal);
+        }
+    }
+
+    #[tokio::test]
+    async fn unlink_winner_suppresses_stale_exit_delivery() {
+        let (process_a, receiver_a) = bounded_process(600);
+        let (process_b, _receiver_b) = bounded_process(601);
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+        link_processes(&process_a, None, None, &process_b, None, None).unwrap();
+
+        assert!(handle_a.unlink_peer(601));
+        handle_b.terminate(DeathReason::Failure);
+
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (0, 0)
+        );
+        assert_eq!(handle_a.available_link_capacity(), 1);
+        assert_eq!(handle_b.available_link_capacity(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), receiver_a.recv())
+                .await
+                .is_err(),
+            "an unlink that linearizes first must suppress the later link death"
+        );
+        handle_a.terminate(DeathReason::Normal);
+    }
+
+    #[tokio::test]
+    async fn exit_winner_delivers_once_and_makes_unlink_idempotent() {
+        let (process_a, receiver_a) = bounded_process(610);
+        let (process_b, _receiver_b) = bounded_process(611);
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+        link_processes(&process_a, None, None, &process_b, None, Some(44)).unwrap();
+
+        handle_b.terminate(DeathReason::Failure);
+        assert!(!handle_a.unlink_peer(611));
+        let signal = tokio::time::timeout(Duration::from_secs(1), receiver_a.recv())
+            .await
+            .expect("exit winner must deliver a link death")
+            .unwrap()
+            .into_signal();
+        assert!(matches!(
+            signal,
+            Signal::LinkDied(611, Some(44), DeathReason::Failure)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), receiver_a.recv())
+                .await
+                .is_err(),
+            "one exit must produce at most one link-death action"
+        );
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (0, 0)
+        );
+        assert_eq!(handle_a.available_link_capacity(), 1);
+        assert_eq!(handle_b.available_link_capacity(), 1);
+        handle_a.terminate(DeathReason::Normal);
+    }
+
+    #[tokio::test]
+    async fn dropping_unmanaged_receiver_reclaims_links_even_if_a_handle_is_retained() {
+        let (process_a, receiver_a) = bounded_process(620);
+        let (process_b, receiver_b) = bounded_process(621);
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+        link_processes(&process_a, None, None, &process_b, None, Some(45)).unwrap();
+
+        drop(receiver_a);
+
+        assert_eq!(handle_a.relation_count(), 0);
+        assert_eq!(handle_b.relation_count(), 0);
+        assert_eq!(handle_b.available_link_capacity(), 1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver_b.recv())
+                .await
+                .expect("dropped lifecycle state must deliver NoProcess")
+                .unwrap()
+                .into_signal(),
+            Signal::LinkDied(620, None, DeathReason::NoProcess)
+        ));
+
+        let (process_c, _receiver_c) = bounded_process(622);
+        let handle_c = process_c.lifecycle_handle().unwrap();
+        let error = link_processes(&process_a, Some(620), None, &process_c, Some(622), None)
+            .expect_err("a retained handle with no receiver must be terminal");
+        assert_eq!(error, LinkError::Terminated { process_id: 620 });
+        assert_eq!(handle_a.relation_count(), 0);
+        assert_eq!(handle_c.relation_count(), 0);
+        assert_eq!(handle_c.available_link_capacity(), 1);
+        handle_b.terminate(DeathReason::Normal);
+        handle_c.terminate(DeathReason::Normal);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_last_receiver_drops_cleanup_exactly_once() {
+        let (process_a, receiver_a) = bounded_process(630);
+        let receiver_a_clone = receiver_a.clone();
+        let (process_b, receiver_b) = bounded_process(631);
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+        link_processes(&process_a, None, Some(46), &process_b, None, Some(47)).unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            scope.spawn(move || {
+                first_barrier.wait();
+                drop(receiver_a);
+            });
+            let second_barrier = barrier.clone();
+            scope.spawn(move || {
+                second_barrier.wait();
+                drop(receiver_a_clone);
+            });
+            barrier.wait();
+        });
+
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (0, 0)
+        );
+        assert_eq!(handle_a.available_link_capacity(), 1);
+        assert_eq!(handle_b.available_link_capacity(), 1);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), receiver_b.recv())
+                .await
+                .expect("the final receiver drop must deliver NoProcess")
+                .unwrap()
+                .into_signal(),
+            Signal::LinkDied(630, Some(46), DeathReason::NoProcess)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), receiver_b.recv())
+                .await
+                .is_err(),
+            "concurrent receiver drops must perform lifecycle cleanup exactly once"
+        );
+
+        let (process_c, _receiver_c) = bounded_process(632);
+        let handle_c = process_c.lifecycle_handle().unwrap();
+        assert_eq!(
+            link_processes(&process_a, Some(630), None, &process_c, Some(632), None),
+            Err(LinkError::Terminated { process_id: 630 })
+        );
+        link_processes(&process_b, None, None, &process_c, None, None)
+            .expect("reclaimed link capacity must be reusable");
+        handle_c.terminate(DeathReason::Normal);
+        handle_b.terminate(DeathReason::Normal);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_unlink_and_exit_leave_no_one_sided_relation() {
+        for offset in 0..64 {
+            let (process_a, receiver_a) = bounded_process(1_000 + offset * 2);
+            let (process_b, _receiver_b) = bounded_process(1_001 + offset * 2);
+            let handle_a = process_a.lifecycle_handle().unwrap();
+            let handle_b = process_b.lifecycle_handle().unwrap();
+            link_processes(&process_a, None, None, &process_b, None, None).unwrap();
+
+            let barrier = Arc::new(Barrier::new(3));
+            let process_b_id = handle_b.process_id();
+            let unlink_won = std::thread::scope(|scope| {
+                let barrier_a = barrier.clone();
+                let unlink_handle = handle_a.clone();
+                let unlink = scope.spawn(move || {
+                    barrier_a.wait();
+                    unlink_handle.unlink_peer(process_b_id)
+                });
+                let barrier_b = barrier.clone();
+                let exit_handle = handle_b.clone();
+                scope.spawn(move || {
+                    barrier_b.wait();
+                    exit_handle.terminate(DeathReason::Failure);
+                });
+                barrier.wait();
+                unlink.join().unwrap()
+            });
+
+            if unlink_won {
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), receiver_a.recv())
+                        .await
+                        .is_err(),
+                    "an unlink winner must not receive a stale link death"
+                );
+            } else {
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(1), receiver_a.recv())
+                        .await
+                        .expect("exit winner must deliver during the race")
+                        .unwrap()
+                        .into_signal(),
+                    Signal::LinkDied(id, None, DeathReason::Failure) if id == process_b_id
+                ));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(10), receiver_a.recv())
+                        .await
+                        .is_err(),
+                    "an exit winner must deliver exactly one link death"
+                );
+            }
+
+            assert_eq!(
+                (handle_a.relation_count(), handle_b.relation_count()),
+                (0, 0)
+            );
+            assert_eq!(handle_a.available_link_capacity(), 1);
+            assert_eq!(handle_b.available_link_capacity(), 1);
+            handle_a.terminate(DeathReason::Normal);
+        }
+    }
+
+    struct PanickingCustomProcess;
+
+    impl Process for PanickingCustomProcess {
+        fn id(&self) -> u64 {
+            panic!("custom id must not be called during lifecycle preflight")
+        }
+
+        fn send(&self, _signal: Signal) -> Result<(), SignalSendError> {
+            panic!("custom send must not be retained or called by link lifecycle")
+        }
+
+        fn lifecycle_handle(&self) -> Option<super::ProcessLifecycleHandle> {
+            panic!("malformed custom lifecycle accessor")
+        }
+    }
+
+    struct ForgedLifecycleProcess {
+        claimed_id: u64,
+        stolen_handle: super::ProcessLifecycleHandle,
+    }
+
+    struct PanickingIdentityProcess {
+        stolen_handle: super::ProcessLifecycleHandle,
+    }
+
+    impl Process for PanickingIdentityProcess {
+        fn id(&self) -> u64 {
+            panic!("custom lifecycle identity accessor")
+        }
+
+        fn send(&self, _signal: Signal) -> Result<(), SignalSendError> {
+            panic!("custom send must not run after identity preflight fails")
+        }
+
+        fn lifecycle_handle(&self) -> Option<super::ProcessLifecycleHandle> {
+            Some(self.stolen_handle.clone())
+        }
+    }
+
+    impl Process for ForgedLifecycleProcess {
+        fn id(&self) -> u64 {
+            self.claimed_id
+        }
+
+        fn send(&self, _signal: Signal) -> Result<(), SignalSendError> {
+            panic!("forged custom process must never receive lifecycle callbacks")
+        }
+
+        fn lifecycle_handle(&self) -> Option<super::ProcessLifecycleHandle> {
+            Some(self.stolen_handle.clone())
+        }
+    }
+
+    #[test]
+    fn malformed_custom_process_cannot_panic_or_retain_link_state() {
+        let custom = Arc::new(PanickingCustomProcess);
+        let (process, _receiver) = bounded_process(500);
+        let handle = process.lifecycle_handle().unwrap();
+
+        let error = link_processes(custom.as_ref(), None, None, &process, Some(500), None)
+            .expect_err("custom lifecycle state must be rejected");
+        assert_eq!(error, LinkError::UnsupportedProcess);
+        assert_eq!(handle.relation_count(), 0);
+        assert_eq!(handle.available_link_capacity(), 1);
+
+        let forged = ForgedLifecycleProcess {
+            claimed_id: 501,
+            stolen_handle: handle.clone(),
+        };
+        let error = link_processes(&forged, None, None, &process, Some(500), None)
+            .expect_err("a stolen lifecycle handle must not impersonate another process");
+        assert_eq!(error, LinkError::IdentityMismatch { process_id: 501 });
+        assert_eq!(handle.relation_count(), 0);
+        assert_eq!(handle.available_link_capacity(), 1);
+
+        let panicking_identity = PanickingIdentityProcess {
+            stolen_handle: handle.clone(),
+        };
+        let error = link_processes(&panicking_identity, None, None, &process, Some(500), None)
+            .expect_err("a panicking delegated identity must fail closed");
+        assert_eq!(error, LinkError::UnsupportedProcess);
+        assert_eq!(handle.relation_count(), 0);
+        assert_eq!(handle.available_link_capacity(), 1);
+
+        let error = process
+            .signal_mailbox
+            .send(Signal::Link(None, custom))
+            .expect_err("legacy one-sided link admission must fail closed");
+        assert_eq!(error.kind(), SignalSendErrorKind::Closed);
+        assert!(matches!(error.into_signal(), Signal::Link(None, _)));
+        assert_eq!(handle.relation_count(), 0);
+        assert_eq!(handle.available_link_capacity(), 1);
     }
 }

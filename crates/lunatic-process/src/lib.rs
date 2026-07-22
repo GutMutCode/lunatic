@@ -22,6 +22,7 @@ use futures_util::FutureExt;
 use log::{debug, log_enabled, trace, warn, Level};
 
 use smallvec::SmallVec;
+pub use state::ProcessLifecycleHandle;
 use state::{
     default_mailboxes, MonitorNotification, MonitorNotificationError, ProcessState, SignalReceiver,
     SignalReceiverGuard, SignalSendError, SignalSender,
@@ -472,9 +473,14 @@ pub enum Signal {
     Message(Message),
     /// Change the `die_when_link_dies` flag
     DieWhenLinkDies(bool),
-    /// Link this process to another
+    /// Legacy one-sided link command.
+    ///
+    /// Built-in process senders reject this form; use [`link_processes`] so both sides are
+    /// admitted atomically.
     Link(Option<i64>, Arc<dyn Process>),
-    /// Unlink this process from another
+    /// Legacy one-sided unlink command.
+    ///
+    /// Built-in process senders reject this form; use [`unlink_process`] instead.
     UnLink { process_id: u64 },
     /// A linked process died
     LinkDied(u64, Option<i64>, DeathReason),
@@ -522,9 +528,59 @@ pub enum DeathReason {
     NoProcess,
 }
 
+/// A bilateral link operation could not be completed without violating the bounded lifecycle
+/// contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkError {
+    /// The process does not expose runtime-owned bounded lifecycle state.
+    UnsupportedProcess,
+    /// The supplied process identity does not match its runtime-owned state.
+    IdentityMismatch { process_id: u64 },
+    /// The process has already entered its terminal state.
+    Terminated { process_id: u64 },
+    /// The process has reached its configured maximum number of live links.
+    CapacityExhausted { process_id: u64 },
+    /// A pre-existing one-sided relation was detected and was not overwritten.
+    InconsistentState {
+        left_process_id: u64,
+        right_process_id: u64,
+    },
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedProcess => formatter
+                .write_str("process does not provide runtime-owned bounded lifecycle state"),
+            Self::IdentityMismatch { process_id } => write!(
+                formatter,
+                "process identity {process_id} does not match its lifecycle state"
+            ),
+            Self::Terminated { process_id } => {
+                write!(formatter, "process {process_id} has already terminated")
+            }
+            Self::CapacityExhausted { process_id } => {
+                write!(formatter, "process {process_id} link capacity is exhausted")
+            }
+            Self::InconsistentState {
+                left_process_id,
+                right_process_id,
+            } => write!(
+                formatter,
+                "processes {left_process_id} and {right_process_id} have inconsistent link state"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
 /// Process trait for sending signals
 pub trait Process: Send + Sync {
-    /// Get the process ID
+    /// Get the stable process ID.
+    ///
+    /// Implementations must return promptly and must return the identity represented by any
+    /// delegated [`ProcessLifecycleHandle`].
     fn id(&self) -> u64;
     /// Send a signal to the process
     fn send(&self, signal: Signal) -> std::result::Result<(), SignalSendError>;
@@ -549,6 +605,67 @@ pub trait Process: Send + Sync {
     fn terminal_reason(&self) -> Option<DeathReason> {
         None
     }
+
+    /// Returns the opaque bounded lifecycle state used for atomic link operations.
+    ///
+    /// The default deliberately opts custom process implementations out. A custom process may
+    /// continue to receive ordinary signals, but it cannot participate in links unless it safely
+    /// delegates to a runtime-owned process handle for the same identity. Overrides must return
+    /// promptly, must not allocate unbounded state, and may only clone a handle originally issued
+    /// by a built-in process. Panics are contained and treated as an unsupported process.
+    #[doc(hidden)]
+    fn lifecycle_handle(&self) -> Option<ProcessLifecycleHandle> {
+        None
+    }
+}
+
+fn checked_lifecycle_handle(
+    process: &dyn Process,
+    expected_process_id: Option<u64>,
+) -> std::result::Result<ProcessLifecycleHandle, LinkError> {
+    let handle = std::panic::catch_unwind(AssertUnwindSafe(|| process.lifecycle_handle()))
+        .map_err(|_| LinkError::UnsupportedProcess)?
+        .ok_or(LinkError::UnsupportedProcess)?;
+    let claimed_process_id = match expected_process_id {
+        Some(process_id) => process_id,
+        None => std::panic::catch_unwind(AssertUnwindSafe(|| process.id()))
+            .map_err(|_| LinkError::UnsupportedProcess)?,
+    };
+    if claimed_process_id != handle.process_id() {
+        return Err(LinkError::IdentityMismatch {
+            process_id: claimed_process_id,
+        });
+    }
+    Ok(handle)
+}
+
+/// Atomically installs the reciprocal sides of one link.
+///
+/// `left_exit_tag` is delivered to `right` when `left` exits, and vice versa. No state is retained
+/// when either process is unsupported, terminal, or out of link capacity.
+#[doc(hidden)]
+pub fn link_processes(
+    left: &dyn Process,
+    expected_left_id: Option<u64>,
+    left_exit_tag: Option<i64>,
+    right: &dyn Process,
+    expected_right_id: Option<u64>,
+    right_exit_tag: Option<i64>,
+) -> std::result::Result<(), LinkError> {
+    let left = checked_lifecycle_handle(left, expected_left_id)?;
+    let right = checked_lifecycle_handle(right, expected_right_id)?;
+    ProcessLifecycleHandle::link_pair(&left, left_exit_tag, &right, right_exit_tag)
+}
+
+/// Atomically removes the caller's relation and its reciprocal peer relation when still live.
+#[doc(hidden)]
+pub fn unlink_process(
+    process: &dyn Process,
+    expected_process_id: Option<u64>,
+    peer_id: u64,
+) -> std::result::Result<bool, LinkError> {
+    let process = checked_lifecycle_handle(process, expected_process_id)?;
+    Ok(process.unlink_peer(peer_id))
 }
 
 type MonitorRelations = HashMap<
@@ -590,7 +707,7 @@ fn close_signal_ingress(
 ) {
     signal_mailbox.close_with_reason(death_reason);
     while let Some(envelope) = signal_mailbox.try_recv() {
-        let (signal, _, _, monitor_permit, monitor_notification) = envelope.into_process_parts();
+        let (signal, _, monitor_permit, monitor_notification) = envelope.into_process_parts();
         match signal {
             Signal::Monitor {
                 process,
@@ -610,27 +727,55 @@ fn close_signal_ingress(
     }
 }
 
-fn notify_linked_process(
-    linked_process: &Arc<dyn Process>,
-    process_id: u64,
-    tag: Option<i64>,
-    death_reason: DeathReason,
-) {
-    if let Err(error) = linked_process.send(Signal::LinkDied(process_id, tag, death_reason)) {
-        warn!("Failed to notify linked process that process {process_id} died: {error}");
-        // Failure/NoProcess links are fatal by default. If mailbox or signal
-        // admission prevents delivery, fail closed through the out-of-band
-        // idempotent Kill latch instead of silently losing the lifecycle
-        // event. Processes opting to trap exits still receive LinkDied under
-        // normal capacity; overload deliberately favors termination safety.
-        if matches!(death_reason, DeathReason::Failure | DeathReason::NoProcess) {
-            if let Err(kill_error) = linked_process.send(Signal::Kill) {
-                warn!(
-                    "Failed to apply fallback kill after link-death backpressure for process \
-                     {process_id}: {kill_error}"
-                );
-            }
+pub(crate) struct ProcessTaskGuard {
+    registration: Option<ProcessRegistration>,
+    lifecycle: ProcessLifecycleHandle,
+    finished: bool,
+}
+
+impl ProcessTaskGuard {
+    pub(crate) fn new(
+        registration: ProcessRegistration,
+        lifecycle: ProcessLifecycleHandle,
+    ) -> Self {
+        Self {
+            registration: Some(registration),
+            lifecycle,
+            finished: false,
         }
+    }
+
+    fn unregister(&mut self) {
+        if let Some(registration) = self.registration.take() {
+            registration.unregister();
+        }
+    }
+
+    fn relation_count(&self) -> usize {
+        self.lifecycle.relation_count()
+    }
+
+    fn unlink_peer(&self, peer_id: u64) -> bool {
+        self.lifecycle.unlink_peer(peer_id)
+    }
+
+    fn finish(mut self, reason: DeathReason) {
+        self.unregister();
+        self.lifecycle.terminate(reason);
+        self.finished = true;
+    }
+}
+
+impl Drop for ProcessTaskGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.unregister();
+        // A dropped execution future has no classified guest result. NoProcess preserves the
+        // fail-closed link semantics while distinguishing cancellation from a reported failure.
+        self.lifecycle.terminate(DeathReason::NoProcess);
+        self.finished = true;
     }
 }
 
@@ -664,6 +809,10 @@ impl Process for WasmProcess {
 
     fn terminal_reason(&self) -> Option<DeathReason> {
         self.signal_sender.terminal_reason()
+    }
+
+    fn lifecycle_handle(&self) -> Option<ProcessLifecycleHandle> {
+        self.signal_sender.lifecycle_handle(self.id)
     }
 }
 
@@ -773,6 +922,10 @@ where
         signal_mailbox: signal_sender,
     };
     let registration = register_process(env.clone(), id, Arc::new(process.clone()))?;
+    let lifecycle = process
+        .lifecycle_handle()
+        .ok_or_else(|| anyhow!("native process {id} has no lifecycle state"))?;
+    let lifecycle_guard = ProcessTaskGuard::new(registration, lifecycle);
     let fut = func(process.clone(), message_mailbox.clone());
     let join = tokio::task::spawn(new(
         fut,
@@ -780,7 +933,7 @@ where
         signal_mailbox,
         message_mailbox,
         None,
-        registration,
+        lifecycle_guard,
     ));
     Ok((join, process))
 }
@@ -806,6 +959,10 @@ where
         signal_mailbox: signal_sender,
     };
     let registration = register_process(env.clone(), id, Arc::new(process.clone()))?;
+    let lifecycle = process
+        .lifecycle_handle()
+        .ok_or_else(|| anyhow!("native process {id} has no lifecycle state"))?;
+    let lifecycle_guard = ProcessTaskGuard::new(registration, lifecycle);
     let fut = func(process.clone(), message_mailbox.clone());
 
     let join = tokio::task::spawn(run_native_process(
@@ -813,7 +970,7 @@ where
         id,
         signal_mailbox,
         message_mailbox,
-        registration,
+        lifecycle_guard,
     ));
     Ok((join, process))
 }
@@ -845,6 +1002,10 @@ impl Process for NativeProcess {
 
     fn terminal_reason(&self) -> Option<DeathReason> {
         self.signal_mailbox.terminal_reason()
+    }
+
+    fn lifecycle_handle(&self) -> Option<ProcessLifecycleHandle> {
+        self.signal_mailbox.lifecycle_handle(self.id)
     }
 }
 
@@ -913,14 +1074,13 @@ async fn run_native_process<F>(
     id: u64,
     signal_mailbox: SignalReceiver,
     message_mailbox: MessageMailbox,
-    registration: ProcessRegistration,
+    mut lifecycle_guard: ProcessTaskGuard,
 ) -> Result<()>
 where
     F: Future<Output = Result<()>> + Send + 'static,
 {
     trace!("Native process {} spawned", id);
     let mut die_when_link_dies = true;
-    let mut links = HashMap::new();
     let mut monitors = HashMap::new();
     let mut signal_mailbox = signal_mailbox.lock().await;
     let mut has_sender = true;
@@ -937,13 +1097,7 @@ where
                         has_sender = false;
                         continue;
                     };
-                    let (
-                        signal,
-                        mailbox_permit,
-                        link_permit,
-                        monitor_permit,
-                        monitor_notification,
-                    ) =
+                    let (signal, mailbox_permit, monitor_permit, monitor_notification) =
                         envelope.into_process_parts();
                     match signal {
                         Signal::Message(message) => message_mailbox
@@ -953,21 +1107,11 @@ where
                             )
                             .expect("signal sender must reserve from the destination mailbox"),
                         Signal::DieWhenLinkDies(value) => die_when_link_dies = value,
-                        Signal::Link(tag, process) => {
-                            links.insert(
-                                process.id(),
-                                (
-                                    process,
-                                    tag,
-                                    link_permit.expect("link signal must reserve link capacity"),
-                                ),
-                            );
-                        }
-                        Signal::UnLink { process_id } => {
-                            links.remove(&process_id);
+                        Signal::Link(_, _) | Signal::UnLink { .. } => {
+                            warn!("Ignored a legacy one-sided link signal for process {id}");
                         }
                         Signal::LinkDied(process_id, tag, reason) => {
-                            links.remove(&process_id);
+                            lifecycle_guard.unlink_peer(process_id);
                             match reason {
                                 DeathReason::Failure | DeathReason::NoProcess if die_when_link_dies => {
                                     break Finished::KillSignal;
@@ -1069,8 +1213,9 @@ where
         ),
     };
 
-    registration.unregister();
+    lifecycle_guard.unregister();
     close_signal_ingress(&mut signal_mailbox, &mut monitors, death_reason);
+    lifecycle_guard.finish(death_reason);
 
     for (_, (monitor, _, notification)) in monitors {
         if let Some(notification) = notification {
@@ -1084,10 +1229,6 @@ where
             warn!("Failed to notify custom monitor that process {id} died: {error}");
         }
     }
-    for (linked_process, tag, _) in links.values() {
-        notify_linked_process(linked_process, id, *tag, death_reason);
-    }
-
     result
 }
 
@@ -1153,7 +1294,7 @@ pub(crate) async fn new<F, S, R>(
     signal_mailbox: SignalReceiver,
     message_mailbox: MessageMailbox,
     context: Option<ProcessContext<S>>,
-    registration: ProcessRegistration,
+    mut lifecycle_guard: ProcessTaskGuard,
 ) -> Result<S>
 where
     S: ProcessState
@@ -1169,8 +1310,6 @@ where
     // If the value is set to false, instead of dying too the process will receive a message about
     // the linked process' death.
     let mut die_when_link_dies = true;
-    // Process linked to this one
-    let mut links = HashMap::new();
     // Processes monitoring this one
     let mut monitors = HashMap::new();
     // Panics inside host calls are captured by the `AssertUnwindSafe(...).catch_unwind()` wrapper
@@ -1198,13 +1337,7 @@ where
                     has_sender = false;
                     continue;
                 };
-                let (
-                    signal,
-                    mailbox_permit,
-                    link_permit,
-                    monitor_permit,
-                    monitor_notification,
-                ) =
+                let (signal, mailbox_permit, monitor_permit, monitor_notification) =
                     envelope.into_process_parts();
                 match signal {
                     Signal::Message(message) => {
@@ -1229,34 +1362,13 @@ where
                         metrics::gauge!("lunatic.process.messages.outstanding", message_mailbox.len() as f64, &labels);
                     },
                     Signal::DieWhenLinkDies(value) => die_when_link_dies = value,
-                    // Put process into list of linked processes
-                    Signal::Link(tag, proc) => {
-                        links.insert(
-                            proc.id(),
-                            (
-                                proc,
-                                tag,
-                                link_permit.expect("link signal must reserve link capacity"),
-                            ),
-                        );
-
-                        #[cfg(feature = "metrics")]
-                        metrics::gauge!("lunatic.process.links.alive", links.len() as f64, &labels);
+                    Signal::Link(_, _) | Signal::UnLink { .. } => {
+                        warn!("Ignored a legacy one-sided link signal for process {id}");
                     },
-                    // Remove process from list
-                    Signal::UnLink { process_id } => {
-                        links.remove(&process_id);
-
-                        #[cfg(feature = "metrics")]
-                        metrics::gauge!("lunatic.process.links.alive", links.len() as f64, &labels);
-                    }
                     // Depending if `die_when_link_dies` is set, process will die or turn the
                     // signal into a message
-                    Signal::LinkDied(id, tag, reason) => {
-                        links.remove(&id);
-
-                        #[cfg(feature = "metrics")]
-                        metrics::gauge!("lunatic.process.links.alive", links.len() as f64, &labels);
+                    Signal::LinkDied(process_id, tag, reason) => {
+                        lifecycle_guard.unlink_peer(process_id);
                         match reason {
                             DeathReason::Failure | DeathReason::NoProcess => {
                                 if die_when_link_dies {
@@ -1485,7 +1597,7 @@ where
                 warn!(
                     "Process {} failed, notifying: {} links {}",
                     name,
-                    links.len(),
+                    lifecycle_guard.relation_count(),
                     // If the log level is WARN instruct user how to display the stacktrace
                     if !log_enabled!(Level::Debug) {
                         "\n\t\t\t    (Set ENV variable `RUST_LOG=lunatic=debug` to show stacktrace)"
@@ -1501,7 +1613,11 @@ where
             }
         }
         Finished::Panicked(message) => {
-            warn!("Process {} panicked, notifying: {} links", id, links.len());
+            warn!(
+                "Process {} panicked, notifying: {} links",
+                id,
+                lifecycle_guard.relation_count()
+            );
 
             (
                 Err(anyhow!(format!("Process panicked: {message}"))),
@@ -1515,8 +1631,9 @@ where
         }
     };
 
-    registration.unregister();
+    lifecycle_guard.unregister();
     close_signal_ingress(&mut signal_mailbox, &mut monitors, death_reason);
+    lifecycle_guard.finish(death_reason);
 
     // Notify all monitors that this process died
     for (_, (monitor, _, notification)) in monitors {
@@ -1530,11 +1647,6 @@ where
         }) {
             warn!("Failed to notify custom monitor that process {id} died: {error}");
         }
-    }
-
-    // Notify all links that this process died
-    for (linked_process, tag, _) in links.values() {
-        notify_linked_process(linked_process, id, *tag, death_reason);
     }
 
     final_result
@@ -1557,11 +1669,12 @@ mod process_backpressure_tests {
     use crate::{
         close_signal_ingress,
         env::{register_process, Environment, LunaticEnvironment},
+        link_processes,
         mailbox::DEFAULT_MESSAGE_MAILBOX_CAPACITY,
         message::Message,
         run_native_process, spawn_native,
-        state::{mailboxes_with_capacity, SignalSendErrorKind},
-        DeathReason, NativeProcess, Process, Signal, WasmProcess,
+        state::{mailboxes_with_capacity, SignalSendErrorKind, DEFAULT_SIGNAL_QUEUE_CAPACITY},
+        DeathReason, NativeProcess, Process, ProcessTaskGuard, Signal, WasmProcess,
     };
 
     struct OrderingObserver {
@@ -1615,6 +1728,115 @@ mod process_backpressure_tests {
         reused_process.send(Signal::Kill).unwrap();
         assert!(reused_join.await.unwrap().is_err());
         assert_eq!(environment.process_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_a_linked_task_reclaims_both_relations_and_permits() {
+        let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(910));
+        let (join_a, process_a) = spawn_native(environment.clone(), |_, _| async move {
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        let (join_b, process_b) = spawn_native(environment, |_, _| async move {
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+
+        link_processes(
+            &process_a,
+            Some(process_a.id()),
+            None,
+            &process_b,
+            Some(process_b.id()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (1, 1)
+        );
+
+        join_a.abort();
+        assert!(join_a.await.unwrap_err().is_cancelled());
+        let peer_result = tokio::time::timeout(Duration::from_secs(1), join_b)
+            .await
+            .expect("linked peer must receive the cancellation death")
+            .unwrap();
+        assert!(peer_result.is_err());
+
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (0, 0)
+        );
+        assert_eq!(
+            handle_a.available_link_capacity(),
+            DEFAULT_SIGNAL_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            handle_b.available_link_capacity(),
+            DEFAULT_SIGNAL_QUEUE_CAPACITY
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_link_died_signal_removes_the_bilateral_relation() {
+        let environment: Arc<dyn Environment> = Arc::new(LunaticEnvironment::new(911));
+        let (join_a, process_a) = spawn_native(environment.clone(), |_, _| async move {
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        let (join_b, process_b) = spawn_native(environment, |_, _| async move {
+            pending::<anyhow::Result<()>>().await
+        })
+        .unwrap();
+        let handle_a = process_a.lifecycle_handle().unwrap();
+        let handle_b = process_b.lifecycle_handle().unwrap();
+        link_processes(
+            &process_a,
+            Some(process_a.id()),
+            None,
+            &process_b,
+            Some(process_b.id()),
+            None,
+        )
+        .unwrap();
+
+        process_a
+            .send(Signal::LinkDied(process_b.id(), None, DeathReason::Normal))
+            .unwrap();
+        let (acknowledgement, acknowledged) = tokio::sync::oneshot::channel();
+        process_a
+            .send(Signal::HotReload {
+                module_id: 0,
+                expected_version: None,
+                new_version: 1,
+                acknowledgement: Some(acknowledgement),
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), acknowledged)
+            .await
+            .expect("native signal barrier timed out")
+            .expect("native signal barrier sender dropped");
+
+        assert_eq!(
+            (handle_a.relation_count(), handle_b.relation_count()),
+            (0, 0)
+        );
+        assert_eq!(
+            handle_a.available_link_capacity(),
+            DEFAULT_SIGNAL_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            handle_b.available_link_capacity(),
+            DEFAULT_SIGNAL_QUEUE_CAPACITY
+        );
+
+        process_a.send(Signal::Kill).unwrap();
+        process_b.send(Signal::Kill).unwrap();
+        assert!(join_a.await.unwrap().is_err());
+        assert!(join_b.await.unwrap().is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1680,6 +1902,10 @@ mod process_backpressure_tests {
         });
         let registration =
             register_process(environment, target_id, target.clone()).expect("target admission");
+        let lifecycle_guard = ProcessTaskGuard::new(
+            registration,
+            target.lifecycle_handle().expect("target lifecycle"),
+        );
         let (release_sender, release_receiver) = tokio::sync::oneshot::channel::<()>();
         let join = tokio::spawn(run_native_process(
             async move {
@@ -1691,7 +1917,7 @@ mod process_backpressure_tests {
             target_id,
             target_receiver,
             target_mailbox,
-            registration,
+            lifecycle_guard,
         ));
 
         let (monitor_acknowledgement, monitor_registered) = std::sync::mpsc::sync_channel(1);

@@ -11,8 +11,8 @@ use crate::module_registry::{ModuleRegistry, ProcessKey};
 use crate::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
 use crate::state::ProcessState;
 use crate::{
-    ExecutionResult, Process, ProcessContext, ProcessReloadStatus, ReloadCommand, Signal,
-    WasmProcess,
+    link_processes, ExecutionResult, Process, ProcessContext, ProcessReloadStatus,
+    ProcessTaskGuard, ReloadCommand, WasmProcess,
 };
 
 enum WasmExecutionEvent {
@@ -323,6 +323,10 @@ where
         child_process_handle.clone(),
         exit_hook,
     )?;
+    let lifecycle = child_process_handle
+        .lifecycle_handle()
+        .ok_or_else(|| anyhow!("Wasm process {id} has no lifecycle state"))?;
+    let lifecycle_guard = ProcessTaskGuard::new(registration, lifecycle);
 
     let instance = runtime.instantiate(module, state).await?;
     let function = function.to_string();
@@ -355,41 +359,18 @@ where
         function,
         params,
     );
-    // **Child link guarantees**:
-    // The link signal is going to be put inside of the child's mailbox and is going to be
-    // processed before any child code can run. This means that any failure inside the child
-    // Wasm code will be correctly reported to the parent.
-    //
-    // We assume here that the code inside of `process::new()` will not fail during signal
-    // handling.
-    //
-    // **Parent link guarantees**:
-    // A `tokio::task::yield_now()` call is executed to allow the parent to link the child
-    // before continuing any further execution. This should force the parent to process all
-    // signals right away.
-    //
-    // The parent could have received a `kill` signal in its mailbox before this function was
-    // called and this signal is going to be processed before the link is established (FIFO).
-    // Only after the yield function we can guarantee that the child is going to be notified
-    // if the parent fails. This is ok, as the actual spawning of the child happens after the
-    // call, so the child wouldn't even exist if the parent failed before.
-    //
-    // TODO: The guarantees provided here don't hold anymore in a distributed environment and
-    //       will require some rethinking. This function will be executed on a completely
-    //       different computer and needs to be synced in a more robust way with the parent
-    //       running somewhere else.
+    // Commit both sides in one non-awaiting transaction before guest code can run. If admission
+    // fails, `lifecycle_guard` removes any already-established links during stack unwinding.
     if let Some((tag, process)) = link {
-        // Send signal to itself to perform the linking
-        process
-            .send(Signal::Link(None, child_process_handle.clone()))
-            .map_err(|error| anyhow!("failed to link spawning process to child {id}: {error}"))?;
-        // Suspend itself to process all new signals
-        tokio::task::yield_now().await;
-        // Send signal to child to link it
-        signal_mailbox
-            .0
-            .send(Signal::Link(tag, process))
-            .map_err(|error| anyhow!("failed to link child {id} to spawning process: {error}"))?;
+        link_processes(
+            process.as_ref(),
+            None,
+            None,
+            child_process_handle.as_ref(),
+            Some(id),
+            tag,
+        )
+        .map_err(|error| anyhow!("failed to atomically link child {id}: {error}"))?;
     }
 
     let child_process = crate::new(
@@ -398,7 +379,7 @@ where
         signal_mailbox.1,
         message_mailbox,
         Some(context),
-        registration,
+        lifecycle_guard,
     );
 
     // Spawn a background process

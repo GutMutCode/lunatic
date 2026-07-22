@@ -22,11 +22,12 @@ use lunatic_error_api::ErrorCtx;
 use lunatic_process::{
     config::ProcessConfig,
     env::{Environment, ProcessLimitReached},
+    link_processes,
     mailbox::MessageMailbox,
     message::Message,
     runtimes::{wasmtime::WasmtimeCompiledModule, RawWasm},
     state::{ensure_registry_insert_capacity, ProcessState, MAX_REGISTRY_NAME_BYTES},
-    DeathReason, Process, Signal, WasmProcess,
+    unlink_process, DeathReason, Process, Signal, WasmProcess,
 };
 use lunatic_wasi_api::LunaticWasiCtx;
 use wasmtime::{Caller, Linker, ResourceLimiter, ToWasmtimeResult as _, Val};
@@ -2475,9 +2476,9 @@ fn environment_id<T: ProcessState + ProcessCtx<T>>(caller: Caller<T>) -> u64 {
     caller.data().environment().id()
 }
 
-// Link current process to **process_id**. This is not an atomic operation, any of the 2 processes
-// could fail before processing the `Link` signal and may not notify the other. If the target no
-// longer exists, a `LinkDied` signal with `DeathReason::NoProcess` is sent to the caller.
+// Link current process to **process_id**. Both reciprocal relations are admitted atomically. If
+// the target no longer exists, a `LinkDied` signal with `DeathReason::NoProcess` is sent to the
+// caller.
 fn link<T: ProcessState + ProcessCtx<T>>(
     mut caller: Caller<T>,
     tag: i64,
@@ -2496,14 +2497,14 @@ fn link<T: ProcessState + ProcessCtx<T>>(
     let process = caller.data().environment().get_process(process_id);
 
     if let Some(process) = process {
-        process.send(Signal::Link(tag, Arc::new(this_process)))?;
-
-        // Send link signal to itself
-        caller
-            .data_mut()
-            .signal_mailbox()
-            .0
-            .send(Signal::Link(tag, process))?;
+        link_processes(
+            &this_process,
+            Some(id),
+            tag,
+            process.as_ref(),
+            Some(process_id),
+            tag,
+        )?;
     } else {
         caller.data_mut().signal_mailbox().0.send(Signal::LinkDied(
             process_id,
@@ -2514,27 +2515,13 @@ fn link<T: ProcessState + ProcessCtx<T>>(
     Ok(())
 }
 
-// Unlink current process from **process_id**. This is not an atomic operation. Missing targets are
-// ignored because there is no remaining link to remove.
+// Unlink current process from **process_id**. Both reciprocal relations are removed under the same
+// lifecycle transaction. Missing or already-terminated peers are idempotent.
 fn unlink<T: ProcessState + ProcessCtx<T>>(mut caller: Caller<T>, process_id: u64) -> Result<()> {
-    // Create handle to itself
     let this_process_id = caller.data().id();
-
-    // Send unlink signal to other process
-    let process = caller.data().environment().get_process(process_id);
-
-    if let Some(process) = process {
-        process.send(Signal::UnLink {
-            process_id: this_process_id,
-        })?;
-    }
-
-    // Send unlink signal to itself
-    caller
-        .data_mut()
-        .signal_mailbox()
-        .0
-        .send(Signal::UnLink { process_id })?;
+    let signal_mailbox = caller.data_mut().signal_mailbox().0.clone();
+    let this_process = WasmProcess::new(this_process_id, signal_mailbox);
+    unlink_process(&this_process, Some(this_process_id), process_id)?;
 
     Ok(())
 }

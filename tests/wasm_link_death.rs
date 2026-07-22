@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     future::pending,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -15,18 +15,21 @@ use lunatic_otp_patterns::{
 };
 use lunatic_process::{
     env::{Environment, LunaticEnvironment},
+    link_processes,
     message::{DataMessage, Message},
     runtimes::{
         wasmtime::{default_config, WasmtimeCompiledModule, WasmtimeRuntime},
         RawWasm,
     },
-    state::ProcessState,
+    spawn_native,
+    state::{mailboxes_with_capacity, ProcessState},
+    unlink_process,
     wasm::spawn_wasm,
-    DeathReason, Process, Signal,
+    DeathReason, Process, Signal, WasmProcess,
 };
 use lunatic_runtime::{state::DefaultProcessState, DefaultProcessConfig};
 use tokio::{
-    sync::{oneshot, Notify, RwLock},
+    sync::{mpsc, oneshot, Notify, RwLock},
     task::JoinHandle,
     time::timeout,
 };
@@ -125,11 +128,9 @@ const LIFECYCLE_GUEST: &str = r#"
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Observed {
-    Ready,
     LinkDied {
         process_id: u64,
         tag: Option<i64>,
-        reason: DeathReason,
         removed_before_notification: bool,
     },
     ProcessDied {
@@ -141,17 +142,15 @@ enum Observed {
 
 struct RecordingProcess {
     id: u64,
-    environment: Weak<LunaticEnvironment>,
-    events: Mutex<Vec<Observed>>,
+    ready: AtomicBool,
     notify: Notify,
 }
 
 impl RecordingProcess {
-    fn new(id: u64, environment: &Arc<LunaticEnvironment>) -> Self {
+    fn new(id: u64) -> Self {
         Self {
             id,
-            environment: Arc::downgrade(environment),
-            events: Mutex::new(Vec::new()),
+            ready: AtomicBool::new(false),
             notify: Notify::new(),
         }
     }
@@ -160,13 +159,7 @@ impl RecordingProcess {
         timeout(TEST_TIMEOUT, async {
             loop {
                 let notified = self.notify.notified();
-                if self
-                    .events
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|event| matches!(event, Observed::Ready))
-                {
+                if self.ready.load(Ordering::Acquire) {
                     return;
                 }
                 notified.await;
@@ -176,32 +169,147 @@ impl RecordingProcess {
         .context("Wasm guest did not reach the ready barrier")?;
         Ok(())
     }
+}
 
-    fn assert_lifecycle(
+impl Process for RecordingProcess {
+    fn id(&self) -> u64 {
+        self.id
+    }
+
+    fn send(
         &self,
+        signal: Signal,
+    ) -> std::result::Result<(), lunatic_process::state::SignalSendError> {
+        if matches!(signal, Signal::Message(Message::Data(_))) {
+            self.ready.store(true, Ordering::Release);
+            self.notify.notify_one();
+        }
+        Ok(())
+    }
+}
+
+struct BoundedLifecycleObserver {
+    process: Arc<dyn Process>,
+    join: JoinHandle<Result<()>>,
+    target_id: Arc<AtomicU64>,
+    events: mpsc::Receiver<Observed>,
+}
+
+impl BoundedLifecycleObserver {
+    async fn spawn(environment: Arc<LunaticEnvironment>) -> Result<Self> {
+        let target_id = Arc::new(AtomicU64::new(0));
+        let task_target_id = target_id.clone();
+        let task_environment = environment.clone();
+        let (events_sender, events) = mpsc::channel(4);
+        let (initialized_sender, initialized) = oneshot::channel();
+        let (join, process) = spawn_native(environment, move |_, mailbox| async move {
+            let initial = mailbox.pop(None).await;
+            if !matches!(initial, Message::Data(_)) {
+                bail!("lifecycle observer received an unexpected initialization message");
+            }
+            initialized_sender
+                .send(())
+                .map_err(|_| anyhow!("lifecycle observer initialization receiver disappeared"))?;
+
+            loop {
+                let event = match mailbox.pop(None).await {
+                    Message::LinkDied(tag) => {
+                        let process_id = task_target_id.load(Ordering::Acquire);
+                        if process_id == 0 {
+                            bail!("link notification arrived before target identity was installed");
+                        }
+                        Observed::LinkDied {
+                            process_id,
+                            tag,
+                            removed_before_notification: task_environment
+                                .get_process(process_id)
+                                .is_none(),
+                        }
+                    }
+                    Message::ProcessDied { process_id, reason } => Observed::ProcessDied {
+                        process_id,
+                        reason,
+                        removed_before_notification: task_environment
+                            .get_process(process_id)
+                            .is_none(),
+                    },
+                    _ => continue,
+                };
+                events_sender
+                    .send(event)
+                    .await
+                    .map_err(|_| anyhow!("lifecycle event receiver disappeared"))?;
+            }
+        })?;
+        let process: Arc<dyn Process> = Arc::new(process);
+
+        process
+            .send(Signal::DieWhenLinkDies(false))
+            .map_err(|error| anyhow!(error.to_string()))?;
+        process
+            .send(Signal::Message(Message::Data(DataMessage::default())))
+            .map_err(|error| anyhow!(error.to_string()))?;
+        timeout(TEST_TIMEOUT, initialized)
+            .await
+            .context("lifecycle observer did not initialize")?
+            .context("lifecycle observer stopped during initialization")?;
+
+        Ok(Self {
+            process,
+            join,
+            target_id,
+            events,
+        })
+    }
+
+    fn set_target(&self, process_id: u64) {
+        self.target_id
+            .compare_exchange(0, process_id, Ordering::AcqRel, Ordering::Acquire)
+            .expect("a lifecycle observer must be assigned exactly one target");
+    }
+
+    async fn assert_lifecycle(
+        &mut self,
         process_id: u64,
         expected_tag: Option<i64>,
         expected_reason: DeathReason,
-    ) {
-        let events = self.events.lock().unwrap();
+    ) -> Result<()> {
+        let expected_link_count = usize::from(expected_reason != DeathReason::Normal);
+        let expected_event_count = expected_link_count + 1;
+        let events = timeout(TEST_TIMEOUT, async {
+            let mut events = Vec::with_capacity(expected_event_count);
+            while events.len() < expected_event_count {
+                events.push(
+                    self.events
+                        .recv()
+                        .await
+                        .context("lifecycle observer stopped before reporting target exit")?,
+                );
+            }
+            Ok::<_, anyhow::Error>(events)
+        })
+        .await
+        .context("lifecycle observer did not report target exit")??;
+
         let link_deaths: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
                 Observed::LinkDied {
                     process_id: observed_id,
                     tag,
-                    reason,
                     removed_before_notification,
-                } if *observed_id == process_id => {
-                    Some((*tag, *reason, *removed_before_notification))
-                }
+                } if *observed_id == process_id => Some((*tag, *removed_before_notification)),
                 _ => None,
             })
             .collect();
+        let expected_link_deaths = if expected_reason == DeathReason::Normal {
+            Vec::new()
+        } else {
+            vec![(expected_tag, true)]
+        };
         assert_eq!(
-            link_deaths,
-            vec![(expected_tag, expected_reason, true)],
-            "link notification must preserve the exit reason and be sent once after removal"
+            link_deaths, expected_link_deaths,
+            "link notification must preserve the tag and be sent once after removal"
         );
 
         let monitor_deaths: Vec<_> = events
@@ -220,45 +328,23 @@ impl RecordingProcess {
             vec![(expected_reason, true)],
             "duplicate monitor registration must preserve the reason and notify exactly once after removal"
         );
+        assert!(
+            !unlink_process(self.process.as_ref(), Some(self.process.id()), process_id)?,
+            "target exit must remove the observer's reciprocal link exactly once"
+        );
+
+        assert!(
+            timeout(Duration::from_millis(50), self.events.recv())
+                .await
+                .is_err(),
+            "target exit must not emit duplicate lifecycle events"
+        );
+        Ok(())
     }
 
-    fn removed(&self, process_id: u64) -> bool {
-        self.environment
-            .upgrade()
-            .and_then(|environment| environment.get_process(process_id))
-            .is_none()
-    }
-}
-
-impl Process for RecordingProcess {
-    fn id(&self) -> u64 {
-        self.id
-    }
-
-    fn send(
-        &self,
-        signal: Signal,
-    ) -> std::result::Result<(), lunatic_process::state::SignalSendError> {
-        let event = match signal {
-            Signal::Message(Message::Data(_)) => Some(Observed::Ready),
-            Signal::LinkDied(process_id, tag, reason) => Some(Observed::LinkDied {
-                process_id,
-                tag,
-                reason,
-                removed_before_notification: self.removed(process_id),
-            }),
-            Signal::ProcessDied { process_id, reason } => Some(Observed::ProcessDied {
-                process_id,
-                reason,
-                removed_before_notification: self.removed(process_id),
-            }),
-            _ => None,
-        };
-
-        if let Some(event) = event {
-            self.events.lock().unwrap().push(event);
-            self.notify.notify_one();
-        }
+    async fn shutdown(self) -> Result<()> {
+        let _ = self.process.send(Signal::Kill);
+        let _ = wait_for_join(self.join).await?;
         Ok(())
     }
 }
@@ -324,7 +410,7 @@ impl WasmHarness {
 
     fn recorder(&self) -> Arc<RecordingProcess> {
         let id = self.environment.get_next_process_id();
-        let recorder = Arc::new(RecordingProcess::new(id, &self.environment));
+        let recorder = Arc::new(RecordingProcess::new(id));
         self.environment.add_process(id, recorder.clone()).unwrap();
         recorder
     }
@@ -435,16 +521,21 @@ async fn run_wasm_case(
     link_tag: i64,
 ) -> Result<Option<DefaultProcessState>> {
     let recorder = harness.recorder();
-    let observer: Arc<dyn Process> = recorder.clone();
+    let mut lifecycle = BoundedLifecycleObserver::spawn(harness.environment.clone()).await?;
     let mut params = vec![Val::I64(recorder.id() as i64)];
     params.extend(extra_params);
     let (join, process) = harness
-        .spawn(function, params, Some((Some(link_tag), observer.clone())))
+        .spawn(
+            function,
+            params,
+            Some((Some(link_tag), lifecycle.process.clone())),
+        )
         .await?;
     let process_id = process.id();
+    lifecycle.set_target(process_id);
 
     recorder.wait_until_ready().await?;
-    register_monitor_and_wait(process.as_ref(), observer).await?;
+    register_monitor_and_wait(process.as_ref(), lifecycle.process.clone()).await?;
 
     match trigger {
         Trigger::Release => process.send(Signal::Message(Message::Data(DataMessage::default()))),
@@ -474,11 +565,14 @@ async fn run_wasm_case(
         }
     };
 
-    recorder.assert_lifecycle(process_id, Some(link_tag), expected_reason);
+    lifecycle
+        .assert_lifecycle(process_id, Some(link_tag), expected_reason)
+        .await?;
     assert!(
         harness.environment.get_process(process_id).is_none(),
         "terminated process must be removed from the environment"
     );
+    lifecycle.shutdown().await?;
     Ok(state)
 }
 
@@ -583,21 +677,78 @@ async fn actual_wasm_exit_matrix_preserves_link_and_monitor_semantics() -> Resul
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_link_capacity_failure_is_atomic_and_reusable() -> Result<()> {
+    let harness = WasmHarness::new()?;
+    let ((parent_sender, parent_receiver), _parent_mailbox) = mailboxes_with_capacity(1, 1);
+    let ((filler_sender, _filler_receiver), _filler_mailbox) = mailboxes_with_capacity(1, 1);
+    let parent: Arc<dyn Process> = Arc::new(WasmProcess::new(70_000, parent_sender));
+    let filler: Arc<dyn Process> = Arc::new(WasmProcess::new(70_001, filler_sender));
+    link_processes(
+        parent.as_ref(),
+        Some(parent.id()),
+        None,
+        filler.as_ref(),
+        Some(filler.id()),
+        None,
+    )?;
+
+    let error = match harness
+        .spawn("fail_now", Vec::new(), Some((Some(777), parent.clone())))
+        .await
+    {
+        Ok(_) => bail!("spawn-link should fail when the parent link capacity is exhausted"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("link capacity is exhausted"));
+    assert_eq!(
+        harness.environment.process_count(),
+        0,
+        "failed spawn-link must remove its provisional child registration"
+    );
+    assert!(
+        unlink_process(parent.as_ref(), Some(parent.id()), filler.id())?,
+        "failed spawn-link must preserve the parent's pre-existing relation"
+    );
+
+    let (join, child) = harness
+        .spawn("fail_now", Vec::new(), Some((Some(777), parent.clone())))
+        .await?;
+    let child_id = child.id();
+    assert!(wait_for_join(join).await?.is_err());
+    assert!(matches!(
+        timeout(TEST_TIMEOUT, parent_receiver.recv())
+            .await
+            .context("successful spawn-link did not report child failure")?
+            .context("spawn-link parent receiver closed")?
+            .into_signal(),
+        Signal::LinkDied(id, Some(777), DeathReason::Failure) if id == child_id
+    ));
+    assert!(
+        !unlink_process(parent.as_ref(), Some(parent.id()), child_id)?,
+        "child exit must already have removed the reciprocal relation"
+    );
+    assert_eq!(harness.environment.process_count(), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_wasm_peer_honors_default_and_trap_exit_link_modes() -> Result<()> {
     let harness = WasmHarness::new()?;
 
     let default_observer = harness.recorder();
-    let default_observer_process: Arc<dyn Process> = default_observer.clone();
+    let mut default_lifecycle =
+        BoundedLifecycleObserver::spawn(harness.environment.clone()).await?;
     let (default_join, default_peer) = harness
         .spawn(
             "default_peer",
             vec![Val::I64(default_observer.id() as i64)],
-            Some((Some(201), default_observer_process.clone())),
+            Some((Some(201), default_lifecycle.process.clone())),
         )
         .await?;
     let default_peer_id = default_peer.id();
+    default_lifecycle.set_target(default_peer_id);
     default_observer.wait_until_ready().await?;
-    register_monitor_and_wait(default_peer.as_ref(), default_observer_process).await?;
+    register_monitor_and_wait(default_peer.as_ref(), default_lifecycle.process.clone()).await?;
 
     let (failing_join, _) = harness
         .spawn(
@@ -613,20 +764,24 @@ async fn actual_wasm_peer_honors_default_and_trap_exit_link_modes() -> Result<()
         Err(error) => error,
     };
     assert!(format!("{default_error:#}").contains("Process killed"));
-    default_observer.assert_lifecycle(default_peer_id, Some(201), DeathReason::Failure);
+    default_lifecycle
+        .assert_lifecycle(default_peer_id, Some(201), DeathReason::Failure)
+        .await?;
+    default_lifecycle.shutdown().await?;
 
     let trap_observer = harness.recorder();
-    let trap_observer_process: Arc<dyn Process> = trap_observer.clone();
+    let mut trap_lifecycle = BoundedLifecycleObserver::spawn(harness.environment.clone()).await?;
     let (trap_join, trap_peer) = harness
         .spawn(
             "trap_peer",
             vec![Val::I64(trap_observer.id() as i64), Val::I64(9002)],
-            Some((Some(202), trap_observer_process.clone())),
+            Some((Some(202), trap_lifecycle.process.clone())),
         )
         .await?;
     let trap_peer_id = trap_peer.id();
+    trap_lifecycle.set_target(trap_peer_id);
     trap_observer.wait_until_ready().await?;
-    register_monitor_and_wait(trap_peer.as_ref(), trap_observer_process).await?;
+    register_monitor_and_wait(trap_peer.as_ref(), trap_lifecycle.process.clone()).await?;
 
     let (failing_join, _) = harness
         .spawn(
@@ -641,7 +796,10 @@ async fn actual_wasm_peer_honors_default_and_trap_exit_link_modes() -> Result<()
         trap_state.message_mailbox().is_empty(),
         "trap-exit peer must consume the tagged LinkDied message"
     );
-    trap_observer.assert_lifecycle(trap_peer_id, Some(202), DeathReason::Normal);
+    trap_lifecycle
+        .assert_lifecycle(trap_peer_id, Some(202), DeathReason::Normal)
+        .await?;
+    trap_lifecycle.shutdown().await?;
 
     Ok(())
 }
@@ -734,12 +892,7 @@ enum NativeOutcome {
 
 async fn run_native_case(outcome: NativeOutcome, link_tag: i64) -> Result<()> {
     let environment = Arc::new(LunaticEnvironment::new(8));
-    let observer_id = environment.get_next_process_id();
-    let recorder = Arc::new(RecordingProcess::new(observer_id, &environment));
-    environment
-        .add_process(observer_id, recorder.clone())
-        .unwrap();
-    let observer: Arc<dyn Process> = recorder.clone();
+    let mut lifecycle = BoundedLifecycleObserver::spawn(environment.clone()).await?;
     let (release_sender, release_receiver) = oneshot::channel::<()>();
 
     let (join, process) =
@@ -765,10 +918,16 @@ async fn run_native_case(outcome: NativeOutcome, link_tag: i64) -> Result<()> {
             }
         })?;
     let process_id = process.id();
-    process
-        .send(Signal::Link(Some(link_tag), observer.clone()))
-        .map_err(|error| anyhow!(error.to_string()))?;
-    register_monitor_and_wait(&process, observer).await?;
+    lifecycle.set_target(process_id);
+    link_processes(
+        &process,
+        Some(process_id),
+        Some(link_tag),
+        lifecycle.process.as_ref(),
+        Some(lifecycle.process.id()),
+        None,
+    )?;
+    register_monitor_and_wait(&process, lifecycle.process.clone()).await?;
 
     match outcome {
         NativeOutcome::Normal | NativeOutcome::Error | NativeOutcome::Panic => release_sender
@@ -813,8 +972,11 @@ async fn run_native_case(outcome: NativeOutcome, link_tag: i64) -> Result<()> {
         }
     };
 
-    recorder.assert_lifecycle(process_id, Some(link_tag), expected_reason);
+    lifecycle
+        .assert_lifecycle(process_id, Some(link_tag), expected_reason)
+        .await?;
     assert!(environment.get_process(process_id).is_none());
+    lifecycle.shutdown().await?;
     Ok(())
 }
 
