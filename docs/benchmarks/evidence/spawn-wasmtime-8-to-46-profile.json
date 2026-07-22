@@ -1,0 +1,164 @@
+{
+  "schema": "spawn-profile-audit-v1",
+  "captured_at": "2026-07-23",
+  "revisions": {
+    "base": "8e7086778815ad32ca57cb8391ca0610e846d4a7",
+    "head": "e838d45bc6df30cffe2e1148c96ee1b7f197baf2"
+  },
+  "environment": {
+    "os": "Windows 11 build 26200",
+    "cpu": "Intel Core i7-14700K",
+    "logical_processors": 28,
+    "memory_gib": 63.77,
+    "rustc": "1.95.0 (59807616e, LLVM 22.1.2)",
+    "cargo": "1.95.0",
+    "criterion": "0.4.0"
+  },
+  "paired_benchmark_context": {
+    "base_median_us": 45.33865810223556,
+    "head_median_us": 30.59811889275547,
+    "head_over_base_ratio": {
+      "point": 0.6730022011202041,
+      "lower_95": 0.6694583573075831,
+      "upper_95": 0.6830336074478804
+    },
+    "pair_count": 10,
+    "sample_size_per_invocation": 50,
+    "warmup_seconds": 1.0,
+    "measurement_seconds": 3.0,
+    "local_report_sha256": "2F98067C3563EC41553C7E87E8E3491AD8945244E05A1430D0DA0932256F0B8A"
+  },
+  "raw_profiles": {
+    "retention": "The raw TSV files are local evidence, not repository-tracked artifacts.",
+    "base": {
+      "path_at_capture": "C:\\tmp\\lunatic-spawn-profile-1671-base.tsv",
+      "sha256": "79F371DB635F73FEA65F175AA23111C32B518F78C64EC3083B6575B7CB87AD31",
+      "bytes": 430175,
+      "rows": 251,
+      "unique_thread_ids": 5,
+      "elapsed_min_ms": 1479,
+      "elapsed_max_ms": 10232,
+      "observed_span_ms": 8753,
+      "cycles_delta_sum": 11976583949
+    },
+    "head": {
+      "path_at_capture": "C:\\tmp\\lunatic-spawn-profile-1671-head.tsv",
+      "sha256": "B035DD8469DE3A0D8B4EB503B49F22772EA39534BDF212D68BA3CB1032DC84BC",
+      "bytes": 362737,
+      "rows": 199,
+      "unique_thread_ids": 5,
+      "elapsed_min_ms": 1459,
+      "elapsed_max_ms": 10227,
+      "observed_span_ms": 8768,
+      "cycles_delta_sum": 9621474815
+    }
+  },
+  "collector": {
+    "name": "ad-hoc C++17 lunatic-stack-sampler",
+    "source_retained": false,
+    "binary_retained": false,
+    "version": null,
+    "compiler": {
+      "name": "MSVC cl.exe 19.44.35215.0",
+      "sha256": "A9A3A13E4D019CFC0A9D823B3EE0CC383C6F3F86B00F861AC066032D869997E5",
+      "developer_shell": "Visual Studio 17.14.13"
+    },
+    "symbol_engine": {
+      "path": "C:\\Windows\\System32\\dbghelp.dll",
+      "version": "10.0.26100.8328",
+      "sha256": "1463249A85BB239FCB536780F3B964C5F2FD68398FFBD35EBEC0D65660C8D83E"
+    },
+    "target_build_command": "cargo +stable bench --bench spawn --no-run --locked --offline",
+    "base_command": "lunatic-stack-sampler.exe C:\\tmp\\lunatic-spawn-profile-1671-base.tsv 2 1200 C:\\tmp\\lunatic-profile-1671-base-20260723\\target\\release\\deps\\spawn-d7ec4e51ece6233f.exe --bench --profile-time 10 --noplot 'spawn process'",
+    "head_command": "lunatic-stack-sampler.exe C:\\tmp\\lunatic-spawn-profile-1671-head.tsv 2 1200 C:\\tmp\\lunatic-profile-1671-head-20260723\\target\\release\\deps\\spawn-d0d55e358570f795.exe --bench --profile-time 10 --noplot 'spawn process'",
+    "base_binary_sha256": "7F1B453DF1E52CA0866B3106392DC8E524F809A8CA7ADEDAC73C0A09B397D1FB",
+    "base_pdb_sha256": "AF6113136B50B681001B7FE17229C63F65243C7BDF03DB5BFB75E670F5088727",
+    "head_binary_sha256": "99E67113C4B100F1418E0067A2841FA1D76CCBFAD313CC9DC2E77F032CFAB247",
+    "head_pdb_sha256": "7132C7B3301C033407890773ED1D1D4A4916047BE7B487BA63C5B09FC5EBF74A",
+    "algorithm": [
+      "Create the child suspended and initialize DbgHelp with PDB loading.",
+      "Resume, wait 100 ms, enumerate modules, and load them with SymLoadModuleExW.",
+      "Discard the first 1200 ms, then enumerate target threads every 2 ms.",
+      "For threads whose QueryThreadCycleTime increased, suspend, capture context, StackWalk64 for at most 96 frames, then resume.",
+      "Discard rows whose top frame matches an OS wait prefix."
+    ],
+    "discarded_top_frame_prefixes": [
+      "ntdll!ZwWait",
+      "ntdll!NtWait",
+      "ntdll!RtlWait",
+      "ntdll!ZwDelay",
+      "ntdll!NtDelay",
+      "ntdll!ZwRemoveIoCompletion",
+      "ntdll!NtRemoveIoCompletion",
+      "KERNELBASE!Wait",
+      "KERNELBASE!Sleep",
+      "KERNELBASE!GetQueuedCompletionStatus"
+    ]
+  },
+  "aggregation": {
+    "primary_unit": "unweighted retained stack row",
+    "cycles_delta_use": "diagnostic only; it is the thread-cycle increase since the previous poll paired with an interval-end stack snapshot, not a per-stack CPU duration",
+    "wilson_z": 1.959963984540054,
+    "exclusive_precedence": [
+      ["fiber_lifecycle", "(?i)wasmtime(_internal)?_fiber|CreateFiber|DeleteFiber|RtlCreateUserStack|RtlFreeUserStack"],
+      ["wasi", "(?i)(^|[!_])wasi(_common|_cap|..api)?"],
+      ["wasmtime_vm_instance", "(?i)wasmtime"],
+      ["lunatic_state_process", "(?i)lunatic_(process|runtime|wasi|common|messaging|timer|registry|distributed|networking|sqlite|metrics|trap|error|version)|DefaultProcessState|LunaticEnvironment"],
+      ["tokio_mio_scheduling", "(?i)tokio|mio[0-9!._]"],
+      ["heap_allocation", "(?i)Rtl(Allocate|Free)Heap|alloc..alloc|hashbrown|RawTable"],
+      ["os_crt_unattributed", "top =~ ^(ntdll|KERNELBASE|KERNEL32|VCRUNTIME)"],
+      ["other_user_code", "fallback"]
+    ],
+    "inclusive_rule": "Split stack_top_to_bottom on ';'. Count a retained row once for a named regex if it matches anywhere in that row. Named paths may overlap."
+  },
+  "exclusive_results": {
+    "base_denominator": 251,
+    "base": {
+      "fiber_lifecycle": {"count": 129, "cycles": 6182316195, "cycles_fraction": 0.5162002973, "wilson95": [0.4523696072, 0.5750984509]},
+      "wasi": {"count": 37, "cycles": 2340029775, "cycles_fraction": 0.1953837409, "wilson95": [0.1088761348, 0.1965743958]},
+      "wasmtime_vm_instance": {"count": 12, "cycles": 485541971, "cycles_fraction": 0.04054094, "wilson95": [0.0275571238, 0.0816929918]},
+      "lunatic_state_process": {"count": 10, "cycles": 394446079, "cycles_fraction": 0.0329347734, "wilson95": [0.0217822085, 0.0717718738]},
+      "tokio_mio_scheduling": {"count": 63, "cycles": 2574249929, "cycles_fraction": 0.2149402484, "wilson95": [0.2013833891, 0.3081155732]},
+      "heap_allocation": {"count": 0, "cycles": 0, "cycles_fraction": 0.0},
+      "os_crt_unattributed": {"count": 0, "cycles": 0, "cycles_fraction": 0.0},
+      "other_user_code": {"count": 0, "cycles": 0, "cycles_fraction": 0.0}
+    },
+    "head_denominator": 199,
+    "head": {
+      "fiber_lifecycle": {"count": 86, "cycles": 3850020540, "cycles_fraction": 0.4001486897, "wilson95": [0.3652616004, 0.5016295166]},
+      "wasi": {"count": 7, "cycles": 388871364, "cycles_fraction": 0.0404170225, "wilson95": [0.0171417666, 0.0708158872]},
+      "wasmtime_vm_instance": {"count": 25, "cycles": 1192474193, "cycles_fraction": 0.1239388156, "wilson95": [0.0865601908, 0.1788759737]},
+      "lunatic_state_process": {"count": 13, "cycles": 699052824, "cycles_fraction": 0.0726554751, "wilson95": [0.0385712136, 0.1085459438]},
+      "tokio_mio_scheduling": {"count": 67, "cycles": 3428916316, "cycles_fraction": 0.3563815716, "wilson95": [0.2746687558, 0.4048839333]},
+      "heap_allocation": {"count": 0, "cycles": 0, "cycles_fraction": 0.0},
+      "os_crt_unattributed": {"count": 1, "cycles": 62139578, "cycles_fraction": 0.0064584255, "wilson95": [0.0008876095, 0.0279105408]},
+      "other_user_code": {"count": 0, "cycles": 0, "cycles_fraction": 0.0}
+    }
+  },
+  "inclusive_results": {
+    "delete_fiber": {"regex": "(^|;)KERNELBASE!DeleteFiber(;|$)", "base": [80, 251, 3782689089], "head": [46, 199, 2122038694]},
+    "nt_free_virtual_memory": {"regex": "(^|;)ntdll!NtFreeVirtualMemory(;|$)", "base": [79, 251, 3719283486], "head": [46, 199, 2122038694]},
+    "rtl_free_user_stack": {"regex": "(^|;)ntdll!RtlFreeUserStack(;|$)", "base": [79, 251, 3719283486], "head": [46, 199, 2122038694]},
+    "create_fiber_ex": {"regex": "(^|;)KERNELBASE!CreateFiberEx(;|$)", "base": [31, 251, 1556729431], "head": [28, 199, 1213164356]},
+    "rtl_create_user_stack": {"regex": "(^|;)ntdll!RtlCreateUserStack(;|$)", "base": [23, 251, 1153509001], "head": [25, 199, 1058896736]},
+    "lunatic_process_new_closure": {"regex": "lunatic_process3new28_", "base": [76, 251, 2619223628], "head": [98, 199, 4466895433]},
+    "environment_get_processes_for_module": {"regex": "lunatic_process3env11Environment24get_processes_for_module", "base": [47, 251, 1682910068], "head": [0, 199, 0]},
+    "default_process_state_new": {"regex": "lunatic_runtime5state19DefaultProcessState3new", "base": [38, 251, 2403891698], "head": [7, 199, 388871364]},
+    "build_wasi": {"regex": "lunatic_wasi_api10build_wasi", "base": [37, 251, 2340029775], "head": [7, 199, 388871364]},
+    "handle_is_console": {"regex": "is_terminal17handle_is_console", "base": [35, 251, 2213266057], "head": [0, 199, 0]},
+    "wasi_inherit_stdio": {"regex": "WasiCtxBuilder13inherit_stdio", "base": [24, 251, 1481899855], "head": [1, 199, 53463341]},
+    "wasmtime_resume_fiber": {"regex": "wasmtime7runtime5fiber12resume_fiber", "base": [0, 251, 0], "head": [48, 199, 2206387435]},
+    "wasmtime_make_fiber_unchecked": {"regex": "wasmtime7runtime5fiber20make_fiber_unchecked", "base": [0, 251, 0], "head": [30, 199, 1300438542]},
+    "wasmtime_internal_into_stack": {"regex": "wasmtime_internal_fiber36Fiber.*10into_stack", "base": [0, 251, 0], "head": [46, 199, 2122038694]},
+    "nt_alert_thread_by_thread_id": {"regex": "(^|;)ntdll!NtAlertThreadByThreadIdEx(;|$)", "base": [27, 251, 1043737186], "head": [30, 199, 1576944867]},
+    "zw_allocate_virtual_memory": {"regex": "(^|;)ntdll!ZwAllocateVirtualMemory(;|$)", "base": [23, 251, 1006881688], "head": [23, 199, 969056010]},
+    "nt_device_io_control_file": {"regex": "(^|;)ntdll!NtDeviceIoControlFile(;|$)", "base": [22, 251, 1399021227], "head": [0, 199, 0]}
+  },
+  "limitations": [
+    "The ad-hoc sampler source and binary were deleted after collection, so exact collector replay is unavailable; commands, tools, target hashes, aggregation rules, and input hashes are retained for audit.",
+    "This is one cooperative DbgHelp suspend/unwind collection per revision, not ETW or perf.",
+    "Async Fiber stacks can be missed or repeated and the profiler can perturb the process.",
+    "cycles_delta is not a true per-stack duration and must not be interpreted as one.",
+    "This Windows profile cannot establish a hosted-Linux causal breakdown; repeated Linux perf profiles are required for that claim."
+  ]
+}

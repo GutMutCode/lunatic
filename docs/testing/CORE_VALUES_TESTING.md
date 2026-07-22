@@ -1,7 +1,7 @@
 # Core Values Verification
 
 **Status**: Active
-**Last reviewed**: 2026-07-22
+**Last reviewed**: 2026-07-23
 
 This guide maps core-value claims to executable production-path evidence. A passing
 test is evidence only for the path it actually runs. Source inspection, printed
@@ -18,8 +18,10 @@ cargo test --all
 ```
 
 GitHub Actions runs the same formatter, Clippy, and workspace test commands on
-Linux, macOS, and Windows. Linux CI also executes Criterion benchmarks and
-enforces the configured thresholds in `scripts/check_bench_thresholds.py`.
+Linux, macOS, and Windows. Linux CI also executes Criterion benchmarks,
+enforces the configured absolute thresholds in
+`scripts/check_bench_thresholds.py`, and runs the dedicated same-runner paired
+spawn comparison in `scripts/compare_spawn_bench.py`.
 
 ## Executable Evidence
 
@@ -57,6 +59,7 @@ cargo bench --bench messaging
 cargo bench --bench distributed_messaging
 cargo bench --bench distributed_latency
 python scripts/check_bench_thresholds.py
+python scripts/compare_spawn_bench.py <base> <head> --output-dir spawn-comparison
 ```
 
 `distributed_messaging` opens a real mTLS QUIC connection and measures the

@@ -1,11 +1,12 @@
 # CI Benchmark Integration
 
-Reviewed against the repository on 2026-07-22.
+Reviewed against the repository on 2026-07-23.
 
 Lunatic keeps Criterion benchmarks in the repository-root [`benches/`](../benches/)
-directory. The Linux leg of [the main CI workflow](../.github/workflows/ci.yml)
-runs them, uploads the textual output for the commit under test, and then runs
-the executable threshold checker.
+directory. [The main CI workflow](../.github/workflows/ci.yml) retains the
+current commit's Linux results, applies absolute limits to workloads with a
+stable service boundary, and evaluates process spawn with a same-runner paired
+base/head comparison.
 
 ## Current benchmark targets
 
@@ -35,10 +36,31 @@ On Linux, `test_or_release` performs three distinct actions:
 
 The threshold checker reruns its configured Criterion workloads, parses their
 confidence intervals, and fails when an upper bound exceeds the checked-in
-limit. It currently covers `spawn`, `messaging`, `distributed_messaging`, and
-`distributed_latency`. The separate pull-request summary still describes
-manual baseline comparison; CI does not yet maintain a historical trend store
-or automatically compare a pull request with its base commit.
+limit. It covers `messaging`, `distributed_messaging`, and
+`distributed_latency`.
+
+The separate `spawn_regression` job checks out the base and head commits into
+detached worktrees on one Ubuntu 24.04 runner and builds both with Rust 1.95.0.
+It alternates `base/head` and `head/base` execution order, starts with 10 paired
+measurements, and extends to at most 15 pairs when the interval remains noisy.
+Each invocation uses 50 Criterion samples, a 1-second warmup, and a 3-second
+measurement window. The comparison uses Criterion's slope point estimate and
+paired log ratios, not two unrelated confidence-interval endpoints.
+
+The paired spawn policy is:
+
+- report a warning when the median paired increase is greater than 5%;
+- fail when the 95% bootstrap interval is wholly above a 10% increase;
+- fail when the 95% bootstrap lower bound for head latency is above 75µs;
+- report an inconclusive failure when the relative interval is still wider
+  than 10 percentage points after 15 pairs.
+
+Once the comparison script starts, it creates `report.json`, `summary.md`, raw
+command output, and environment metadata. The following `if: always()` artifact
+step uploads any available evidence as `spawn-comparison-<commit SHA>`; a failure
+before the comparison starts can legitimately leave no artifact. The 75µs
+backstop is an emergency bound for this minimal harness; paired change is the
+normal regression signal.
 
 ## Local commands
 
@@ -54,6 +76,17 @@ Run the same hard-threshold gate used by CI:
 ```bash
 ./scripts/check_bench_thresholds.py
 ```
+
+Run the paired spawn comparison used by CI:
+
+```bash
+python scripts/compare_spawn_bench.py <base> <head> \
+  --output-dir spawn-comparison
+```
+
+Use an otherwise idle machine. The script isolates the commits' Cargo targets
+and Criterion homes, records the resolved revisions and environment, and
+removes its temporary worktrees when finished.
 
 Criterion writes detailed local output below `target/criterion/`. Generated
 results are not source-controlled and a number copied from one run is not a
@@ -81,4 +114,5 @@ on the stated commit.
 3. Add it to `scripts/check_bench_thresholds.py` only when a justified,
    runner-tolerant hard limit exists.
 4. Document the measured boundary and what the result does not establish.
-5. Verify both `cargo bench --bench <name>` and the threshold checker.
+5. Verify both `cargo bench --bench <name>` and the applicable absolute or
+   paired checker.

@@ -1,6 +1,6 @@
 # Core Values Verification Summary
 
-**Last reviewed**: 2026-07-22
+**Last reviewed**: 2026-07-23
 
 The repository uses executable production-path tests instead of a synthetic
 compliance score.
@@ -24,7 +24,7 @@ cargo test --all
 | Global registration coordinates across authenticated nodes | Real mTLS QUIC tests cover 2/3/5-node contention, request-ID uniqueness, quorum, resync, forged leader/snapshot rejection with no registry mutation, and expected-peer response correlation | Cluster-wide resource quotas and crash chaos are not covered |
 | Node-control bearer credentials remain transport-bound and revocable | `tests/node_control_security.rs` and crate tests cover redaction, exact-origin URL validation, HTTP downgrade rejection, redirect/authenticated-proxy/forged-target fail-closed behavior, acknowledgement-loss-safe generation-CAS rotation, deterministic expiry, cancelled shutdown, stop revocation, and normal production Axum lifecycle | Plain HTTP is loopback-only; remote deployment requires HTTPS and enrollment admission, and the excluded submillisecond implementation is quarantined |
 | QUIC framing dispatches multi-chunk messages | 4,097-byte production-framed request E2E | Dispatch boundary only; no live process mailbox |
-| Performance limits are measured | Criterion benches plus `scripts/check_bench_thresholds.py` | Results are environment-sensitive and are not correctness proofs |
+| Performance limits are measured | Criterion benches, absolute workload thresholds, and a same-runner paired spawn comparison with retained raw evidence | Results remain workload- and environment-specific and are not correctness proofs |
 
 ## Corrections to Historical Claims
 

@@ -1,6 +1,6 @@
 # Lunatic Core Values & Design Principles
 
-**Last Updated**: July 22, 2026
+**Last Updated**: July 23, 2026
 
 **Historical Performance Analysis (October 2025)**: See [docs/benchmarks/PERFORMANCE_ANALYSIS.md](docs/benchmarks/PERFORMANCE_ANALYSIS.md)
 
@@ -331,7 +331,7 @@ When designing or reviewing features, ask:
 Checkboxes in this section represent current production-path verification, not whether a supporting component or historical microbenchmark exists. Measurement scope and reviewed commit are recorded in [the canonical status](docs/core_values/status.md).
 
 ### Performance
-- [ ] Process spawn < 10μs (historical component benchmark: 23.055μs; remeasurement and workload definition required)
+- [ ] Process spawn < 10μs (aspirational product target; a 2026-07-23 Windows component run at `9afadbb` had a 34.763μs median point estimate, and the [spawn analysis](docs/benchmarks/SPAWN_BASELINE_ANALYSIS.md) records the boundary and same-runner paired regression contract)
 - [ ] Live hot reload < 100ms (historical synthetic Criterion compile/instantiate/registry/snapshot/restore harness: 0.76ms; live signal path unverified)
 - [ ] End-to-end process message passing < 1μs (historical local 10-message FIFO mailbox creation/push/pop harness: 353ns; process delivery unmeasured)
 - [ ] Memory overhead < 1KB per process (historical lower-bound estimate: ~66KiB including one 64KiB Wasm page)

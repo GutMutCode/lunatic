@@ -1,6 +1,6 @@
 # Lunatic Benchmark Suite
 
-Evidence review: 2026-07-22
+Evidence review: 2026-07-23
 
 Canonical implementation status: [`docs/core_values/status.md`](../core_values/status.md)
 
@@ -60,6 +60,16 @@ cargo bench --bench distributed_latency
 
 Criterion HTML reports are written below `target/criterion/`.
 
+Compare process spawn between two commits on the same idle machine:
+
+```bash
+python scripts/compare_spawn_bench.py <base> <head> \
+  --output-dir spawn-comparison
+```
+
+This is the regression contract for `spawn process`; a single current-commit
+run remains useful descriptive evidence but is not the CI regression decision.
+
 Run the deterministic adversarial backpressure gate separately:
 
 ```bash
@@ -97,16 +107,31 @@ See [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for the retained details.
 
 On Linux, `.github/workflows/ci.yml` is configured to invoke all eight suites listed above and retain their combined textual output for 30 days.
 
-The workflow also runs `scripts/check_bench_thresholds.py`, which separately executes and enforces ceilings for these four suites only:
+The workflow also runs `scripts/check_bench_thresholds.py`, which separately executes and enforces ceilings for these three suites only:
 
-- `spawn`;
 - `messaging`;
 - `distributed_messaging`;
 - `distributed_latency`.
 
-The script checks configured absolute upper bounds for specific Criterion labels. It does not compare a pull request against a stored historical baseline. The workflow explicitly reports that baseline regression comparison remains manual.
+The script checks configured absolute upper bounds for specific Criterion labels.
 
-The `spawn process` guard is calibrated to the Wasmtime 46 hosted-Linux baseline recorded on 2026-07-21 at commit `100767b` ([Actions run 29803866397](https://github.com/GutMutCode/lunatic/actions/runs/29803866397)): a 53.827µs Criterion upper bound, with a warning above 60µs and a hard failure above 75µs. The margin provides headroom for shared-runner variance while still detecting a material regression. These CI limits do not replace the separate aspirational `<10µs` product target.
+`spawn process` instead has a dedicated Ubuntu 24.04/Rust 1.95.0 job. Base
+and head are built in isolated worktrees and measured on the same runner in
+alternating order. Ten paired Criterion slope estimates are collected first;
+the tool may extend to 15 pairs when the interval is noisy. A median increase
+above 5% warns, a 95% paired-bootstrap interval wholly above +10% fails, and a
+95% lower bound above 75µs for head fails as an emergency absolute backstop.
+An interval still wider than 10 percentage points at 15 pairs is inconclusive
+and fails instead of silently passing uncertain evidence. Raw logs, JSON,
+metadata, and a Markdown summary are retained for 30 days.
+
+The former 60µs warning / 75µs single-run gate was calibrated from Wasmtime
+46 hosted-Linux observations of 49–54µs. It was replaced because one shared-runner
+upper endpoint cannot distinguish code change from runner variance. The 75µs
+value remains only as the paired tool's emergency backstop. None of these CI
+limits replaces the aspirational `<10µs` product target. See
+[`SPAWN_BASELINE_ANALYSIS.md`](SPAWN_BASELINE_ANALYSIS.md) for the decision and
+reproduction record.
 
 Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete. The live-mailbox threshold likewise covers only its fixed two-node native-process fixture, not the guest-Wasm boundary or broader production readiness.
 
@@ -172,5 +197,6 @@ Until those exist, the live reload, end-to-end messaging, one-million-process, a
 
 - [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) — historical numbers with their boundaries.
 - [`PERFORMANCE_ANALYSIS.md`](PERFORMANCE_ANALYSIS.md) — scoped analysis and evidence gaps.
+- [`SPAWN_BASELINE_ANALYSIS.md`](SPAWN_BASELINE_ANALYSIS.md) — reproducible spawn comparison and accepted gate.
 - [`../../CORE_VALUES.md`](../../CORE_VALUES.md) — goals, not a completion report.
 - [`../core_values/status.md`](../core_values/status.md) — canonical current implementation status.
