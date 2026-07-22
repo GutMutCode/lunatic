@@ -31,7 +31,7 @@ use lunatic_process::{
     Process, Signal,
 };
 use lunatic_runtime::{DefaultProcessConfig, DefaultProcessState};
-use quinn::{Endpoint, VarInt};
+use quinn::{Connection, Endpoint, VarInt};
 use rcgen::{CertificateParams, CustomExtension, DnType};
 use tokio::{
     sync::{mpsc, Mutex, RwLock},
@@ -365,7 +365,7 @@ impl TestCluster {
         target_index: usize,
         wire_message_id: u64,
         request: Request,
-    ) -> Result<()> {
+    ) -> Result<(quic::Client, Connection)> {
         self.send_requests_as(source_index, target_index, vec![(wire_message_id, request)])
             .await
     }
@@ -375,7 +375,7 @@ impl TestCluster {
         source_index: usize,
         target_index: usize,
         requests: Vec<(u64, Request)>,
-    ) -> Result<()> {
+    ) -> Result<(quic::Client, Connection)> {
         let source = &self.nodes[source_index];
         let target = &self.nodes[target_index];
         let raw_client = quic::new_quic_client(&self.root_cert, &source.cert, &source.key)?;
@@ -387,7 +387,10 @@ impl TestCluster {
         }
         stream.finish()?;
         let _ = stream.stopped().await?;
-        Ok(())
+        drop(stream);
+        // `stopped()` confirms transport acknowledgement, not application dispatch. Keep both
+        // the endpoint and connection alive until the caller observes its application barrier.
+        Ok((raw_client, connection))
     }
 }
 
@@ -611,7 +614,7 @@ async fn spawn_response_waiter_accepts_only_the_intended_mtls_peer() -> Result<(
 
     // Node 3 knows the message ID but is not the authenticated peer retained
     // by the waiter. Its response must neither complete nor remove that waiter.
-    cluster
+    let spoof_transport_guard = cluster
         .send_requests_as(
             2,
             0,
@@ -646,8 +649,9 @@ async fn spawn_response_waiter_accepts_only_the_intended_mtls_peer() -> Result<(
         .is_err(),
         "spawn waiter accepted a response authenticated as node 3"
     );
+    drop(spoof_transport_guard);
 
-    cluster
+    let intended_transport_guard = cluster
         .send_request_as(
             1,
             0,
@@ -662,5 +666,6 @@ async fn spawn_response_waiter_accepts_only_the_intended_mtls_peer() -> Result<(
         .await
         .context("node-2 spawn response did not complete its waiter")??;
     assert_eq!(response, ResponseContent::Spawned(42));
+    drop(intended_transport_guard);
     Ok(())
 }
