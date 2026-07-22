@@ -183,6 +183,7 @@ wasi-common = "46.0.1"
 wasmtime = "46.0.1"
 webpki-roots = "1.0"
 x509-parser = "0.18.1"
+zeroize = "1.9"
 
 [workspace.metadata.git-cliff.changelog]
 header = """

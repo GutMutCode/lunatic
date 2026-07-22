@@ -2,7 +2,7 @@
 
 Reviewed: 2026-07-22
 
-Reviewed working tree based on: `f472608b1a91154fe511dc9a2c65abb32400ac2a` plus the reviewed working-tree changes for Hanary #1679
+Reviewed working tree based on: `54b3cced8142a0e9a3f71b3689019c7fbea96c29` plus the reviewed working-tree changes for Hanary #1677
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -21,7 +21,7 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 | Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and acknowledged atomic reload/rollback/in-doubt behavior are production-path tested. Cross-node recovery remains incomplete. |
 | Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
 | Language Independence | Partial | Host imports are language-neutral and multi-language source examples/build recipes exist. Equivalent guest APIs and a verified multi-language build/run CI matrix do not. |
-| Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. Typed/redacted V1 audit events cover major privileged boundaries, but complete resource accounting, a receiver path policy, and durable/required audit delivery remain open. |
+| Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. Version-2 TLS listener snapshots exclude raw private-key bytes, and typed/redacted V1 audit events cover major privileged boundaries, but the guest TLS ABI still accepts raw key input, complete resource accounting and receiver path policy remain open, and audit delivery is not durable/required. |
 | Fault Tolerance & HA | Partial | Actual-Wasm links and monitors, process-local live reload, host-side OTP components, snapshots, and registry quorum components exist. Distributed recovery paths remain incomplete. |
 | Async by Default | Partial | Wasmtime preemption, bounded actor ingress, and several async host paths exist. Unverified blocking host calls and scheduler fairness prevent a stronger claim. |
 | Erlang-Inspired | Partial | Actor primitives, host-side GenServer/Supervisor, and coordinated registry components exist. Guest adapters and several BEAM-like guarantees remain open. |
@@ -94,7 +94,9 @@ missing.
 - Privileged operation boundaries now record compile/config/preopen/WASI directory access, local and distributed spawn, TCP/TLS/UDP/DNS operations, covered resource-limit denials, hot-reload terminal outcomes, distributed-registry changes/snapshots, and distributed authorization denials. Operation-level guards emit one terminal result on success, denial, failure, timeout, or early trap.
 - Distributed mTLS certificates bind a control-plane-issued numeric node ID. Outbound connections verify the intended topology ID, inbound requests fence inactive members and reject mismatched source claims, response waiters require the expected authenticated peer, and registry leader/snapshot decisions consume only the certificate identity. Protocol-denial audit subjects use that verified peer (`crates/lunatic-distributed/src/quic/quin.rs`, `crates/lunatic-distributed/src/distributed/server.rs`, `crates/lunatic-distributed/src/distributed/client.rs`).
 - Networking paths enforce several per-process limits, and Wasmtime uses memory/table resource limiting (`crates/lunatic-networking-api`, `src/state.rs`).
-- A directly tested same-runtime helper can transfer supported live network resource maps between process states without serializing TLS traffic keys. Serialized active TLS restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
+- Version-2 `ResourceMigrationSnapshot` TLS listener entries serialize only a local address and an opaque 128-bit handle, never a certificate or raw private key. Provider access is authorized against both environment and process identity. The default provider is process-local, five-minute, single-use, and capped at 1,024 unexpired entries; missing, expired, wrong-scope, capacity, and provider-error paths fail closed with stable secret-free errors. Unversioned, missing-version, unknown-version, and trailing-data snapshots are rejected without an automatic importer (`crates/lunatic-process/src/resource_migration.rs`, `src/tls_credentials.rs`, `src/state.rs`).
+- The `tls_bind` host path zeroizes its temporary host PEM copy while preserving the const guest input required by SDK multi-address fallback. The production-import test checks that ABI behavior and audit-event redaction on an invalid-key path (`crates/lunatic-networking-api/src/tls_tcp.rs`, `tests/capability_attenuation.rs`).
+- A directly tested same-runtime helper transfers supported live network resource maps, including the bound TLS listener/acceptor and active TLS sessions, without provider lookup or snapshot serialization. Serialized active TLS stream restoration fails explicitly (`src/state.rs`, `crates/lunatic-process/src/resource_migration.rs`).
 
 ### Boundary
 
@@ -103,7 +105,8 @@ missing.
 - Every guest-visible TCP/TLS listener or stream and UDP socket owns a paired FD/network lease, and DNS/address iterators are finite. General WASI file handles and network destination policy are not connected to those limits.
 - Local actor ingress and resource transfer are bounded, but aggregate host/cluster memory, CPU, disk, and remote-transport budgets are not closed by one global policy.
 - Audit delivery is best-effort and fail-open: a dedicated writer uses a bounded 1,024-record queue, drops newest on saturation, opens a health circuit on sink failure, exposes counters, and waits at most 250 ms at graceful shutdown. The default sink ends at the enabled Rust `log` facade; it does not prove disk/remote persistence, action-plus-audit atomicity, retention, or tamper evidence. An explicit `RUST_LOG` can still disable `audit=info`, and remaining non-privileged host calls are outside the event inventory.
-- The running-Wasm reload transaction invokes the same-runtime live-resource transfer after its fallible preparation steps. Exact TLS session/ID preservation is tested at that transfer boundary, not yet by a guest-driven reload E2E. Serialized snapshots, host restarts, and cross-node migration cannot restore active TCP/TLS streams; listener restoration has separate support.
+- The current guest TLS bind ABI still receives raw private-key bytes through a const buffer that SDKs may reuse for multi-address fallback. The host zeroizes only its temporary copy and deliberately does not mutate guest memory, so the original or duplicates can appear in a `MemorySnapshot`. Intentional distributed credential-delivery APIs are also outside this resource-snapshot guarantee. Avoiding guest key bytes altogether requires a future provider-handle guest ABI.
+- The running-Wasm reload transaction invokes the same-runtime live-resource transfer after its fallible preparation steps. Exact TLS session/ID preservation is tested at that transfer boundary, not yet by a guest-driven reload E2E. Serialized snapshots, host restarts, and cross-node migration cannot restore active TCP/TLS streams. A TLS listener can be rebound from a version-2 snapshot only while its scoped handle is resolvable; the default provider does not survive restart, a consumed or failed-attempt handle must not be replayed, and persisted/restart recovery requires an explicitly injected reprovisioning provider.
 
 ## 4. Fault Tolerance and High Availability
 
@@ -158,6 +161,8 @@ missing.
 | `cargo test --all` | Current unit and integration contracts exercised by the repository | Untested production paths, performance, scale, or multi-host behavior |
 | `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and monitor semantics | Cross-node links, Supervisor event intake, or every possible host-future suspension point |
 | `cargo test -p lunatic-otp-patterns` | Host-side OTP component and process integration behavior | Guest-Wasm adapters, automatic Supervisor monitor intake, GenStatem/GenEvent runtime integration |
+| TLS listener credential tests | Version-2 address-plus-handle serialization, scoped/single-use/expiry/capacity behavior, stable fail-closed errors, provider-backed rebind, legacy rejection, and live listener transfer without provider lookup | Persistent-provider implementation, host restart, cross-node restoration, or elimination of guest-memory duplicates |
+| TLS bind production-import test | The const guest key-input range remains reusable on the exercised invalid-input path, the temporary host copy is zeroized by implementation, and the audit record omits the marker | Guest-managed erasure, `MemorySnapshot` key absence, successful-bind crash-dump/remanence guarantees, or distributed credential delivery |
 | Registry/QUIC + guest integration tests | Real localhost mTLS transport, framing, quorum behavior, two actual Wasm guest lookup-to-mailbox request/reply, typed missing-target errors, and owner cleanup | Cross-host deployment, cross-environment handles, partitioned guest owner exit, distributed process recovery |
 | Criterion mailbox benchmark | Local queue-operation cost for its configured workload | End-to-end process message latency or backpressure |
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
@@ -178,17 +183,20 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 ## Prioritized Follow-Ups
 
 1. Add an operator-selectable required/fail-closed durable audit sink and health endpoint, then extend the typed inventory to any remaining privileged host boundaries.
-2. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
-3. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
-4. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
-5. Connect Supervisor monitor intake and OTP guest/runtime adapters.
-6. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
-7. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
+2. Add a provider-handle TLS guest ABI so private-key bytes need not enter Wasm memory, and define equivalent contracts for intentional distributed credential delivery.
+3. Add receiver-owned distributed capability/ceiling policy, filesystem mapping/allowlists, and close the local path check/open authority boundary.
+4. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
+5. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
+6. Connect Supervisor monitor intake and OTP guest/runtime adapters.
+7. Build and run representative Rust, TinyGo, and AssemblyScript guest E2E scenarios in CI.
+8. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
 
 ## Related Resources
 
 - `CORE_VALUES.md` — design principles and target metrics.
 - `docs/benchmarks/BENCHMARK_RESULTS.md` — historical component measurements with scope limitations.
 - `docs/security/CAPABILITY_ATTENUATION.md` — process capability and resource-ceiling inheritance contract.
+- `docs/tls/TLS_LISTENER_CREDENTIALS.md` — version-2 TLS listener credential, legacy-artifact, and guest key-input boundary.
+- `docs/tls/TLS_STREAM_MIGRATION.md` — live-transfer and serialized active-stream boundary.
 - `examples/MULTI_LANGUAGE_GUIDE.md` — language example guide with support boundaries.
 - `docs/core_values/CORE_VALUES_COMPLIANCE_REPORT.md` — archived scorecard; this file supersedes its status claims.

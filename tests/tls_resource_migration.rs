@@ -1,36 +1,25 @@
 use anyhow::Result;
-use lunatic_process::resource_migration::ResourceSnapshot;
+use lunatic_process::resource_migration::{
+    ResourceMigrationSnapshot, ResourceSnapshot, TlsCredentialHandle,
+};
 
-#[tokio::test]
-async fn test_tls_listener_snapshot_structure() -> Result<()> {
-    // Generate test certificate and key (self-signed for testing)
-    let cert_pem = generate_test_cert();
-    let key_pem = generate_test_key();
+#[test]
+fn test_tls_listener_snapshot_structure() -> Result<()> {
     let local_addr = "127.0.0.1:8443".to_string();
+    let credential_handle = TlsCredentialHandle::from_bytes([0x5a; 16]);
 
-    // Create TLS listener snapshot
     let snapshot = ResourceSnapshot::TlsListener {
         local_addr: local_addr.clone(),
-        cert_pem: cert_pem.clone(),
-        key_pem: key_pem.clone(),
+        credential_handle,
     };
 
-    println!("✓ Created TLS listener snapshot");
-
-    // Verify snapshot contains correct data
     match &snapshot {
         ResourceSnapshot::TlsListener {
             local_addr: addr,
-            cert_pem: snap_cert,
-            key_pem: snap_key,
+            credential_handle: snapshot_handle,
         } => {
             assert_eq!(addr, &local_addr);
-            assert_eq!(snap_cert, &cert_pem);
-            assert_eq!(snap_key, &key_pem);
-            println!("✓ Snapshot data verified");
-            println!("  - Address: {}", addr);
-            println!("  - Cert size: {} bytes", snap_cert.len());
-            println!("  - Key size: {} bytes", snap_key.len());
+            assert_eq!(snapshot_handle.as_bytes(), credential_handle.as_bytes());
         }
         _ => panic!("Expected TlsListener snapshot"),
     }
@@ -38,46 +27,37 @@ async fn test_tls_listener_snapshot_structure() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_tls_listener_snapshot_serialization() -> Result<()> {
-    use lunatic_process::resource_migration::ResourceMigrationSnapshot;
-
-    let cert_pem = generate_test_cert();
-    let key_pem = generate_test_key();
+#[test]
+fn test_tls_listener_snapshot_serialization_contains_only_opaque_handle() -> Result<()> {
+    let private_key_marker = b"private-key-material-must-never-be-serialized";
     let addr = "127.0.0.1:9443";
+    let credential_handle = TlsCredentialHandle::from_bytes([0xa5; 16]);
 
     let snapshot = ResourceSnapshot::TlsListener {
         local_addr: addr.to_string(),
-        cert_pem: cert_pem.clone(),
-        key_pem: key_pem.clone(),
+        credential_handle,
     };
 
-    // Create migration snapshot collection
     let mut migration_snapshot = ResourceMigrationSnapshot::new();
     migration_snapshot.add_tls_listener(1, snapshot);
 
-    // Serialize to bytes
     let bytes = migration_snapshot.to_bytes()?;
     assert!(!bytes.is_empty());
-    println!("✓ Serialized TLS snapshot to {} bytes", bytes.len());
+    assert!(!bytes
+        .windows(private_key_marker.len())
+        .any(|window| window == private_key_marker));
 
-    // Deserialize
     let restored_migration = ResourceMigrationSnapshot::from_bytes(&bytes)?;
     assert_eq!(restored_migration.tls_listeners.len(), 1);
-    println!("✓ Deserialized TLS snapshot successfully");
 
-    // Verify content
     let restored_snapshot = restored_migration.tls_listeners.get(&1).unwrap();
     match restored_snapshot {
         ResourceSnapshot::TlsListener {
             local_addr,
-            cert_pem: restored_cert,
-            key_pem: restored_key,
+            credential_handle: restored_handle,
         } => {
             assert_eq!(local_addr, addr);
-            assert_eq!(restored_cert, &cert_pem);
-            assert_eq!(restored_key, &key_pem);
-            println!("✓ TLS listener data preserved: {}", local_addr);
+            assert_eq!(restored_handle.as_bytes(), credential_handle.as_bytes());
         }
         _ => panic!("Expected TlsListener snapshot"),
     }
@@ -105,25 +85,4 @@ fn serialized_tls_stream_state_can_be_marked_non_migratable() {
         }
         _ => panic!("Expected NonMigratable snapshot"),
     }
-}
-
-// Helper functions to generate test certificates
-fn generate_test_cert() -> Vec<u8> {
-    // This is a minimal self-signed certificate for testing
-    // In production, use proper certificate generation
-    vec![
-        0x30, 0x82, 0x01,
-        0x0a, // SEQUENCE header (certificate structure)
-             // ... simplified test cert data
-    ]
-}
-
-fn generate_test_key() -> Vec<u8> {
-    // This is a minimal private key for testing
-    // In production, use proper key generation
-    vec![
-        0x30, 0x82, 0x01,
-        0x3a, // SEQUENCE header (private key structure)
-             // ... simplified test key data
-    ]
 }

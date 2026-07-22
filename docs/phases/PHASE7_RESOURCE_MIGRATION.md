@@ -1,10 +1,20 @@
-# Phase 7: Resource Migration Infrastructure - COMPLETE
+# Phase 7: Resource Migration Infrastructure (historical report)
 
 **Date**: October 5, 2025
 **Branch**: feature/phase4-state-preservation
-**Status**: Infrastructure complete, application-level implementation pattern documented
+**Status**: Historical phase status; current claims are governed by `docs/core_values/status.md`
 
-> **UPDATE (October 6, 2025)**: TLS listener migration has been **fully implemented** beyond the original infrastructure-only scope. See `feature/tls-resource-migration-complete` branch and `tests/tls_resource_migration.rs` for complete implementation including certificate/key preservation during hot reload.
+> **SECURITY CORRECTION (July 22, 2026)**: The October 6, 2025 claim that serialized
+> TLS listener migration preserved certificate/key bytes is obsolete. Version-2
+> `ResourceMigrationSnapshot` listener entries contain only the local address and an opaque
+> 128-bit credential-provider handle; they never contain a certificate or raw private key.
+> Production in-process hot reload moves the live listener and rustls acceptor without
+> serialization. See [TLS listener credentials](../tls/TLS_LISTENER_CREDENTIALS.md) and
+> [TLS stream migration](../tls/TLS_STREAM_MIGRATION.md).
+
+Unversioned and unknown-version snapshots are rejected. There is no automatic legacy importer.
+Operators upgrading from the old unversioned format must purge old copies and backups, rotate or
+revoke any key that may have appeared in them, and securely reprovision fresh version-2 handles.
 
 ---
 
@@ -25,19 +35,21 @@ This approach follows the "simplicity scales" principle: provide the mechanism, 
 
 ### 1. ResourceMigrationSnapshot (`crates/lunatic-process/src/resource_migration.rs`)
 
-**Core Data Structure**:
+**Current core data structure (abridged)**:
 ```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResourceSnapshot {
     TcpConnection { peer_addr: String, local_addr: String },
     TcpListener { local_addr: String },
-    TlsConnection { peer_addr: String, local_addr: String },
-    TlsListener { local_addr: String },
+    TlsClientConnectionMetadata { /* descriptive fields only */ },
+    TlsServerConnectionMetadata { /* descriptive fields only */ },
+    TlsListener {
+        local_addr: String,
+        credential_handle: TlsCredentialHandle, // opaque [u8; 16]
+    },
     UdpSocket { local_addr: String },
     NonMigratable { resource_type: String, reason: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ResourceMigrationSnapshot {
     pub tcp_listeners: HashMap<u64, ResourceSnapshot>,
     pub tcp_streams: HashMap<u64, ResourceSnapshot>,
@@ -48,10 +60,14 @@ pub struct ResourceMigrationSnapshot {
 ```
 
 **Features**:
-- Serializable (bincode) for storage/transfer
+- Versioned (`LUNRSNP\0` plus version `2`) bincode payload for storage/transfer
 - Type-safe resource identification
 - Extensible for new resource types
 - Count and empty checks
+- TLS listener snapshots contain an address and scoped provider handle, not certificate/private-key
+  bytes
+- Active TLS stream entries are descriptive metadata and cannot recreate the byte stream
+- Unversioned, missing-version, and unknown-version payloads fail closed
 
 **Example Usage**:
 ```rust
@@ -71,6 +87,11 @@ let bytes = snapshot.to_bytes()?;
 // Deserialize
 let restored = ResourceMigrationSnapshot::from_bytes(&bytes)?;
 ```
+
+The default listener credential provider is process-local, five-minute, and single-use. Persisted
+or restart restoration requires an explicitly injected provider that can securely reprovision the
+same handle and `(environment_id, process_id)` scope. Because lookup consumes a handle before bind
+completion, every retry requires a fresh snapshot or freshly provisioned handles.
 
 ---
 
@@ -384,7 +405,21 @@ fn test_resource_snapshot_serialization() {
 }
 ```
 
-**Result**: ✅ 2 tests pass
+**Current targeted evidence**:
+
+```bash
+cargo test -p lunatic-process --lib test_resource_snapshot_serialization
+cargo test -p lunatic-process --lib legacy_unversioned_snapshot_is_rejected_without_echoing_secret_bytes
+cargo test -p lunatic-process --lib unknown_and_truncated_versions_are_rejected_without_payload_details
+cargo test -p lunatic-runtime --test tls_resource_migration
+cargo test -p lunatic-runtime --lib state::tests::serialized_tls_listener_reinjects_without_private_key_bytes
+cargo test -p lunatic-runtime --lib state::tests::hot_reload_transfers_live_tls_listener_without_provider_lookup
+cargo test -p lunatic-runtime --test capability_attenuation tcp_dns_and_tls_host_paths_emit_typed_terminal_events_once
+```
+
+These tests separate versioned serialization, fail-closed legacy rejection, provider-backed
+listener rebind, production live-object transfer, const guest-input preservation, and temporary
+host key-copy zeroization. They do not make active serialized TLS streams restorable.
 
 ### Integration Pattern (Application Responsibility)
 
@@ -609,12 +644,23 @@ Decide what happens if migration fails:
 
 ### ✅ Security Through Isolation
 
-**Maintained**: Resource snapshots contain metadata only  
-**No leaks**: Old resources explicitly closed
+**Listener snapshots**: Version 2 stores only a local address and an opaque provider handle, not a
+certificate or raw private key. Provider lookup is scoped to environment and process identity.
+
+**Live reload**: Ownership of the configured listener/acceptor moves in-process; it is not
+serialized or rebuilt.
+
+**Guest ABI boundary**: `tls_bind` preserves the const guest key-input range required by SDK
+multi-address fallback and zeroizes its temporary host PEM byte copy. The original guest buffer and
+duplicates elsewhere can remain in Wasm memory, and distributed credential delivery is outside
+this snapshot contract. Total avoidance of raw key bytes in Wasm needs a future provider-handle
+guest ABI.
 
 ### ✅ Fault Tolerance & HA
 
-**Improved**: Applications can maintain connections across reloads  
+**Improved**: In-process live transfer can maintain supported listeners and connections across
+reloads.
+
 **Flexible**: Choose availability vs consistency per resource
 
 ### ✅ Erlang-Inspired
@@ -625,6 +671,9 @@ Decide what happens if migration fails:
 ---
 
 ## Compliance Score Update
+
+The numeric values below are retained as the 2025 report's historical self-assessment. They are not
+the current repository score or acceptance status; `docs/core_values/status.md` supersedes them.
 
 **Before Phase 7**: 78/100
 
@@ -658,12 +707,17 @@ Phase 7 delivers **practical resource migration** by:
 
 **Key Insight**: Automatic migration is a false goal. Applications know their requirements best. Our job is to provide the tools, not dictate the policy.
 
-**Result**: Resource migration is now **possible and practical** for hot reload scenarios.
+**Current result boundary**: Production process-local reload transfers supported live resources.
+Version-2 serialized snapshots can rebind TLS listeners only through scoped, single-use provider
+handles; they cannot restore active TLS streams.
 
 **Next**: Phase 8 (Observability) for production debugging capabilities.
 
 ---
 
-**Status**: ✅ Phase 7 Complete  
-**Production Ready**: Yes (with application-level implementation)  
-**Erlang Parity**: Achieved (application-level migration, like Erlang)
+**Historical status**: Phase 7 infrastructure report complete
+
+**Current production status**: See `docs/core_values/status.md`
+
+**Current TLS contracts**: See `docs/tls/TLS_LISTENER_CREDENTIALS.md` and
+`docs/tls/TLS_STREAM_MIGRATION.md`

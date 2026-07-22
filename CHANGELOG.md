@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- TLS listener resource snapshots use a version-2 address-plus-opaque-handle contract. The
+  `ResourceSnapshot::TlsListener` fields changed, and `ResourceMigrationSnapshot` must now be
+  encoded and decoded through `to_bytes`/`from_bytes` instead of blanket serde implementations.
+- `lunatic-networking-api::TlsListener` now owns a configured `TlsAcceptor` instead of exposing
+  certificate and private-key fields.
+
+These public Rust API and wire-contract changes require the next published Lunatic line to be
+`0.14.0` or another explicitly semver-breaking release; they must not ship as a `0.13.x` patch.
+
 ### Added
 
 - Hot reload Phase 4: True Erlang-style hot code reloading

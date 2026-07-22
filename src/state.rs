@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::fmt::Debug;
 use std::net::SocketAddr;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -16,8 +16,8 @@ use lunatic_distributed::{
 };
 use lunatic_error_api::{ErrorCtx, ErrorResource};
 use lunatic_networking_api::{
-    DnsIterator, DnsIteratorQuota, NetworkHandleQuota, NetworkingCtx, TcpConnection, TlsConnection,
-    TlsListener,
+    DnsIterator, DnsIteratorQuota, NetworkHandleLease, NetworkHandleQuota, NetworkingCtx,
+    TcpConnection, TlsConnection, TlsListener,
 };
 use lunatic_process::env::{Environment, LunaticEnvironment};
 use lunatic_process::runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime};
@@ -36,12 +36,31 @@ use lunatic_wasi_api::{build_wasi_with_audit, LunaticWasiCtx};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use wasi_common::WasiCtx;
 use wasmtime::{Linker, ResourceLimiter};
 
-use crate::DefaultProcessConfig;
+use crate::{
+    tls_credentials::{
+        EphemeralTlsCredentialProvider, TlsCredentialMaterial, TlsCredentialProvider,
+        TlsCredentialScope,
+    },
+    DefaultProcessConfig,
+};
 use log::warn;
+
+fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    catch_unwind(AssertUnwindSafe(|| TcpListener::from_std(listener)))
+        .map_err(|_| std::io::Error::other("Tokio I/O driver is unavailable"))?
+}
+
+fn bind_udp_socket(addr: SocketAddr) -> std::io::Result<UdpSocket> {
+    let socket = std::net::UdpSocket::bind(addr)?;
+    socket.set_nonblocking(true)?;
+    catch_unwind(AssertUnwindSafe(|| UdpSocket::from_std(socket)))
+        .map_err(|_| std::io::Error::other("Tokio I/O driver is unavailable"))?
+}
 
 #[derive(Debug, Default)]
 pub struct DbResources {
@@ -296,6 +315,8 @@ pub struct DefaultProcessState {
     registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
     // Resource usage stats (Phase 3)
     resource_stats: Arc<ResourceStats>,
+    // Host-owned TLS identities used only by serialized listener restoration.
+    tls_credential_provider: Arc<dyn TlsCredentialProvider>,
 }
 
 impl DefaultProcessState {
@@ -342,6 +363,10 @@ impl DefaultProcessState {
             + self.resources.udp_sockets.len()
     }
 
+    fn tls_credential_scope(&self) -> TlsCredentialScope {
+        TlsCredentialScope::new(self.environment.id(), self.id)
+    }
+
     pub fn new(
         environment: Arc<LunaticEnvironment>,
         distributed: Option<DistributedProcessState>,
@@ -349,6 +374,31 @@ impl DefaultProcessState {
         module: Arc<WasmtimeCompiledModule<Self>>,
         config: Arc<DefaultProcessConfig>,
         registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
+    ) -> Result<Self> {
+        Self::new_with_tls_credential_provider(
+            environment,
+            distributed,
+            runtime,
+            module,
+            config,
+            registry,
+            Arc::new(EphemeralTlsCredentialProvider::default()),
+        )
+    }
+
+    /// Creates process state with an explicitly managed TLS credential provider.
+    ///
+    /// The default constructor uses a short-lived process-local provider. A
+    /// caller that persists resource snapshots across runtime restarts must
+    /// inject a provider that can securely re-provision scoped handles.
+    pub fn new_with_tls_credential_provider(
+        environment: Arc<LunaticEnvironment>,
+        distributed: Option<DistributedProcessState>,
+        runtime: WasmtimeRuntime,
+        module: Arc<WasmtimeCompiledModule<Self>>,
+        config: Arc<DefaultProcessConfig>,
+        registry: Arc<RwLock<HashMap<String, (u64, u64)>>>,
+        tls_credential_provider: Arc<dyn TlsCredentialProvider>,
     ) -> Result<Self> {
         config
             .validate_runtime_limits()
@@ -402,6 +452,7 @@ impl DefaultProcessState {
                 config.get_max_file_descriptors(),
                 config.get_max_network_connections(),
             )),
+            tls_credential_provider,
         };
         Ok(state)
     }
@@ -467,6 +518,7 @@ impl ProcessState for DefaultProcessState {
                 config.get_max_file_descriptors(),
                 config.get_max_network_connections(),
             )),
+            tls_credential_provider: self.tls_credential_provider.clone(),
         };
         Ok(state)
     }
@@ -514,6 +566,7 @@ impl ProcessState for DefaultProcessState {
                 config.get_max_file_descriptors(),
                 config.get_max_network_connections(),
             )),
+            tls_credential_provider: self.tls_credential_provider.clone(),
         })
     }
 
@@ -703,14 +756,22 @@ impl ProcessState for DefaultProcessState {
 
         for (id, listener) in self.resources.tls_listeners.iter() {
             match listener.listener.local_addr() {
-                Ok(addr) => snapshot.add_tls_listener(
-                    *id,
-                    ResourceSnapshot::TlsListener {
-                        local_addr: addr.to_string(),
-                        cert_pem: listener.certs.as_ref().to_vec(),
-                        key_pem: listener.keys.secret_der().to_vec(),
-                    },
-                ),
+                Ok(addr) => {
+                    let credential_handle = self
+                        .tls_credential_provider
+                        .provision(
+                            self.tls_credential_scope(),
+                            TlsCredentialMaterial::new(listener.acceptor.clone()),
+                        )
+                        .map_err(anyhow::Error::new)?;
+                    snapshot.add_tls_listener(
+                        *id,
+                        ResourceSnapshot::TlsListener {
+                            local_addr: addr.to_string(),
+                            credential_handle,
+                        },
+                    );
+                }
                 Err(err) => snapshot.add_tls_listener(
                     *id,
                     ResourceSnapshot::NonMigratable {
@@ -799,20 +860,22 @@ impl ProcessState for DefaultProcessState {
                     "serialized TLS server stream restoration is unsupported \
                      (resource {id}): reason redacted"
                 ),
-                other => anyhow::bail!(
+                _ => anyhow::bail!(
                     "serialized TLS stream restoration is unsupported \
-                     (resource {id}, snapshot {other:?})"
+                     (resource {id}, snapshot type redacted)"
                 ),
             }
         }
 
-        let handle = match Handle::try_current() {
-            Ok(handle) => handle,
-            Err(_) => {
-                warn!("Skipping resource restoration: no active Tokio runtime available");
-                return Ok(());
-            }
-        };
+        let (_, target_network_connections) = self.resource_stats.counts();
+        anyhow::ensure!(
+            self.live_network_handle_count() == 0 && target_network_connections == 0,
+            "resource snapshot restore target already owns network resources"
+        );
+
+        Handle::try_current().map_err(|_| {
+            anyhow::anyhow!("resource restoration requires an active Tokio runtime")
+        })?;
 
         let ResourceMigrationSnapshot {
             tcp_listeners,
@@ -824,37 +887,64 @@ impl ProcessState for DefaultProcessState {
 
         let mut restored = 0usize;
 
+        // Resolve, authorize, and bind every TLS listener before mutating any
+        // resource table. The RAII leases and bound sockets in this temporary
+        // vector are discarded if any later TLS preflight step fails.
+        let mut prepared_tls_listeners: Vec<(TlsListener, NetworkHandleLease)> =
+            Vec::with_capacity(tls_listeners.len());
+        for (_id, entry) in tls_listeners.into_iter() {
+            let ResourceSnapshot::TlsListener {
+                local_addr,
+                credential_handle,
+            } = entry
+            else {
+                anyhow::bail!("TLS listener snapshot entry is invalid");
+            };
+            let addr = local_addr
+                .parse::<SocketAddr>()
+                .map_err(|_| anyhow::anyhow!("TLS listener snapshot address is invalid"))?;
+            let material = self
+                .tls_credential_provider
+                .take(self.tls_credential_scope(), &credential_handle)
+                .map_err(anyhow::Error::new)?;
+            let lease = self
+                .reserve_network_handle_lease()
+                .map_err(|_| anyhow::anyhow!("TLS listener restore exceeds network limits"))?;
+            let listener = bind_tcp_listener(addr)
+                .map_err(|_| anyhow::anyhow!("TLS listener rebind failed"))?;
+            prepared_tls_listeners.push((
+                TlsListener {
+                    listener,
+                    acceptor: material.into_acceptor(),
+                },
+                lease,
+            ));
+        }
+
         for (_id, entry) in tcp_listeners.into_iter() {
             match entry {
                 ResourceSnapshot::TcpListener { local_addr } => {
                     match local_addr.parse::<SocketAddr>() {
                         Ok(addr) => match self.reserve_network_handle_lease() {
-                            Ok(lease) => match handle.block_on(TcpListener::bind(addr)) {
+                            Ok(lease) => match bind_tcp_listener(addr) {
                                 Ok(listener) => {
                                     self.resources.tcp_listeners.add(listener);
                                     lease.into_table_reservation();
                                     restored += 1;
                                 }
                                 Err(err) => warn!(
-                                    "Failed to rebind TCP listener at {} during hot reload: {}",
-                                    local_addr, err
+                                    "Failed to rebind TCP listener during hot reload: {}",
+                                    err
                                 ),
                             },
-                            Err(err) => warn!(
-                                "TCP listener at {} exceeds restored network limits: {}",
-                                local_addr, err
-                            ),
+                            Err(err) => {
+                                warn!("TCP listener exceeds restored network limits: {}", err)
+                            }
                         },
-                        Err(err) => warn!(
-                            "Invalid TCP listener address '{}' in snapshot: {}",
-                            local_addr, err
-                        ),
+                        Err(err) => warn!("Invalid TCP listener address in snapshot: {}", err),
                     }
                 }
-                other => warn!(
-                    "Unexpected snapshot entry for TCP listener ignored: {:?}",
-                    other
-                ),
+                _ => warn!("Unexpected snapshot entry for TCP listener ignored"),
             }
         }
 
@@ -863,86 +953,31 @@ impl ProcessState for DefaultProcessState {
                 ResourceSnapshot::UdpSocket { local_addr } => {
                     match local_addr.parse::<SocketAddr>() {
                         Ok(addr) => match self.reserve_network_handle_lease() {
-                            Ok(lease) => match handle.block_on(UdpSocket::bind(addr)) {
+                            Ok(lease) => match bind_udp_socket(addr) {
                                 Ok(socket) => {
                                     self.resources.udp_sockets.add(Arc::new(socket));
                                     lease.into_table_reservation();
                                     restored += 1;
                                 }
-                                Err(err) => warn!(
-                                    "Failed to rebind UDP socket at {} during hot reload: {}",
-                                    local_addr, err
-                                ),
+                                Err(err) => {
+                                    warn!("Failed to rebind UDP socket during hot reload: {}", err)
+                                }
                             },
-                            Err(err) => warn!(
-                                "UDP socket at {} exceeds restored network limits: {}",
-                                local_addr, err
-                            ),
+                            Err(err) => {
+                                warn!("UDP socket exceeds restored network limits: {}", err)
+                            }
                         },
-                        Err(err) => warn!(
-                            "Invalid UDP socket address '{}' in snapshot: {}",
-                            local_addr, err
-                        ),
+                        Err(err) => warn!("Invalid UDP socket address in snapshot: {}", err),
                     }
                 }
-                other => warn!(
-                    "Unexpected snapshot entry for UDP socket ignored: {:?}",
-                    other
-                ),
+                _ => warn!("Unexpected snapshot entry for UDP socket ignored"),
             }
         }
 
-        for (_id, entry) in tls_listeners.into_iter() {
-            match entry {
-                ResourceSnapshot::TlsListener {
-                    local_addr,
-                    cert_pem,
-                    key_pem,
-                } => {
-                    let key = match PrivateKeyDer::try_from(key_pem) {
-                        Ok(key) => key,
-                        Err(err) => {
-                            warn!(
-                                "Invalid TLS private key for listener '{}' in snapshot: {}",
-                                local_addr, err
-                            );
-                            continue;
-                        }
-                    };
-
-                    match local_addr.parse::<SocketAddr>() {
-                        Ok(addr) => match self.reserve_network_handle_lease() {
-                            Ok(lease) => match handle.block_on(TcpListener::bind(addr)) {
-                                Ok(listener) => {
-                                    self.resources.tls_listeners.add(TlsListener {
-                                        listener,
-                                        certs: CertificateDer::from(cert_pem),
-                                        keys: key,
-                                    });
-                                    lease.into_table_reservation();
-                                    restored += 1;
-                                }
-                                Err(err) => warn!(
-                                    "Failed to rebind TLS listener at {} during hot reload: {}",
-                                    local_addr, err
-                                ),
-                            },
-                            Err(err) => warn!(
-                                "TLS listener at {} exceeds restored network limits: {}",
-                                local_addr, err
-                            ),
-                        },
-                        Err(err) => warn!(
-                            "Invalid TLS listener address '{}' in snapshot: {}",
-                            local_addr, err
-                        ),
-                    }
-                }
-                other => warn!(
-                    "Unexpected snapshot entry for TLS listener ignored: {:?}",
-                    other
-                ),
-            }
+        for (listener, lease) in prepared_tls_listeners {
+            self.resources.tls_listeners.add(listener);
+            lease.into_table_reservation();
+            restored += 1;
         }
 
         debug_assert!(tls_streams.is_empty());
@@ -1325,6 +1360,7 @@ impl DistributedCtx<LunaticEnvironment> for DefaultProcessState {
                 config.get_max_file_descriptors(),
                 config.get_max_network_connections(),
             )),
+            tls_credential_provider: Arc::new(EphemeralTlsCredentialProvider::default()),
         };
         Ok(state)
     }
@@ -1360,7 +1396,133 @@ impl lunatic_process::reloadable_state::ReloadableState for DefaultProcessState 
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, convert::TryFrom, sync::Arc, time::Duration};
+    use std::{
+        collections::HashMap,
+        convert::TryFrom,
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    use crate::tls_credentials::{
+        EphemeralTlsCredentialProvider, TlsCredentialMaterial, TlsCredentialProvider,
+        TlsCredentialProviderError, TlsCredentialScope,
+    };
+    use lunatic_process::{
+        resource_migration::{ResourceMigrationSnapshot, ResourceSnapshot, TlsCredentialHandle},
+        runtimes::wasmtime::{WasmtimeCompiledModule, WasmtimeRuntime},
+    };
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    fn test_state_with_tls_provider(
+        provider: Arc<dyn TlsCredentialProvider>,
+    ) -> anyhow::Result<(
+        super::DefaultProcessState,
+        Arc<WasmtimeCompiledModule<super::DefaultProcessState>>,
+        Arc<crate::DefaultProcessConfig>,
+    )> {
+        use lunatic_process::env::LunaticEnvironment;
+        use tokio::sync::RwLock;
+
+        let runtime = WasmtimeRuntime::new(&lunatic_process::runtimes::wasmtime::default_config())?;
+        let module =
+            Arc::new(runtime.compile_module(
+                wat::parse_str(r#"(module (memory (export "memory") 1))"#)?.into(),
+            )?);
+        let mut config = crate::DefaultProcessConfig::default();
+        config.set_max_file_descriptors(8);
+        config.set_max_network_connections(8);
+        let config = Arc::new(config);
+        let state = super::DefaultProcessState::new_with_tls_credential_provider(
+            Arc::new(LunaticEnvironment::new(73)),
+            None,
+            runtime,
+            module.clone(),
+            config.clone(),
+            Arc::new(RwLock::new(HashMap::new())),
+            provider,
+        )?;
+        Ok((state, module, config))
+    }
+
+    fn test_tls_identity() -> anyhow::Result<(TlsAcceptor, TlsConnector, Vec<u8>, Vec<u8>)> {
+        use lunatic_distributed::{control::cert, distributed::server::gen_node_cert};
+        use tokio_rustls::rustls::{
+            pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer},
+            ClientConfig, RootCertStore, ServerConfig,
+        };
+
+        let root = cert::test_root_cert()?;
+        let server_cert = gen_node_cert("localhost")?;
+        let server_cert_pem = server_cert.serialize_pem_with_signer(&root)?;
+        let server_key_pem = server_cert.serialize_private_key_pem();
+        let server_cert_der = CertificateDer::from_pem_slice(server_cert_pem.as_bytes())?;
+        let server_key_der = PrivateKeyDer::from_pem_slice(server_key_pem.as_bytes())?;
+        let key_der = server_key_der.secret_der().to_vec();
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![server_cert_der], server_key_der)?;
+
+        let mut root_store = RootCertStore::empty();
+        root_store.add(CertificateDer::from_pem_slice(
+            root.certificate_pem().as_bytes(),
+        )?)?;
+        let client_config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+
+        Ok((
+            TlsAcceptor::from(Arc::new(server_config)),
+            TlsConnector::from(Arc::new(client_config)),
+            key_der,
+            server_key_pem.into_bytes(),
+        ))
+    }
+
+    struct FailingTlsCredentialProvider;
+
+    impl TlsCredentialProvider for FailingTlsCredentialProvider {
+        fn provision(
+            &self,
+            _scope: TlsCredentialScope,
+            _material: TlsCredentialMaterial,
+        ) -> Result<TlsCredentialHandle, TlsCredentialProviderError> {
+            Err(TlsCredentialProviderError::ProviderFailure)
+        }
+
+        fn take(
+            &self,
+            _scope: TlsCredentialScope,
+            _handle: &TlsCredentialHandle,
+        ) -> Result<TlsCredentialMaterial, TlsCredentialProviderError> {
+            Err(TlsCredentialProviderError::ProviderFailure)
+        }
+    }
+
+    struct FailAfterOneTlsCredentialProvider {
+        material: Mutex<Option<TlsCredentialMaterial>>,
+    }
+
+    impl TlsCredentialProvider for FailAfterOneTlsCredentialProvider {
+        fn provision(
+            &self,
+            _scope: TlsCredentialScope,
+            _material: TlsCredentialMaterial,
+        ) -> Result<TlsCredentialHandle, TlsCredentialProviderError> {
+            Err(TlsCredentialProviderError::ProviderFailure)
+        }
+
+        fn take(
+            &self,
+            _scope: TlsCredentialScope,
+            _handle: &TlsCredentialHandle,
+        ) -> Result<TlsCredentialMaterial, TlsCredentialProviderError> {
+            self.material
+                .lock()
+                .map_err(|_| TlsCredentialProviderError::ProviderFailure)?
+                .take()
+                .ok_or(TlsCredentialProviderError::ProviderFailure)
+        }
+    }
 
     #[tokio::test]
     async fn import_filter_signature_matches() {
@@ -1541,6 +1703,333 @@ mod tests {
                 .expect("transferred DNS iterator ID is preserved"),
         );
         assert_eq!(replacement.dns_iterator_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hot_reload_transfers_live_tls_listener_without_provider_lookup() -> anyhow::Result<()>
+    {
+        use lunatic_networking_api::TlsListener;
+        use lunatic_process::state::ProcessState;
+        use tokio::net::TcpListener;
+
+        let provider = Arc::new(FailingTlsCredentialProvider);
+        let (mut source, module, config) = test_state_with_tls_provider(provider)?;
+        let (acceptor, _connector, _key_der, _key_pem) = test_tls_identity()?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+        let listener_id = source
+            .resources
+            .tls_listeners
+            .add(TlsListener { listener, acceptor });
+        source.reserve_network_handle()?;
+
+        let mut replacement = source.new_state_for_reload(module, config)?;
+        let report = source.transfer_runtime_resources_to(&mut replacement)?;
+
+        assert_eq!(report.tls_listeners, 1);
+        assert!(source.resources.tls_listeners.is_empty());
+        let transferred = replacement
+            .resources
+            .tls_listeners
+            .get(listener_id)
+            .expect("live listener ID is preserved");
+        assert_eq!(transferred.listener.local_addr()?, local_addr);
+        drop(
+            replacement
+                .resources
+                .tls_listeners
+                .remove(listener_id)
+                .expect("transferred listener remains removable"),
+        );
+        replacement.release_network_handle()?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serialized_tls_listener_reinjects_without_private_key_bytes() -> anyhow::Result<()> {
+        use lunatic_networking_api::TlsListener;
+        use lunatic_process::state::ProcessState;
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::{TcpListener, TcpStream},
+            time::timeout,
+        };
+        use tokio_rustls::rustls::pki_types::ServerName;
+
+        let provider = Arc::new(EphemeralTlsCredentialProvider::default());
+        let (mut source, module, config) = test_state_with_tls_provider(provider)?;
+        let (acceptor, connector, private_key_der, private_key_pem) = test_tls_identity()?;
+        anyhow::ensure!(
+            private_key_der.len() >= 40,
+            "test private key is unexpectedly short"
+        );
+        let private_key_marker = &private_key_der[8..40];
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let local_addr = listener.local_addr()?;
+        let source_listener_id = source
+            .resources
+            .tls_listeners
+            .add(TlsListener { listener, acceptor });
+        source.reserve_network_handle()?;
+
+        let snapshot = source
+            .capture_resource_snapshot()?
+            .expect("a TLS listener produces a resource snapshot");
+        let bytes = snapshot.to_bytes()?;
+        assert!(!bytes
+            .windows(private_key_marker.len())
+            .any(|window| window == private_key_marker));
+        assert!(!bytes
+            .windows(private_key_pem.len())
+            .any(|window| window == private_key_pem));
+        let debug = format!("{snapshot:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(&local_addr.to_string()));
+
+        let decoded = ResourceMigrationSnapshot::from_bytes(&bytes)?;
+        let replay = decoded.clone();
+        drop(
+            source
+                .resources
+                .tls_listeners
+                .remove(source_listener_id)
+                .expect("source listener remains present until snapshot capture completes"),
+        );
+        source.release_network_handle()?;
+
+        let mut replacement = source.new_state_for_reload(module.clone(), config.clone())?;
+        replacement.restore_resource_snapshot(decoded)?;
+        assert_eq!(replacement.resources.tls_listeners.len(), 1);
+        assert_eq!(replacement.network_resource_counts(), (1, 1));
+
+        let mut replay_target = source.new_state_for_reload(module, config)?;
+        let replay_error = replay_target
+            .restore_resource_snapshot(replay)
+            .expect_err("credential handles are single-use");
+        assert_eq!(
+            replay_error.to_string(),
+            "TLS listener credential is unavailable"
+        );
+        assert!(replay_target.resources.tls_listeners.is_empty());
+        assert_eq!(replay_target.network_resource_counts(), (0, 0));
+
+        let restored_listener_id = *replacement
+            .resources
+            .tls_listeners
+            .iter()
+            .next()
+            .expect("restored listener exists")
+            .0;
+        let restored = replacement
+            .resources
+            .tls_listeners
+            .remove(restored_listener_id)
+            .expect("restored listener remains removable");
+        replacement.release_network_handle()?;
+
+        let server_task = tokio::spawn(async move {
+            let (tcp_stream, _) = restored.listener.accept().await?;
+            let mut tls_stream = restored.acceptor.accept(tcp_stream).await?;
+            let mut request = [0_u8; 4];
+            tls_stream.read_exact(&mut request).await?;
+            anyhow::ensure!(&request == b"ping", "unexpected TLS test payload");
+            tls_stream.write_all(b"pong").await?;
+            tls_stream.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let tcp_stream = TcpStream::connect(local_addr).await?;
+        let domain = ServerName::try_from("localhost".to_string())?;
+        let mut tls_stream = connector.connect(domain, tcp_stream).await?;
+        tls_stream.write_all(b"ping").await?;
+        let mut response = [0_u8; 4];
+        tls_stream.read_exact(&mut response).await?;
+        assert_eq!(&response, b"pong");
+        let server_result = timeout(Duration::from_secs(5), server_task).await??;
+        server_result?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_tls_credential_fails_before_any_resource_mutation() -> anyhow::Result<()> {
+        use lunatic_process::state::ProcessState;
+
+        let provider = Arc::new(EphemeralTlsCredentialProvider::default());
+        let (mut state, _module, _config) = test_state_with_tls_provider(provider)?;
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        snapshot.add_tcp_listener(
+            1,
+            ResourceSnapshot::TcpListener {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+        snapshot.add_udp_socket(
+            2,
+            ResourceSnapshot::UdpSocket {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+        snapshot.add_tls_listener(
+            3,
+            ResourceSnapshot::TlsListener {
+                local_addr: "127.0.0.1:0".into(),
+                credential_handle: TlsCredentialHandle::from_bytes([0x5a; 16]),
+            },
+        );
+
+        let error = state
+            .restore_resource_snapshot(snapshot)
+            .expect_err("an unknown credential must fail closed");
+        assert_eq!(error.to_string(), "TLS listener credential is unavailable");
+        assert!(state.resources.tcp_listeners.is_empty());
+        assert!(state.resources.udp_sockets.is_empty());
+        assert!(state.resources.tls_listeners.is_empty());
+        assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_tls_preflight_failure_rolls_back_prepared_listener_and_lease(
+    ) -> anyhow::Result<()> {
+        use lunatic_process::state::ProcessState;
+
+        let (acceptor, _connector, _key_der, _key_pem) = test_tls_identity()?;
+        let provider = Arc::new(FailAfterOneTlsCredentialProvider {
+            material: Mutex::new(Some(TlsCredentialMaterial::new(acceptor))),
+        });
+        let (mut state, _module, _config) = test_state_with_tls_provider(provider)?;
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        for (id, marker) in [(1, 0x11), (2, 0x22)] {
+            snapshot.add_tls_listener(
+                id,
+                ResourceSnapshot::TlsListener {
+                    local_addr: "127.0.0.1:0".into(),
+                    credential_handle: TlsCredentialHandle::from_bytes([marker; 16]),
+                },
+            );
+        }
+
+        let error = state
+            .restore_resource_snapshot(snapshot)
+            .expect_err("the second provider failure must abort the whole TLS listener set");
+        assert_eq!(error.to_string(), "TLS credential provider failed");
+        assert!(state.resources.tls_listeners.is_empty());
+        assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn expired_tls_credential_fails_closed_with_stable_error() -> anyhow::Result<()> {
+        use lunatic_process::state::ProcessState;
+
+        let provider = Arc::new(EphemeralTlsCredentialProvider::new(Duration::ZERO));
+        let (mut state, _module, _config) = test_state_with_tls_provider(provider.clone())?;
+        let (acceptor, _connector, _key_der, _key_pem) = test_tls_identity()?;
+        let handle = provider.provision(
+            state.tls_credential_scope(),
+            TlsCredentialMaterial::new(acceptor),
+        )?;
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        snapshot.add_tls_listener(
+            1,
+            ResourceSnapshot::TlsListener {
+                local_addr: "127.0.0.1:0".into(),
+                credential_handle: handle,
+            },
+        );
+
+        let error = state
+            .restore_resource_snapshot(snapshot)
+            .expect_err("an expired credential must fail closed");
+        assert_eq!(error.to_string(), "TLS listener credential has expired");
+        assert!(state.resources.tls_listeners.is_empty());
+        assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_provider_failure_is_stable_and_secret_free() -> anyhow::Result<()> {
+        use lunatic_process::state::ProcessState;
+
+        let provider = Arc::new(FailingTlsCredentialProvider);
+        let (mut state, _module, _config) = test_state_with_tls_provider(provider)?;
+        let handle = TlsCredentialHandle::from_bytes([0xa5; 16]);
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        snapshot.add_tcp_listener(
+            1,
+            ResourceSnapshot::TcpListener {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+        snapshot.add_tls_listener(
+            2,
+            ResourceSnapshot::TlsListener {
+                local_addr: "127.0.0.1:0".into(),
+                credential_handle: handle,
+            },
+        );
+
+        let error = state
+            .restore_resource_snapshot(snapshot)
+            .expect_err("provider failures must fail closed");
+        let message = error.to_string();
+        assert_eq!(message, "TLS credential provider failed");
+        assert!(!message.contains(&format!("{:?}", handle.as_bytes())));
+        assert!(!message.contains("127.0.0.1"));
+        assert!(state.resources.tcp_listeners.is_empty());
+        assert!(state.resources.tls_listeners.is_empty());
+        assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn serialized_resource_restore_without_runtime_fails_closed() -> anyhow::Result<()> {
+        use lunatic_process::state::ProcessState;
+
+        let provider = Arc::new(EphemeralTlsCredentialProvider::default());
+        let runtime = tokio::runtime::Runtime::new()?;
+        let (mut state, _module, _config) =
+            runtime.block_on(async { test_state_with_tls_provider(provider) })?;
+        drop(runtime);
+        let mut snapshot = ResourceMigrationSnapshot::new();
+        snapshot.add_tcp_listener(
+            1,
+            ResourceSnapshot::TcpListener {
+                local_addr: "127.0.0.1:0".into(),
+            },
+        );
+
+        let error = state
+            .restore_resource_snapshot(snapshot)
+            .expect_err("restore requires an active Tokio runtime");
+        assert_eq!(
+            error.to_string(),
+            "resource restoration requires an active Tokio runtime"
+        );
+        assert!(state.resources.tcp_listeners.is_empty());
+        assert_eq!(state.network_resource_counts(), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn listener_binding_without_tokio_io_driver_returns_errors() -> anyhow::Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let _guard = runtime.enter();
+        let address = "127.0.0.1:0".parse()?;
+
+        let tcp_result = std::panic::catch_unwind(|| super::bind_tcp_listener(address));
+        let tcp_error = tcp_result
+            .expect("TCP conversion panic must stay inside the binding boundary")
+            .expect_err("an I/O-disabled runtime cannot register a TCP listener");
+        assert_eq!(tcp_error.to_string(), "Tokio I/O driver is unavailable");
+
+        let udp_result = std::panic::catch_unwind(|| super::bind_udp_socket(address));
+        let udp_error = udp_result
+            .expect("UDP conversion panic must stay inside the binding boundary")
+            .expect_err("an I/O-disabled runtime cannot register a UDP socket");
+        assert_eq!(udp_error.to_string(), "Tokio I/O driver is unavailable");
         Ok(())
     }
 
@@ -1764,6 +2253,26 @@ mod tests {
             .contains("serialized TLS client stream restoration is unsupported"));
         assert!(state.resources.tcp_listeners.is_empty());
         assert!(state.resources.tls_streams.is_empty());
+
+        let mut untrusted_snapshot = ResourceMigrationSnapshot::new();
+        untrusted_snapshot.add_tls_stream(
+            13,
+            ResourceSnapshot::NonMigratable {
+                resource_type: "private-key-type-marker".into(),
+                reason: "private-key-reason-marker".into(),
+            },
+        );
+        let error = state
+            .restore_resource_snapshot(untrusted_snapshot)
+            .expect_err("an unexpected TLS stream variant must be rejected");
+        let message = error.to_string();
+        assert_eq!(
+            message,
+            "serialized TLS stream restoration is unsupported \
+             (resource 13, snapshot type redacted)"
+        );
+        assert!(!message.contains("private-key-type-marker"));
+        assert!(!message.contains("private-key-reason-marker"));
 
         Ok(())
     }

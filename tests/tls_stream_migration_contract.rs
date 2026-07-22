@@ -1,6 +1,6 @@
 use anyhow::Result;
 use lunatic_process::resource_migration::{
-    ResourceMigrationSnapshot, ResourceSnapshot, ResourceTransferReport,
+    ResourceMigrationSnapshot, ResourceSnapshot, ResourceTransferReport, TlsCredentialHandle,
 };
 
 #[test]
@@ -128,8 +128,7 @@ fn transfer_report_counts_snapshot_resources() {
         1,
         ResourceSnapshot::TlsListener {
             local_addr: "127.0.0.1:8443".to_string(),
-            cert_pem: vec![0x30, 0x82],
-            key_pem: vec![0x30, 0x82],
+            credential_handle: TlsCredentialHandle::from_bytes([0x42; 16]),
         },
     );
     snapshot.add_tls_stream(

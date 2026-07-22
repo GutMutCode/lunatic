@@ -16,6 +16,7 @@ use tokio_rustls::rustls::{
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use wasmtime::{Caller, Linker, ToWasmtimeResult as _};
+use zeroize::Zeroize;
 
 use lunatic_common_api::{
     get_memory, AuditAction, AuditEvent, AuditReason, AuditResult, AuditTargetKind, IntoTrap,
@@ -195,21 +196,15 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
             std::mem::size_of::<u64>(),
             "lunatic::networking::tls_bind",
         )?;
-        let certs = memory
+        let key_start = keys_array_ptr as usize;
+        let key_end = key_start
+            .checked_add(keys_array_len as usize)
+            .or_trap("lunatic::networking::tls_bind")?;
+        let mut key_bytes = memory
             .data(&caller)
-            .get(certs_array_ptr as usize..(certs_array_ptr + certs_array_len) as usize)
+            .get(key_start..key_end)
             .or_trap("lunatic::networking::tls_bind")?
             .to_vec();
-
-        let keys = memory
-            .data(&caller)
-            .get(keys_array_ptr as usize..(keys_array_ptr + keys_array_len) as usize)
-            .or_trap("lunatic::networking::tls_bind")?
-            .to_vec();
-        let keys = load_private_key(&keys)
-            .or_trap("lunatic::networking::tls_bind::failed to unpack the keys")?;
-        let certs = load_certs(&certs)
-            .or_trap("lunatic::networking::tls_bind::failed to unpack the certs")?;
         let socket_addr = socket_address(
             &caller,
             &memory,
@@ -218,7 +213,36 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
             port,
             flow_info,
             scope_id,
-        )?;
+        );
+
+        // The guest ABI declares this input as const and guest SDKs may reuse
+        // it while trying multiple resolved addresses. Do not mutate guest
+        // memory here; zeroize only the temporary host PEM copy. Eliminating
+        // guest key bytes requires a provider-handle ABI.
+        let key_result = load_private_key(&key_bytes);
+        key_bytes.zeroize();
+
+        let cert_start = certs_array_ptr as usize;
+        let cert_end = cert_start
+            .checked_add(certs_array_len as usize)
+            .or_trap("lunatic::networking::tls_bind")?;
+        let cert_bytes = memory
+            .data(&caller)
+            .get(cert_start..cert_end)
+            .or_trap("lunatic::networking::tls_bind")?
+            .to_vec();
+
+        let socket_addr = socket_addr?;
+        let keys =
+            key_result.or_trap("lunatic::networking::tls_bind::failed to unpack the keys")?;
+        let certs = load_certs(&cert_bytes)
+            .or_trap("lunatic::networking::tls_bind::failed to unpack the certs")?;
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certs], keys)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
+            .or_trap("lunatic::networking::tls_bind server_config")?;
+        let acceptor = TlsAcceptor::from(Arc::new(config));
         let lease = caller.data().reserve_network_handle_lease();
         let (tls_listener_or_error_id, result, audit_result, audit_reason) = match lease {
             Ok(lease) => {
@@ -234,11 +258,7 @@ fn tls_bind<T: NetworkingCtx + ErrorCtx + Send>(
                         let id = caller
                             .data_mut()
                             .tls_listener_resources_mut()
-                            .add(TlsListener {
-                                listener,
-                                keys,
-                                certs,
-                            });
+                            .add(TlsListener { listener, acceptor });
                         lease.into_table_reservation();
                         audit.set_target(redacted_network_target(
                             AuditTargetKind::TlsListener,
@@ -312,20 +332,14 @@ fn tls_accept<T: NetworkingCtx + ErrorCtx + Send>(
             AuditAction::Accept,
             redacted_network_target(AuditTargetKind::TlsListener, Some(listener_id), None),
         );
-        let (keys, certs) = {
+        let acceptor = {
             let tls_listener = caller
                 .data()
                 .tls_listener_resources()
                 .get(listener_id)
                 .or_trap("lunatic::network::tls_accept")?;
-            (tls_listener.keys.clone_key(), tls_listener.certs.clone())
+            tls_listener.acceptor.clone()
         };
-        let config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certs], keys)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
-            .or_trap("lunatic::network::tls_accept server_config")?;
-        let acceptor = TlsAcceptor::from(Arc::new(config));
         let memory = get_memory(&mut caller)?;
         validate_memory_range(
             &caller,

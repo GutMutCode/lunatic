@@ -1,6 +1,35 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use bincode::Options as _;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt};
+
+const RESOURCE_SNAPSHOT_MAGIC: [u8; 8] = *b"LUNRSNP\0";
+const RESOURCE_SNAPSHOT_VERSION: u8 = 2;
+
+/// An opaque reference to TLS listener credentials held by a host provider.
+///
+/// The handle is intentionally serializable so a resource snapshot can name
+/// credentials without containing their private-key bytes. It is only a
+/// locator: providers must additionally validate the requesting runtime scope.
+/// The value is redacted from `Debug` output as defense in depth.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TlsCredentialHandle([u8; 16]);
+
+impl TlsCredentialHandle {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for TlsCredentialHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TlsCredentialHandle([REDACTED])")
+    }
+}
 
 /// Represents a serializable resource snapshot for migration
 #[derive(Clone, Serialize, Deserialize)]
@@ -33,11 +62,13 @@ pub enum ResourceSnapshot {
         requires_peer_reconnect: bool,
         reason: String,
     },
-    /// TLS listener: store bound address and certificate info
+    /// TLS listener metadata and an opaque credential-provider reference.
+    ///
+    /// The referenced certificate and private key are never part of this
+    /// serializable value.
     TlsListener {
         local_addr: String,
-        cert_pem: Vec<u8>,
-        key_pem: Vec<u8>,
+        credential_handle: TlsCredentialHandle,
     },
     /// UDP socket: store bound address
     UdpSocket { local_addr: String },
@@ -80,16 +111,15 @@ impl fmt::Debug for ResourceSnapshot {
             Self::TlsListener { .. } => formatter
                 .debug_struct("TlsListener")
                 .field("local_addr", &"[REDACTED]")
-                .field("certificate", &"[REDACTED]")
-                .field("private_key", &"[REDACTED]")
+                .field("credential_handle", &"[REDACTED]")
                 .finish(),
             Self::UdpSocket { .. } => formatter
                 .debug_struct("UdpSocket")
                 .field("local_addr", &"[REDACTED]")
                 .finish(),
-            Self::NonMigratable { resource_type, .. } => formatter
+            Self::NonMigratable { .. } => formatter
                 .debug_struct("NonMigratable")
-                .field("resource_type", resource_type)
+                .field("resource_type", &"[REDACTED]")
                 .field("reason", &"[REDACTED]")
                 .finish(),
         }
@@ -130,13 +160,55 @@ impl ResourceTransferReport {
 }
 
 /// Collection of resource snapshots by resource ID
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ResourceMigrationSnapshot {
     pub tcp_listeners: HashMap<u64, ResourceSnapshot>,
     pub tcp_streams: HashMap<u64, ResourceSnapshot>,
     pub tls_listeners: HashMap<u64, ResourceSnapshot>,
     pub tls_streams: HashMap<u64, ResourceSnapshot>,
     pub udp_sockets: HashMap<u64, ResourceSnapshot>,
+}
+
+#[derive(Serialize)]
+struct ResourceMigrationSnapshotRef<'a> {
+    tcp_listeners: &'a HashMap<u64, ResourceSnapshot>,
+    tcp_streams: &'a HashMap<u64, ResourceSnapshot>,
+    tls_listeners: &'a HashMap<u64, ResourceSnapshot>,
+    tls_streams: &'a HashMap<u64, ResourceSnapshot>,
+    udp_sockets: &'a HashMap<u64, ResourceSnapshot>,
+}
+
+impl<'a> From<&'a ResourceMigrationSnapshot> for ResourceMigrationSnapshotRef<'a> {
+    fn from(snapshot: &'a ResourceMigrationSnapshot) -> Self {
+        Self {
+            tcp_listeners: &snapshot.tcp_listeners,
+            tcp_streams: &snapshot.tcp_streams,
+            tls_listeners: &snapshot.tls_listeners,
+            tls_streams: &snapshot.tls_streams,
+            udp_sockets: &snapshot.udp_sockets,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ResourceMigrationSnapshotWire {
+    tcp_listeners: HashMap<u64, ResourceSnapshot>,
+    tcp_streams: HashMap<u64, ResourceSnapshot>,
+    tls_listeners: HashMap<u64, ResourceSnapshot>,
+    tls_streams: HashMap<u64, ResourceSnapshot>,
+    udp_sockets: HashMap<u64, ResourceSnapshot>,
+}
+
+impl From<ResourceMigrationSnapshotWire> for ResourceMigrationSnapshot {
+    fn from(snapshot: ResourceMigrationSnapshotWire) -> Self {
+        Self {
+            tcp_listeners: snapshot.tcp_listeners,
+            tcp_streams: snapshot.tcp_streams,
+            tls_listeners: snapshot.tls_listeners,
+            tls_streams: snapshot.tls_streams,
+            udp_sockets: snapshot.udp_sockets,
+        }
+    }
 }
 
 impl ResourceMigrationSnapshot {
@@ -166,12 +238,36 @@ impl ResourceMigrationSnapshot {
 
     /// Serialize to bytes for storage
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(bincode::serialize(self)?)
+        let payload = bincode::serialize(&ResourceMigrationSnapshotRef::from(self))?;
+        let mut bytes = Vec::with_capacity(
+            RESOURCE_SNAPSHOT_MAGIC.len() + std::mem::size_of::<u8>() + payload.len(),
+        );
+        bytes.extend_from_slice(&RESOURCE_SNAPSHOT_MAGIC);
+        bytes.push(RESOURCE_SNAPSHOT_VERSION);
+        bytes.extend_from_slice(&payload);
+        Ok(bytes)
     }
 
     /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        Ok(bincode::deserialize(bytes)?)
+        if !bytes.starts_with(&RESOURCE_SNAPSHOT_MAGIC) {
+            anyhow::bail!(
+                "legacy unversioned resource snapshots are unsupported; create a fresh snapshot"
+            );
+        }
+        let Some(version) = bytes.get(RESOURCE_SNAPSHOT_MAGIC.len()) else {
+            anyhow::bail!("resource snapshot version is missing");
+        };
+        if *version != RESOURCE_SNAPSHOT_VERSION {
+            anyhow::bail!("unsupported resource snapshot version");
+        }
+
+        let wire: ResourceMigrationSnapshotWire = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .reject_trailing_bytes()
+            .deserialize(&bytes[RESOURCE_SNAPSHOT_MAGIC.len() + 1..])
+            .map_err(|_| anyhow!("resource snapshot payload is invalid"))?;
+        Ok(wire.into())
     }
 
     /// Check if there are any resources to migrate
@@ -246,19 +342,96 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_debug_redacts_addresses_certificates_and_private_keys() {
-        let certificate = b"certificate-sentinel".to_vec();
-        let private_key = b"private-key-sentinel".to_vec();
+    fn snapshot_debug_redacts_addresses_and_credential_handles() {
+        let credential_handle = TlsCredentialHandle::from_bytes([0x5a; 16]);
         let snapshot = ResourceSnapshot::TlsListener {
             local_addr: "address-sentinel".to_owned(),
-            cert_pem: certificate.clone(),
-            key_pem: private_key.clone(),
+            credential_handle,
         };
 
         let debug = format!("{snapshot:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("address-sentinel"));
-        assert!(!debug.contains(&format!("{certificate:?}")));
-        assert!(!debug.contains(&format!("{private_key:?}")));
+        assert!(!debug.contains(&format!("{:?}", credential_handle.as_bytes())));
+
+        let non_migratable = ResourceSnapshot::NonMigratable {
+            resource_type: "private-key-marker".to_owned(),
+            reason: "private-key-reason-marker".to_owned(),
+        };
+        let debug = format!("{non_migratable:?}");
+        assert!(!debug.contains("private-key-marker"));
+        assert!(!debug.contains("private-key-reason-marker"));
+    }
+
+    #[test]
+    fn legacy_unversioned_snapshot_is_rejected_without_echoing_secret_bytes() {
+        #[derive(Serialize)]
+        enum LegacyResourceSnapshot {
+            TlsListener {
+                local_addr: String,
+                cert_pem: Vec<u8>,
+                key_pem: Vec<u8>,
+            },
+        }
+
+        #[derive(Serialize)]
+        struct LegacyResourceMigrationSnapshot {
+            tcp_listeners: HashMap<u64, LegacyResourceSnapshot>,
+            tcp_streams: HashMap<u64, LegacyResourceSnapshot>,
+            tls_listeners: HashMap<u64, LegacyResourceSnapshot>,
+            tls_streams: HashMap<u64, LegacyResourceSnapshot>,
+            udp_sockets: HashMap<u64, LegacyResourceSnapshot>,
+        }
+
+        let key_marker = b"legacy-private-key-marker";
+        let legacy = LegacyResourceMigrationSnapshot {
+            tcp_listeners: HashMap::new(),
+            tcp_streams: HashMap::new(),
+            tls_listeners: HashMap::from([(
+                7,
+                LegacyResourceSnapshot::TlsListener {
+                    local_addr: "127.0.0.1:8443".to_owned(),
+                    cert_pem: b"legacy-certificate".to_vec(),
+                    key_pem: key_marker.to_vec(),
+                },
+            )]),
+            tls_streams: HashMap::new(),
+            udp_sockets: HashMap::new(),
+        };
+        let bytes = bincode::serialize(&legacy).unwrap();
+        assert!(bytes
+            .windows(key_marker.len())
+            .any(|window| window == key_marker));
+
+        let error = ResourceMigrationSnapshot::from_bytes(&bytes).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("legacy unversioned resource snapshots are unsupported"));
+        assert!(!message.contains("legacy-private-key-marker"));
+    }
+
+    #[test]
+    fn unknown_and_truncated_versions_are_rejected_without_payload_details() {
+        let marker = b"private-key-marker";
+        let mut unknown = RESOURCE_SNAPSHOT_MAGIC.to_vec();
+        unknown.push(RESOURCE_SNAPSHOT_VERSION + 1);
+        unknown.extend_from_slice(marker);
+
+        let error = ResourceMigrationSnapshot::from_bytes(&unknown).unwrap_err();
+        assert_eq!(error.to_string(), "unsupported resource snapshot version");
+        assert!(!error.to_string().contains("private-key-marker"));
+
+        let error = ResourceMigrationSnapshot::from_bytes(&RESOURCE_SNAPSHOT_MAGIC).unwrap_err();
+        assert_eq!(error.to_string(), "resource snapshot version is missing");
+    }
+
+    #[test]
+    fn trailing_payload_is_rejected_without_echoing_secret_bytes() {
+        let marker = b"appended-private-key-marker";
+        let mut bytes = ResourceMigrationSnapshot::new().to_bytes().unwrap();
+        bytes.extend_from_slice(marker);
+
+        let error = ResourceMigrationSnapshot::from_bytes(&bytes).unwrap_err();
+        assert_eq!(error.to_string(), "resource snapshot payload is invalid");
+        assert!(!error.to_string().contains("appended-private-key-marker"));
     }
 }

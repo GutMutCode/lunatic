@@ -43,6 +43,7 @@ provided by Lunatic.
 mod config;
 pub mod hot_reload;
 pub mod state;
+pub mod tls_credentials;
 
 pub use config::DefaultProcessConfig;
 pub use lunatic_process::{Finished, Process, Signal, WasmProcess};

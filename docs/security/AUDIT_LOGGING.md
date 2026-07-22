@@ -83,6 +83,16 @@ The event schema never accepts:
 
 Related runtime `Debug` implementations redact credential-bearing configuration and migration data. This does not turn general diagnostic logging into an audit sink; operators must still protect all runtime logs.
 
+Audit redaction is separate from the TLS listener snapshot contract. Version-2 listener entries
+contain only a local address and an opaque provider handle, while the certificate and raw private
+key remain outside the serialized snapshot. The `tls_bind` host path zeroizes its temporary host
+PEM copy but preserves the const guest input needed for SDK address fallback. It therefore does not
+erase the original guest buffer or duplicates elsewhere in Wasm memory and cannot prove that an
+entire `MemorySnapshot` is key-free.
+Intentional distributed credential-delivery APIs are outside that guarantee. See
+[TLS Listener Credential Snapshots](../tls/TLS_LISTENER_CREDENTIALS.md) for the scoped-provider,
+legacy-artifact, and future provider-handle guest ABI requirements.
+
 ## Delivery and backpressure
 
 The default `AuditDispatcher` has a dedicated writer thread and a bounded queue of 1,024 records. Guest/runtime operations call `try_send` and never wait for queue capacity.
@@ -128,7 +138,10 @@ The common API has deterministic tests for the exact V1 JSON shape, redaction st
 Production-import integration tests capture exact terminal records for process
 capability and process-quota decisions, configuration/preopen mutations, local
 registry changes, TCP/UDP bind, DNS resolution, and TLS/port validation. They
-cover successful, denied, failed, and redacted outcomes. The live-Wasm reload
+cover successful, denied, failed, and redacted outcomes. The invalid TLS bind
+case also verifies that the const guest key-input range remains unchanged and
+that its marker is absent from the typed audit event; the host-copy zeroization
+is an implementation property, not guest-memory erasure. The live-Wasm reload
 test captures one record for each commit, rollback, in-doubt, and blocked
 attempt. WASI directory tests cover successful access and cancellation-guard
 behavior. Distributed receiver decode/authorization and atomic-admission

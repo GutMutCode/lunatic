@@ -2296,6 +2296,7 @@ dependencies = [
  "tokio-rustls",
  "wasmtime",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]

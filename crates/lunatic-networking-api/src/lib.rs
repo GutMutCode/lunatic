@@ -17,8 +17,7 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio_rustls::TlsStream;
+use tokio_rustls::{TlsAcceptor, TlsStream};
 use wasmtime::{Caller, Linker, Memory};
 
 use lunatic_common_api::{
@@ -68,8 +67,7 @@ pub struct TlsClientConnectionMetadata {
 
 pub struct TlsListener {
     pub listener: TcpListener,
-    pub certs: CertificateDer<'static>,
-    pub keys: PrivateKeyDer<'static>,
+    pub acceptor: TlsAcceptor,
 }
 
 impl TlsConnection {

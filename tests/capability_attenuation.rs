@@ -132,6 +132,7 @@ const DELEGATION_GUEST: &str = r#"
     (data (i32.const 224) "\7f\00\00\01")
     (data (i32.const 256) "secret-registry-name")
     (data (i32.const 288) "localhost:80")
+    (data (i32.const 352) "PRIVATE_KEY_SENTINEL")
 
     (func $assert_checked_error (param $error i64)
         (if (i64.eq (local.get $error) (i64.const -1)) (then unreachable))
@@ -444,8 +445,8 @@ const DELEGATION_GUEST: &str = r#"
             (call $tls_bind
                 (i32.const 4) (i32.const 224) (i32.const 0)
                 (i32.const 0) (i32.const 0) (i32.const 336)
-                (i32.const 352) (i32.const 0)
-                (i32.const 352) (i32.const 0))))
+                (i32.const 384) (i32.const 0)
+                (i32.const 352) (i32.const 20))))
 
     (func (export "child"))
 )
@@ -672,14 +673,23 @@ async fn tcp_dns_and_tls_host_paths_emit_typed_terminal_events_once() -> Result<
         .state()
         .audit_environment_id()
         .expect("default runtime exposes an environment ID");
+    let before_tls_bind = invalid_tls.snapshot_memory()?.memory;
+    assert_eq!(&before_tls_bind[352..372], b"PRIVATE_KEY_SENTINEL");
     assert!(invalid_tls
         .call_ref("tls_bind_invalid_material", Vec::new())
         .await
         .is_err());
+    let after_tls_bind = invalid_tls.snapshot_memory()?.memory;
+    assert_eq!(
+        &after_tls_bind[352..372],
+        b"PRIVATE_KEY_SENTINEL",
+        "the const guest input must remain reusable across address attempts"
+    );
     let tls_failed = events_for_environment(tls_environment_id, "network_bind", "bind", "failed");
     assert_eq!(tls_failed.len(), 1, "invalid TLS bind must emit once");
     assert_eq!(tls_failed[0]["reason"], "invalid_input");
     assert_eq!(tls_failed[0]["target"]["kind"], "tls_listener");
+    assert!(!tls_failed[0].to_string().contains("PRIVATE_KEY_SENTINEL"));
 
     let mut invalid_port = instantiate_guest(DefaultProcessConfig::default()).await?;
     let invalid_port_environment_id = invalid_port

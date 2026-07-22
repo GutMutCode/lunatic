@@ -18,3 +18,4 @@ tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 tokio-rustls = { workspace = true }
 wasmtime = { workspace = true }
 webpki-roots = { workspace = true }
+zeroize = { workspace = true }
