@@ -538,10 +538,9 @@ impl PlatformWorkerState {
         #[cfg(target_os = "windows")]
         {
             let modifiers = std::collections::HashMap::from([("persistence", "Local")]);
-            return self
-                .store()?
+            self.store()?
                 .build(CREDENTIAL_SERVICE, reference.as_str(), Some(&modifiers))
-                .map_err(map_platform_error);
+                .map_err(map_platform_error)
         }
         #[cfg(not(target_os = "windows"))]
         self.store()?
