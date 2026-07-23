@@ -69,7 +69,7 @@ calibration are still missing.
 - Each independently constructed Wasmtime engine has an epoch ticker. The new fixed-round gates exercise local scheduler progress and live reload under bounded pressure, but they do not establish fairness or latency under sustained large-scale or multi-host load.
 - Reload cancels the current Wasmtime call and re-enters the same export on the replacement module. It preserves compatible linear memory and host-owned state, not the interrupted instruction pointer, native stack, private globals, or tables; modules therefore need a compatible entrypoint-reentry contract.
 - The bounded scale gate stops at 32 concurrent guests and 80 lifecycles; it measures process-wide RSS rather than allocator/reachable heap per process. Sustained large-scale scheduler throughput and cluster-wide memory/network limits remain uncovered.
-- A Sunday/manual two-hour population-32 soak workflow now exists with exact cleanup and a 512MiB process-wide RSS-growth guard; version-tag publication depends on the same reusable workflow. It has not yet produced a remote result for this branch and therefore is not counted as passing long-duration evidence.
+- A Sunday/manual two-hour population-32 soak workflow now exists with exact cleanup and a 512MiB process-wide RSS-growth guard; version-tag publication depends on the same reusable workflow. Verified two-hour soak: [GitHub Actions run 29984715567](https://github.com/GutMutCode/lunatic/actions/runs/29984715567) at commit `30b0e1b11bada8bdefca848dee77b5b6aa180cc6`. The retained run completed its requested 7,200 seconds with four echo rounds per cycle, 164,745,248 process lifecycles, 658,980,992 mailbox echo samples, zero registrations after shutdown, and 5,881,856 bytes of process-wide RSS growth under the guard; it remains bounded single-host evidence rather than multi-day or cluster coverage.
 
 ## 2. Language Independence via WebAssembly
 
@@ -233,7 +233,7 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 4. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
 5. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
 6. Build on the now-verified primitive Rust, TinyGo, and AssemblyScript matrix by packaging equivalent OTP1 guest APIs, including guest-side Supervisor/GenStatem/GenEvent libraries.
-7. Establish and maintain fresh retained two-hour soak evidence, then expand the bounded local gates into aggregate host/cluster budgets, larger populations, longitudinal CPU/queue telemetry, sustained chaos coverage, and calibrated final production-readiness policies.
+7. Maintain fresh retained two-hour soak evidence, then expand the bounded local gates into aggregate host/cluster budgets, larger populations, longitudinal CPU/queue telemetry, sustained chaos coverage, and calibrated final production-readiness policies.
 
 ## Related Resources
 
