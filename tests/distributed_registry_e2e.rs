@@ -40,6 +40,7 @@ use wasmtime::Val;
 const ENVIRONMENT_ID: u64 = 41;
 const SERVICE_NAME: &str = "guest-service";
 const CROSS_ENVIRONMENT_NAME: &str = "cross-environment";
+const GUEST_ROUND_TRIPS: usize = 16;
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 // The distributed connection manager keys peers by numeric node ID. Keep the
@@ -79,9 +80,10 @@ const REGISTRY_GUEST: &str = r#"
         (call $create_data (local.get $tag) (i64.const 0))
         (call $assert_i32 (call $local_send (local.get $observer)) (i32.const 0)))
 
-    ;; The owner publishes itself, serves one cross-node request, then proves
+    ;; The owner publishes itself, serves a bounded cross-node request burst, then proves
     ;; explicit removal before re-registering for process-exit cleanup.
     (func (export "owner") (param $observer i64)
+        (local $round i32)
         (call $registry_put
             (i32.const 0)
             (i32.const 13)
@@ -89,20 +91,28 @@ const REGISTRY_GUEST: &str = r#"
             (call $process_id))
         (call $signal (local.get $observer) (i64.const 10))
 
-        (call $assert_i32
-            (call $receive (i32.const 0) (i32.const 0) (i64.const -1))
-            (i32.const 0))
-        (call $assert_i64 (call $get_tag) (i64.const 42))
-        (call $assert_i64 (call $data_size) (i64.const 16))
-        (call $assert_i32 (call $read_data (i32.const 128) (i32.const 16)) (i32.const 16))
+        (loop $serve
+            (call $assert_i32
+                (call $receive (i32.const 0) (i32.const 0) (i64.const -1))
+                (i32.const 0))
+            (call $assert_i64 (call $get_tag) (i64.const 42))
+            (call $assert_i64 (call $data_size) (i64.const 16))
+            (call $assert_i32
+                (call $read_data (i32.const 128) (i32.const 16))
+                (i32.const 16))
 
-        (call $create_data (i64.const 42) (i64.const 4))
-        (call $assert_i32 (call $write_data (i32.const 64) (i32.const 4)) (i32.const 4))
-        (call $assert_i32
-            (call $distributed_send
-                (i64.load (i32.const 128))
-                (i64.load (i32.const 136)))
-            (i32.const 0))
+            (call $create_data (i64.const 42) (i64.const 4))
+            (call $assert_i32
+                (call $write_data (i32.const 64) (i32.const 4))
+                (i32.const 4))
+            (call $assert_i32
+                (call $distributed_send
+                    (i64.load (i32.const 128))
+                    (i64.load (i32.const 136)))
+                (i32.const 0))
+            (local.set $round (i32.add (local.get $round) (i32.const 1)))
+            (br_if $serve
+                (i32.lt_u (local.get $round) (i32.const __GUEST_ROUND_TRIPS__))))
         (call $signal (local.get $observer) (i64.const 11))
 
         ;; Host barrier before the explicit remove/re-register lifecycle step.
@@ -131,6 +141,7 @@ const REGISTRY_GUEST: &str = r#"
     ;; owner is started in the same environment, it resolves the global name
     ;; and completes a request/reply over the live remote mailbox.
     (func (export "requester") (param $observer i64) (param $remote_node i64)
+        (local $round i32)
         ;; A cross-environment registry entry must be hidden by the legacy ABI,
         ;; which returns only (node, process) and sends in the caller's env.
         (call $assert_i32
@@ -143,29 +154,42 @@ const REGISTRY_GUEST: &str = r#"
             (i32.const 1))
         (call $signal (local.get $observer) (i64.const 20))
 
-        ;; Host creates the same environment and starts the owner before release.
-        (call $assert_i32
-            (call $receive (i32.const 0) (i32.const 0) (i64.const -1))
-            (i32.const 0))
-
-        (call $assert_i32
-            (call $registry_get (i32.const 0) (i32.const 13) (i32.const 96) (i32.const 104))
-            (i32.const 0))
-        (i64.store (i32.const 128) (call $node_id))
-        (i64.store (i32.const 136) (call $process_id))
-        (call $create_data (i64.const 42) (i64.const 16))
-        (call $assert_i32 (call $write_data (i32.const 128) (i32.const 16)) (i32.const 16))
-        (call $assert_i32
-            (call $distributed_send_receive
-                (i64.load (i32.const 96))
-                (i64.load (i32.const 104))
-                (i64.const 42)
-                (i64.const 5000))
-            (i32.const 0))
-        (call $assert_i64 (call $get_tag) (i64.const 42))
-        (call $assert_i64 (call $data_size) (i64.const 4))
-        (call $assert_i32 (call $read_data (i32.const 160) (i32.const 4)) (i32.const 4))
-        (call $assert_i32 (i32.load (i32.const 160)) (i32.const 0x676e6f70))
+        (loop $round_trip
+            ;; The host releases one measured request at a time so its duration starts
+            ;; before this guest lookup and cannot collapse into observer-queue drain time.
+            (call $assert_i32
+                (call $receive (i32.const 0) (i32.const 0) (i64.const -1))
+                (i32.const 0))
+            ;; Include the production global-registry lookup in every measured request.
+            (call $assert_i32
+                (call $registry_get (i32.const 0) (i32.const 13) (i32.const 96) (i32.const 104))
+                (i32.const 0))
+            (i64.store (i32.const 128) (call $node_id))
+            (i64.store (i32.const 136) (call $process_id))
+            (call $create_data (i64.const 42) (i64.const 16))
+            (call $assert_i32
+                (call $write_data (i32.const 128) (i32.const 16))
+                (i32.const 16))
+            (call $assert_i32
+                (call $distributed_send_receive
+                    (i64.load (i32.const 96))
+                    (i64.load (i32.const 104))
+                    (i64.const 42)
+                    (i64.const 5000))
+                (i32.const 0))
+            (call $assert_i64 (call $get_tag) (i64.const 42))
+            (call $assert_i64 (call $data_size) (i64.const 4))
+            (call $assert_i32
+                (call $read_data (i32.const 160) (i32.const 4))
+                (i32.const 4))
+            (call $assert_i32 (i32.load (i32.const 160)) (i32.const 0x676e6f70))
+            (local.set $round (i32.add (local.get $round) (i32.const 1)))
+            (call $signal
+                (local.get $observer)
+                (i64.add (i64.const 100) (i64.extend_i32_u (local.get $round))))
+            (br_if $round_trip
+                (i32.lt_u (local.get $round) (i32.const __GUEST_ROUND_TRIPS__))))
+        (call $signal (local.get $observer) (i64.const 22))
 
         ;; The remote node exists and the environment exists, but the process does not.
         (call $create_data (i64.const 91) (i64.const 0))
@@ -239,7 +263,9 @@ impl TestCluster {
         let runtime = WasmtimeRuntime::new(&default_config())?;
         let module = Arc::new(runtime.compile_module::<DefaultProcessState>(RawWasm::new(
             Some(1),
-            wat::parse_str(REGISTRY_GUEST)?,
+            wat::parse_str(
+                REGISTRY_GUEST.replace("__GUEST_ROUND_TRIPS__", &GUEST_ROUND_TRIPS.to_string()),
+            )?,
         ))?);
         let mut nodes = Vec::with_capacity(node_count);
 
@@ -537,12 +563,35 @@ async fn guest_registry_resolves_a_live_remote_mailbox_and_cleans_up_owner_exit(
         .wait_for_registry(SERVICE_NAME, Some(owner_pid))
         .await?;
 
-    send_trigger(&requester, 60)?;
+    let round_trip_started = Instant::now();
+    let mut round_trip_latencies = Vec::with_capacity(GUEST_ROUND_TRIPS);
+    for round in 1..=GUEST_ROUND_TRIPS {
+        let request_started = Instant::now();
+        send_trigger(&requester, 60 + round as i64)?;
+        wait_for_tag(&mut requester_tags, 100 + round as i64).await?;
+        round_trip_latencies.push(request_started.elapsed());
+    }
+    wait_for_tag(&mut requester_tags, 22).await?;
+    let round_trip_elapsed = round_trip_started.elapsed();
     wait_for_tag(&mut requester_tags, 21).await?;
     timeout(TEST_TIMEOUT, requester_join)
         .await
         .context("requester guest did not exit")???;
     wait_for_tag(&mut owner_tags, 11).await?;
+    round_trip_latencies.sort_unstable();
+    let percentile = |percent: usize| {
+        let rank = (round_trip_latencies.len() * percent).div_ceil(100).max(1);
+        round_trip_latencies[rank - 1].as_micros()
+    };
+    println!(
+        "LUNATIC_RESILIENCE_EVIDENCE {{\"kind\":\"guest_wasm_cross_node_round_trip\",\"samples\":{GUEST_ROUND_TRIPS},\"elapsed_us\":{},\"average_us\":{:.3},\"p50_us\":{},\"p95_us\":{},\"p99_us\":{},\"rate_per_sec\":{:.3},\"loopback_mtls\":true}}",
+        round_trip_elapsed.as_micros(),
+        round_trip_elapsed.as_secs_f64() * 1_000_000.0 / GUEST_ROUND_TRIPS as f64,
+        percentile(50),
+        percentile(95),
+        percentile(99),
+        GUEST_ROUND_TRIPS as f64 / round_trip_elapsed.as_secs_f64()
+    );
 
     // The guest itself removes the name, verifies a miss, and publishes it
     // again so its normal process exit must clean every replica.

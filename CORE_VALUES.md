@@ -181,11 +181,11 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 - Tail-recursive loops enable version switching
 
 **Lunatic Implementation Status:**
-- ⚠️ `ModuleRegistry` stores and prunes module entries, but unique version identity and live process-version lifecycle are not production-path verified
-- ⚠️ State snapshot/restore components are implemented; live running-Wasm state preservation is not yet production-path verified
-- ⚠️ Preemptive reload signaling exists, but acknowledgement, atomic commit, and tested live instance replacement remain pending
-- ⚠️ A signature-validation component exists; rejection through the live reload path is not E2E-verified
-- ⚠️ A directly tested same-runtime in-memory helper transfers supported live resource maps, including active TLS sessions, between replacement states; it is not proven reachable through live Wasm reload. Serialized snapshot, host-restart, and cross-node restoration of active TCP/TLS streams remain unsupported
+- ✅ `ModuleRegistry` assigns unique versions and tracks live process-version transitions through the production reload path
+- ✅ The watch-equivalent update path interrupts running Wasm, preserves compatible linear memory and FIFO mailbox state, waits for every process acknowledgement, and either commits atomically or rolls the full target set back; explicit in-doubt state prevents false success. The current bounded workload summary is 16 processes, 10 rounds, 5 commit + 5 rollback, 1,280 FIFO messages, and 160 full denials.
+- ⚠️ Reload re-enters the configured guest export rather than preserving the interrupted instruction pointer, native stack, private globals, or tables; modules still need a compatible entrypoint-reentry contract
+- ⚠️ Candidate-instantiation failure is exercised through the live rollback path, while signature compatibility remains component-tested rather than a separately asserted live-path E2E case
+- ⚠️ A directly tested same-runtime helper transfers supported live resource maps, including active TLS sessions, between replacement states. Guest-driven proof for every resource type, serialized snapshots, host restart, and cross-node restoration of active TCP/TLS streams remain unsupported
 
 ### Fault Tolerance
 
@@ -203,7 +203,8 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 
 **Lunatic Implementation Status:**
 - ✅ Process links preserve actual-Wasm normal-versus-failure reasons, while monitors notify once; default links terminate peers and trapping exits preserve the tagged notification
-- ✅ A native Supervisor process automatically consumes acknowledged child monitor events with preserved normal/failure reasons; actual-process tests cover immediate exit/panic, kill, an actual guest-Wasm trap, OneForOne, OneForAll, RestForOne, restart intensity, reverse shutdown, and failure escalation
+- ✅ A native Supervisor process automatically consumes acknowledged child monitor events with preserved normal/failure reasons; actual-process tests cover immediate exit/panic, kill, OneForOne, OneForAll, RestForOne, restart intensity, reverse shutdown, and failure escalation. The actual-Wasm Supervisor test survives three immediate traps, performs three replacements, reaches a stable fourth start, and tears down without retained registrations.
+- ✅ Registry partition recovery is repeated three times against fresh production-transport clusters, and slow-consumer fairness emits 16-sample bounded-lane evidence
 - ⚠️ Guest-Wasm supervisor trees and distributed supervision remain pending
 
 ### Distribution
@@ -222,7 +223,8 @@ Lunatic is a universal runtime inspired by Erlang/BEAM, designed to bring proven
 **Lunatic Implementation Status:**
 - ⚠️  Distributed messaging (lunatic-distributed crate)
 - ✅ Registry coordination uses the runtime mTLS QUIC control path and is covered by localhost multi-endpoint quorum/partition tests
-- ⚠️ `GlobalProcessId` and coordinated registry operations exist, but guest name lookup, automatic process/node-lifecycle-triggered ownership cleanup, and delivery into a cross-node mailbox are not yet wired and tested end to end
+- ✅ Actual Wasm guests resolve a globally registered process and exchange a confirmed request/reply through live cross-node mailboxes over the production localhost mTLS path; healthy owner exit removes the registration from both replicas. Two guest-Wasm processes now perform 16 sequential production registry lookup → loopback mTLS QUIC → remote live mailbox → reply round trips with average/p50/p95/p99/rate evidence.
+- ⚠️ Environment-aware guest handles, partitioned owner exit, node-failure recovery, multi-host guest traffic, cross-host deployment, and transparent distributed process reconstruction remain unverified
 - ❌ Distributed hot reload (Phase 10)
 
 ### OTP Patterns
@@ -332,13 +334,13 @@ Checkboxes in this section represent current production-path verification, not w
 
 ### Performance
 - [ ] Process spawn < 10μs (aspirational product target; a 2026-07-23 Windows component run at `9afadbb` had a 34.763μs median point estimate, and the [spawn analysis](docs/benchmarks/SPAWN_BASELINE_ANALYSIS.md) records the boundary and same-runner paired regression contract)
-- [ ] Live hot reload < 100ms (historical synthetic Criterion compile/instantiate/registry/snapshot/restore harness: 0.76ms; live signal path unverified)
-- [ ] End-to-end process message passing < 1μs (historical local 10-message FIFO mailbox creation/push/pop harness: 353ns; process delivery unmeasured)
-- [ ] Memory overhead < 1KB per process (historical lower-bound estimate: ~66KiB including one 64KiB Wasm page)
+- [ ] Live hot reload < 100ms (a bounded 16-process full-mailbox gate records production-path commit/rollback p50/p95/p99 on every Linux CI run, but no portable calibrated product threshold has been established)
+- [ ] End-to-end process message passing < 1μs (historical local 10-message FIFO mailbox creation/push/pop harness: 353ns; live guest delivery is now measured at the registry-to-live-mailbox boundary, but sub-µs end-to-end delivery remains unproven)
+- [ ] Memory overhead < 1KB per process (historical lower-bound estimate: ~66KiB including one 64KiB Wasm page; current scale evidence reports 64KiB committed Wasm bytes per guest and a single-baseline process-wide RSS curve at cumulative live populations 1/8/32, but not allocator-attributable per-process heap overhead)
 
 ### Reliability
 - [ ] Production isolation contract (Wasm memory isolation, least-privilege defaults, and linked failure propagation are verified; bounded queues, process counts, and complete resource accounting remain open)
-- [ ] Live hot reload state preservation with acknowledgement and rollback proof
+- [x] Local live hot reload state preservation with acknowledgement and rollback proof (compatible linear memory, FIFO mailbox state, and supported same-runtime resources; instruction-pointer and distributed continuation are excluded)
 - [ ] 99.999% uptime (application-dependent)
 - [x] Automatic local failure recovery via OTP supervisors (actual child monitor events drive restart strategies and intensity escalation; distributed recovery is excluded)
 

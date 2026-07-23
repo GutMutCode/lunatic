@@ -1,0 +1,74 @@
+name: Production actual-Wasm soak
+
+on:
+  schedule:
+    - cron: "17 3 * * 0"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-soak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  extended_actual_wasm_soak:
+    name: Two-hour actual-Wasm lifecycle soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      LUNATIC_EXTENDED_SOAK_DURATION_SECS: "7200"
+      LUNATIC_EXTENDED_SOAK_POPULATION: "32"
+      LUNATIC_EXTENDED_SOAK_ECHO_ROUNDS: "4"
+      LUNATIC_EXTENDED_SOAK_MAX_RSS_GROWTH_BYTES: "536870912"
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+      - name: Restore Rust build cache
+        uses: Swatinem/rust-cache@v2
+      - name: Record production-soak environment
+        shell: bash
+        run: |
+          set -o pipefail
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "run_url=https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "duration_seconds=$LUNATIC_EXTENDED_SOAK_DURATION_SECS"
+            echo "population=$LUNATIC_EXTENDED_SOAK_POPULATION"
+            echo "echo_rounds=$LUNATIC_EXTENDED_SOAK_ECHO_ROUNDS"
+            echo "max_rss_growth_bytes=$LUNATIC_EXTENDED_SOAK_MAX_RSS_GROWTH_BYTES"
+            rustc +1.94.0 -Vv
+            cargo +1.94.0 -V
+            uname -a
+            lscpu
+            free -b
+          } 2>&1 | tee production-soak-environment.txt
+      - name: Run the extended actual-Wasm soak
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo +1.94.0 test --release --locked --test wasm_scale_soak \
+            extended_actual_wasm_soak_is_bounded \
+            -- --ignored --exact --nocapture 2>&1 | tee production-soak-output.txt
+      - name: Validate extended-soak evidence
+        run: >-
+          python scripts/check_core_value_docs.py
+          --scale-output production-soak-output.txt
+          --require-extended-soak
+      - name: Upload production-soak evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: production-soak-${{ github.sha }}
+          path: |
+            production-soak-environment.txt
+            production-soak-output.txt
+          if-no-files-found: error
+          retention-days: 30

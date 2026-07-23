@@ -1,8 +1,8 @@
 # Core Values Compliance Status
 
-Reviewed: 2026-07-22
+Reviewed: 2026-07-23
 
-Reviewed working tree based on: `22bde05` plus the reviewed working-tree changes for Hanary #1666
+Reviewed implementation baseline: `f62e5c5`; the Hanary #1667 evidence is bound to the current checkout SHA recorded by CI
 
 This is the canonical implementation-status document for `CORE_VALUES.md`. Design documents, phase reports, examples, and historical benchmark reports may describe intent or component work, but they do not override the status here.
 
@@ -17,9 +17,9 @@ Data structures, serialization tests, callback tests, loopback transport tests, 
 
 | Focus | Status | Current evidence boundary |
 | --- | --- | --- |
-| Fast | Partial | Wasmtime preemption primitives and live process-local hot reload are production-path tested. A two-node registry-to-live-native-mailbox round trip is benchmarked; hot-reload latency and guest-host-call messaging latency are not. |
+| Fast | Partial | Wasmtime preemption primitives and live process-local hot reload are production-path tested. A bounded 16-process adversarial gate records live commit/rollback distributions, the native two-node path is benchmarked, and a sixteen-sample actual guest-Wasm loopback path records average/p50/p95/p99/rate; portable hot-reload and sub-µs messaging objectives remain unverified. |
 | Robust | Partial | Wasm isolation, actual-Wasm link/monitor exit semantics, and acknowledged atomic reload/rollback/in-doubt behavior are production-path tested. Cross-node recovery remains incomplete. |
-| Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. Cluster-scale process/resource behavior is unverified. |
+| Scalable | Partial | Process admission, mailboxes, signals, message allocations, and guest-visible network handles have finite quotas and pressure tests. An actual-Wasm `[1, 8, 32]` curve with one discarded warm-up plus five measured batches per population, 16 echo rounds per measured batch, committed 64KiB Wasm bytes per guest, and an 80-lifecycle bounded soak exercise those paths; large, longitudinal, and cluster-scale behavior remains unverified. |
 | Language Independence | Partial | Rust, TinyGo, and AssemblyScript compiler output now passes one shared process/message/timeout/permission E2E in CI. These low-level fixtures are not equivalent published guest SDKs, and broader host APIs remain uncovered. |
 | Security Through Isolation | Partial | Process configs default to denied capabilities and enforce non-increasing child authority. The provider-handle guest TLS ABI and version-2 listener snapshots exclude raw private-key bytes, Cloud CLI credentials use native protected stores, and typed/redacted V1 audit events cover major privileged boundaries, but deprecated raw TLS and distributed CA/signing compatibility imports remain, complete resource accounting and receiver path policy remain open, and audit delivery is not durable/required. |
 | Fault Tolerance & HA | Partial | Actual-Wasm links/monitors, process-local live reload, and automatic native Supervisor restart/escalation paths are production-path tested. Guest-side and distributed recovery paths remain incomplete. |
@@ -35,8 +35,8 @@ unbounded actor-ingress/process-admission gap is closed by finite, transactional
 quotas, and the former reload-coordination gap is closed by process
 acknowledgements, atomic commit, full-target rollback, and explicit in-doubt
 state. The partial ratings below remain because durable audit delivery,
-receiver-selected authority, cross-node recovery, and scale evidence are still
-missing.
+receiver-selected authority, cross-node recovery, and large/longitudinal scale
+calibration are still missing.
 
 ## 1. Fast, Robust, and Scalable
 
@@ -56,17 +56,20 @@ missing.
   apply failure, and blocks later updates when rollback is in doubt.
   `tests/live_hot_reload.rs` exercises this through running Wasm processes.
 - Instance-pool and component microbenchmarks provide useful local regression signals.
+- `tests/wasm_scale_soak.rs` runs actual Wasm populations `[1, 8, 32]`, discards one timing warm-up and then measures five batches per population, performs 16 echo rounds per measured batch, records spawn-batch and mailbox throughput/rate plus spawn/readiness/echo p50/p95/p99, tracks 64KiB committed Wasm bytes per guest, and separately records one pre-guest Linux process-wide RSS baseline followed by cumulative live populations 1/8/32. Each delta divided by live guest count is explicitly non-allocator-attributable. It still proves exact N+1 admission denial, mailbox-eight saturation and reuse without sibling blockage, a two-page memory ceiling, and ten cycles/80 process lifecycles with zero registered-process leakage.
+- `tests/live_hot_reload_scale.rs` runs ten alternating commit/rollback rounds across sixteen live Wasm processes with full bounded mailboxes. It preserves 1,280 FIFO messages, rejects 160 deliberate overflows, retains process/version ownership, rejects false success or `InDoubt`, and records separate commit/rollback p50/p95/p99 plus a workload summary. Its 250/500ms bounds are CI runaway guards, not portable product claims.
 - The distributed QUIC benchmark uses real loopback mTLS, production framing, reassembly, MessagePack decoding, and the request-dispatch boundary.
-- The distributed latency suite also measures a persistent two-node production path from global-registry lookup through confirmed QUIC delivery into a live native-process mailbox and a confirmed live-mailbox reply (`benches/distributed_latency.rs`).
+- The distributed latency suite also measures a persistent two-node production path from global-registry lookup through confirmed QUIC delivery into a live native-process mailbox and a confirmed live-mailbox reply (`benches/distributed_latency.rs`), and the actual guest-Wasm production path now has 16 sequential registry lookup → loopback mTLS QUIC → remote live mailbox → reply round trips with average/p50/p95/p99/rate evidence.
 
 ### Boundary
 
 - The mailbox benchmark measures local mailbox operations, not a sender-to-live-receiver process round trip.
-- The `distributed_messaging` transport benchmark stops at decoded request dispatch. The live-mailbox benchmark reaches real processes but does not include guest-Wasm host calls, multi-host deployment, or partitions in its timed fixture.
+- The `distributed_messaging` transport benchmark stops at decoded request dispatch. The Criterion live-mailbox benchmark reaches native processes but does not include guest-Wasm host calls; the separate sixteen-sample guest-Wasm timing fixture adds those calls but still excludes multi-host deployment and partitions.
 - Historical spawn, mailbox, and component-reload measurements do not establish current production latency guarantees.
-- Each independently constructed Wasmtime engine has an epoch ticker, but live-reload latency and scheduler fairness have not been benchmarked under sustained load.
+- Each independently constructed Wasmtime engine has an epoch ticker. The new fixed-round gates exercise local scheduler progress and live reload under bounded pressure, but they do not establish fairness or latency under sustained large-scale or multi-host load.
 - Reload cancels the current Wasmtime call and re-enters the same export on the replacement module. It preserves compatible linear memory and host-owned state, not the interrupted instruction pointer, native stack, private globals, or tables; modules therefore need a compatible entrypoint-reentry contract.
-- Sustained scheduler throughput, mailbox pressure, and cluster-wide memory/network limits are not covered by a scale or soak gate.
+- The bounded scale gate stops at 32 concurrent guests and 80 lifecycles; it measures process-wide RSS rather than allocator/reachable heap per process. Sustained large-scale scheduler throughput and cluster-wide memory/network limits remain uncovered.
+- A Sunday/manual two-hour population-32 soak workflow now exists with exact cleanup and a 512MiB process-wide RSS-growth guard; version-tag publication depends on the same reusable workflow. It has not yet produced a remote result for this branch and therefore is not counted as passing long-duration evidence.
 
 ## 2. Language Independence via WebAssembly
 
@@ -149,10 +152,10 @@ missing.
 ### Verified components
 
 - Process links and monitors, snapshot/signature components, and reload coordination structures exist.
-- `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one reason-preserving monitor notification, removal-before-notification ordering, native-runner parity, and automatic Supervisor replacement after an immediate guest trap.
-- Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery, resynchronization, rejection of a node-2 certificate claiming node 1 for leader notifications, and rejection of a node-2-authenticated synchronization snapshot while node 3 expects coordinator node 1. The latter proves processing with a same-stream response marker before a legitimate node-1 snapshot completes the preserved waiter (`crates/lunatic-distributed/tests/registry_coordination.rs`).
-- `tests/distributed_registry_e2e.rs` runs actual Wasm guests on full node servers. It covers guest registration and replica lookup, confirmed request/reply through live cross-node mailboxes, missing environment/process errors, explicit removal, cross-environment fail-closed lookup, and owner-exit cleanup on both replicas. A three-node mTLS case also proves that a spawn waiter expecting node 2 rejects a matching response ID from node 3 without consuming the waiter, then accepts node 2's response.
-- Confirmed sends correlate `Sent`/typed error responses before reporting success, preserve bounded waiter/outbound accounting on timeout or cancellation, and distinguish missing environments, missing processes, receiver backpressure, and oversized/rejected delivery. Owner cleanup retains a bounded retry record with backoff until quorum coordination succeeds.
+- `tests/wasm_link_death.rs` exercises the real `spawn_wasm` lifecycle for normal exit, guest trap, host panic, active receive/sleep cancellation, and missing-process link/monitor behavior. It verifies exact link reasons and tags, default peer termination, trapping-exit survival, one reason-preserving monitor notification, removal-before-notification ordering, native-runner parity, and three crash-driven Supervisor replacements before a stable fourth actual-Wasm start.
+- Global registration crosses runtime mTLS QUIC control paths on localhost. Multi-endpoint tests cover one-winner contention, quorum waiting, partition recovery repeated three times against fresh production-transport clusters, resynchronization, rejection of a node-2 certificate claiming node 1 for leader notifications, and rejection of a node-2-authenticated synchronization snapshot while node 3 expects coordinator node 1. The latter proves processing with a same-stream response marker before a legitimate node-1 snapshot completes the preserved waiter (`crates/lunatic-distributed/tests/registry_coordination.rs`).
+- `tests/distributed_registry_e2e.rs` runs actual Wasm guests on full node servers. It covers guest registration and replica lookup, confirmed request/reply through live cross-node mailboxes, missing environment/process errors, explicit removal, cross-environment fail-closed lookup, and owner-exit cleanup on both replicas. A three-node mTLS case also proves that a spawn waiter expecting node 2 rejects a matching response ID from node 3 without consuming the waiter, then accepts node 2's response. The current production path also includes the 16 sequential registry lookup → loopback mTLS QUIC → remote live mailbox → reply round-trip evidence.
+- Confirmed sends correlate `Sent`/typed error responses before reporting success, preserve bounded waiter/outbound accounting on timeout or cancellation, and distinguish missing environments, missing processes, receiver backpressure, and oversized/rejected delivery. Owner cleanup retains a bounded retry record with backoff until quorum coordination succeeds, and slow-consumer fairness now emits 16-sample evidence.
 - Production QUIC framing has a multi-chunk transport test (`crates/lunatic-distributed/tests/quic_transport.rs`).
 
 ### Boundary
@@ -181,7 +184,7 @@ missing.
 - `GenServer::spawn` uses native Lunatic processes and mailbox call/cast/reply flows. `spawn_in` optionally registers a name in an injected bounded `DistributedRegistry` local namespace; tests cover collision rejection before `init`, owner-indexed cleanup, and immediate reuse after exit.
 - `Supervisor::spawn_with_environment` runs the supervisor itself as a native Lunatic process. It registers acknowledged monitors before exposing startup, retains terminal reasons for late monitor registration, consumes child-death messages automatically, ignores stale intentional-kill events by process identity, and escalates restart exhaustion after reverse-order shutdown. Tests cover immediate normal/error/panic exits, kill, an actual guest-Wasm trap, ChildStart-panic orphan cleanup, Normal/Failure monitor output, OneForOne, OneForAll, and RestForOne.
 - GenStatem and GenEvent have native Lunatic-process mailbox/lifecycle adapters in addition to their behavior APIs. Their synchronous handle waits, along with GenServer calls and lifecycle waits, are regression-tested on a one-worker multi-thread Tokio runtime.
-- `tests/otp_guest_wasm.rs` runs an actual Wasm client and server using the language-neutral OTP1 envelope over existing bounded message imports. It verifies a Rust-encoded contract probe, cast, correlated reply envelopes, timeout status, and acknowledged graceful stop.
+- `tests/otp_guest_wasm.rs` runs an actual Wasm client and server using the language-neutral OTP1 envelope over existing bounded message imports. It verifies a Rust-encoded contract probe, cast, correlated reply envelopes, timeout status, and acknowledged graceful stop. The live production fixture is the 16-sequential-round registry lookup → loopback mTLS QUIC → remote live mailbox → reply path with average/p50/p95/p99/rate evidence.
 - Coordinated registry messages travel over the production QUIC control transport.
 
 ### Boundary
@@ -195,15 +198,17 @@ missing.
 | Evidence | What it establishes | What it does not establish |
 | --- | --- | --- |
 | `cargo test --all` | Current unit and integration contracts exercised by the repository | Untested production paths, performance, scale, or multi-host behavior |
-| `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and reason-preserving monitor semantics, plus Supervisor restart after an immediate guest trap | Cross-node links or every possible host-future suspension point |
+| `cargo test -p lunatic-runtime --test wasm_link_death` | Actual-Wasm and native normal/failure/panic/kill/missing-process link and reason-preserving monitor semantics, plus three Supervisor restarts after immediate guest traps and clean stable-child teardown | Cross-node links, distributed supervision, or every possible host-future suspension point |
 | `cargo test -p lunatic-otp-patterns` | Native GenServer/GenStatem/GenEvent mailbox lifecycles, local named registration, and automatic Supervisor monitor/restart/escalation behavior | Guest-side supervisor trees, global naming, or distributed recovery |
 | `cargo test -p lunatic-runtime --test otp_guest_wasm` | Actual-Wasm OTP1 cast, correlated call/reply, timeout, and acknowledged stop over production message imports | Packaged language SDK ergonomics, guest-side Supervisor/GenStatem/GenEvent libraries, or cross-node OTP |
 | `LUNATIC_MULTILANGUAGE_GUESTS_REQUIRED=1 cargo test --test multilanguage_guest_e2e` after the pinned compiler builds | Rust, TinyGo, and AssemblyScript artifacts all exercise process spawn, tagged message round trip, timeout, and child permission denial through registered production imports | Stable/public guest SDKs, full host-API parity, language-level concurrency equivalence, OTP adapters, WASI Preview 2/components, or distributed behavior |
 | TLS listener/provider-handle tests | Version-2 address-plus-handle serialization, environment/process/capability scope, capability-before-quota ordering, existence-hiding audit classes, single-use/revocation/expiry/capacity behavior, provider unwind containment and rollback-failure promotion, stable fail-closed errors, actual guest Wasm bind/accept/TLS traffic, key-marker-free guest/resource snapshots and audit output, provider-backed rebind, legacy rejection, and live listener transfer without provider lookup | Panic-hook or provider-owned log redaction, persistent-provider implementation, host restart, cross-node restoration/reissue, host crash-dump/remanence guarantees, provider-specific reconciliation after a failed revoke, or distributed signer migration |
 | Legacy TLS bind production-import test | The const guest key-input range remains reusable on the exercised invalid-input path, the temporary host copy is zeroized by implementation, and the audit record omits the marker | Guest-managed erasure, `MemorySnapshot` key absence, successful-bind crash-dump/remanence guarantees, or raw distributed CA/signing imports |
-| Registry/QUIC + guest integration tests | Real localhost mTLS transport, framing, quorum behavior, two actual Wasm guest lookup-to-mailbox request/reply, typed missing-target errors, and owner cleanup | Cross-host deployment, cross-environment handles, partitioned guest owner exit, distributed process recovery |
+| Registry/QUIC + guest integration tests | Real localhost mTLS transport, framing, quorum behavior, sixteen sequential two-guest Wasm lookup-to-mailbox request/replies with average/p50/p95/p99/rate, typed missing-target errors, and owner cleanup | Cross-host deployment, cross-environment handles, partitioned guest owner exit, distributed process recovery |
 | Criterion mailbox benchmark | Local queue-operation cost for its configured workload | End-to-end process message latency or backpressure |
 | Criterion hot-reload benchmark | Manual compile/instantiate/snapshot/restore component cost | A live running process receiving, acknowledging, committing, or rolling back a reload |
+| Actual-Wasm scale/pressure gate | Live populations 1/8/32, one discarded timing warm-up plus five measured batches per population, sixteen echo rounds per measured batch, host-to-guest-to-native-observer throughput and latency distributions, one pre-guest baseline plus cumulative live-population RSS delta/guest proxy, 64KiB committed Wasm bytes per guest, exact admission/mailbox/memory bounds, sibling progress, and 80 cleanup lifecycles | Allocator-attributable per-process heap, guest-to-guest serialization under pressure, large populations, multi-day/longitudinal stability, or cluster capacity |
+| Live-reload scale/rollback gate | Sixteen running Wasm processes preserve full FIFO mailboxes across ten acknowledged commit/rollback operations and report per-run distributions | Portable `<100ms` proof, instruction-pointer continuation, cross-node reload, or multi-day/chaos stability |
 | Memory projections | Arithmetic estimates based on measured component sizes | Demonstrated million-process capacity or sustained workload stability |
 | Cloud CLI credential lifecycle tests | Production config/login/request/logout flow around an injected protected-store boundary, including plaintext migration and fail-closed errors | A configured/unlocked native store in a representative macOS, Windows, or Linux user session, or remote session revocation |
 
@@ -217,7 +222,8 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 - This file is the canonical current status and evidence boundary.
 - Historical phase/completion reports are archival context. Any unqualified completion language in them is superseded by this file.
 - README feature claims must link here and use the same completion rule.
-- A future completion change must name the production entry point, executable test, reviewed commit, and unsupported cases.
+- A future completion change must name the production entry point, executable test, reviewed base commit, CI checkout SHA, and unsupported cases.
+- `scripts/check_core_value_docs.py` enforces the protected checkboxes, fixed workload counts, evidence symbols, review dates, and stale-claim exclusions. CI feeds it the current Criterion, scale, live-reload, and resilience outputs; the scheduled workflow additionally requires a complete two-hour soak record, so component speed or an incomplete run cannot silently promote a production claim.
 
 ## Prioritized Follow-Ups
 
@@ -227,7 +233,7 @@ The benchmark documents under `docs/benchmarks/` preserve an October 2025 measur
 4. Add an environment-aware global guest handle/send API, then exercise partitioned owner exit and node-failure recovery through the combined guest path.
 5. Measure live hot-reload latency and formalize the guest entrypoint-reentry/checkpoint contract.
 6. Build on the now-verified primitive Rust, TinyGo, and AssemblyScript matrix by packaging equivalent OTP1 guest APIs, including guest-side Supervisor/GenStatem/GenEvent libraries.
-7. Add aggregate host/cluster budgets, scale/soak coverage, and final production-readiness gates.
+7. Establish and maintain fresh retained two-hour soak evidence, then expand the bounded local gates into aggregate host/cluster budgets, larger populations, longitudinal CPU/queue telemetry, sustained chaos coverage, and calibrated final production-readiness policies.
 
 ## Related Resources
 

@@ -29,8 +29,8 @@ If you would like to see other languages supported or just follow the discussion
 - [x] Channel based message passing
 - [x] TCP networking
 - [x] Filesystem access
-- [ ] Distributed nodes (mTLS QUIC and registry coordination exist; live cross-node guest mailbox delivery is not yet proven end to end)
-- [ ] Hot reload (snapshot, validation, and resource-transfer components exist; the live running-Wasm reload path is not yet production-verified)
+- [ ] Distributed nodes (two actual-Wasm guests complete 16 measured registry lookup → loopback mTLS QUIC → remote mailbox → reply rounds; multi-host operation, partitioned owner exit, and cross-node failure recovery remain unverified)
+- [ ] Hot reload (the watch-equivalent path interrupts running Wasm, preserves compatible state, waits for acknowledgements, and commits or rolls back locally; the current 16-process evidence measures bounded live-path latency, but no portable latency target is established and the entrypoint-reentry contract and distributed reload remain unverified)
 - [ ] OTP patterns (native GenServer/Supervisor/GenStatem/GenEvent adapters and an actual-Wasm OTP call/reply/timeout/stop contract are verified; high-level cross-language SDKs and distributed OTP remain pending)
 
 Unchecked entries are active implementation areas, not unavailable concepts. The canonical evidence and known gaps are maintained in [the core-values status](docs/core_values/status.md); historical phase and benchmark reports do not override it.
@@ -96,7 +96,10 @@ To learn how to build modules, check out language-specific bindings:
 
 Lunatic's design centers on lightweight isolated processes, comparable in role to green threads or
 [go-routines][8] in other runtimes. Low spawn cost, small memory overhead, and massive concurrency are
-design goals; current measured boundaries and missing scale/soak evidence are recorded in the
+design goals; current bounded live-Wasm scale/pressure evidence includes one warm-up plus five measured batches per population with measured spawn and mailbox throughput/rate,
+p50/p95/p99, 64KiB committed Wasm bytes per guest, and a single-baseline cumulative live-population RSS delta divided by guest count
+that is explicitly not allocator-attributable, while the remaining large-scale, multi-day/longitudinal, and
+multi-host gaps are recorded in the
 [implementation status](docs/core_values/status.md).
 
 Some common use cases for processes are:

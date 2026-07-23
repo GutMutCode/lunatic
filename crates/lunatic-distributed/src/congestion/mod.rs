@@ -1727,6 +1727,11 @@ mod tests {
         eprintln!(
             "adversarial fair-lane p99 over {FAST_SAMPLES} samples: {p99:?} (limit {FAIR_LANE_LATENCY_THRESHOLD:?})"
         );
+        println!(
+            "LUNATIC_RESILIENCE_EVIDENCE {{\"kind\":\"slow_consumer_fairness\",\"samples\":{FAST_SAMPLES},\"healthy_lane_p99_us\":{},\"limit_us\":{},\"stalled_lane_remained_bounded\":true}}",
+            p99.as_micros(),
+            FAIR_LANE_LATENCY_THRESHOLD.as_micros()
+        );
         assert!(
             p99 <= FAIR_LANE_LATENCY_THRESHOLD,
             "healthy-lane p99 {p99:?} exceeded {FAIR_LANE_LATENCY_THRESHOLD:?}"

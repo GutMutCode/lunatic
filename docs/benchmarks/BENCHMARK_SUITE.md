@@ -16,7 +16,7 @@ Use these evidence classes when reporting results:
 - **Transport-boundary benchmark** — real transport through decode/dispatch, stopping before a live destination process.
 - **Production E2E benchmark** — public/runtime entry point through a live outcome, including acknowledgement and failure behavior.
 
-The current suite contains microbenchmark, component-harness, probe/projection, transport-boundary, and production E2E evidence. The production E2E coverage is currently limited to distributed registry lookup and live native-process mailbox delivery; live hot reload and guest-Wasm messaging still lack production E2E benchmarks.
+The current suite contains microbenchmark, component-harness, probe/projection, transport-boundary, production E2E, and bounded production acceptance evidence. Production-path coverage now includes distributed registry lookup and live native-process mailbox delivery, sixteen sequential actual guest-Wasm request/reply samples over loopback mTLS, a local actual-Wasm scale/pressure/short-soak gate with measured throughput/rate and p50/p95/p99, and acknowledged local live reload/rollback under full mailboxes. It still does not establish multi-host or partitioned guest latency, large-cluster performance, or multi-day/longitudinal stability.
 
 Historical numeric results in the companion documents are from 2025-10-06. They have no recorded commit or exact hardware/toolchain profile and therefore are not a reproducible current baseline.
 
@@ -28,14 +28,20 @@ Historical numeric results in the companion documents are from 2025-10-06. They 
 | `mailbox.rs` | Microbenchmark | New local mailbox, N direct pushes, one FIFO/selective pop | No sender/receiver processes, host calls, or backpressure |
 | `messaging.rs` | Microbenchmark | Direct push/pop on one local mailbox | Its `round_trip` label is not a process round trip |
 | `hot_reload.rs` | Component harness | Direct compile, registry, instantiate, memory snapshot/restore | No running guest, `Signal::HotReload`, acknowledgement, commit, or rollback |
+| `wasm_scale_soak::actual_wasm_scale_soak_and_resource_pressure_are_bounded` | Bounded production acceptance gate | Actual live Wasm populations 1/8/32, one discarded warm-up plus five measured batches per population, 16 echo rounds per measured batch, tagged request/reply, spawn-batch and mailbox throughput/rate plus spawn/readiness/echo p50/p95/p99, one pre-guest RSS baseline followed by cumulative live populations 1/8/32, 64KiB committed Wasm bytes per guest, exact process admission, mailbox saturation/reuse, sibling progress, a two-page memory ceiling, and 80 spawn/load/kill/join lifecycles | Same-process local fixture; Linux RSS is process-wide and informational, and each RSS delta divided by the live guest count is explicitly non-allocator-attributable; 32 live guests and 80 lifecycles are not a large or multi-day production soak |
+| `wasm_scale_soak::extended_actual_wasm_soak_is_bounded` via `production-soak.yml` | Scheduled and release-tag production endurance gate | Two-hour population-32 spawn/readiness/message/kill/join cycling, exact registration cleanup, and a 512MiB process-wide RSS-growth guard with retained environment/output; the reusable workflow is also a required dependency of version-tag publication | Implemented but not yet run remotely for this branch; RSS remains process-wide, and the workload does not inject partitions or Supervisor crashes |
+| `live_hot_reload_scale::production_hot_reload_scale_soak_preserves_full_mailboxes_and_rolls_back` | Production E2E adversarial gate | Sixteen running Wasm processes, ten alternating acknowledged commits/full-target rollbacks, 1,280 FIFO messages, 160 exact mailbox-full denials, stable identities, a workload summary, and per-run p50/p95/p99 | Local compatible-memory fixture; hard ceilings are CI runaway guards, not a portable `<100ms` product SLA or distributed reload proof |
 | `memory_profile.rs` | Probe/projection | Rust type sizes, example memory snapshot, up to 100 state constructions | No RSS/reachable-heap measurement or large-scale live process run |
 | `instance_pool.rs` | Component harness | Pool acquire/release and hit/miss behavior | Does not establish whole-process spawn behavior under production load |
 | `distributed_messaging.rs` | Micro + transport boundary | Encode/decode and real loopback mTLS QUIC framing/reassembly/dispatch | Stops at decoded callback; no registry-to-live-mailbox delivery |
 | `distributed_latency.rs` | Component + production E2E | Control-plane node lookup; global registry lookup followed by a confirmed two-node mTLS QUIC request/reply through live Lunatic native-process mailboxes | Cluster creation, quorum registration, and connection warm-up are outside measurement; no guest-Wasm host-call boundary |
+| `distributed_registry_e2e::guest_registry_resolves_a_live_remote_mailbox_and_cleans_up_owner_exit` | Production guest-Wasm E2E gate | Sixteen sequential guest registry lookups and confirmed loopback-mTLS request/replies through two live guest-Wasm mailboxes, with average/p50/p95/p99/rate evidence and healthy owner cleanup | Fixed two-node localhost fixture; no multi-host network, partitioned traffic, or portable latency objective |
 | `congestion::tests::adversarial_slow_destination_fairness_benchmark` | Adversarial transport gate | Holds one 128 KiB logical lane above the 64 KiB QUIC stream window while sampling an independent lane 16 times | Loopback mTLS and scheduler-to-peer receipt only; no destination mailbox or production-network latency claim |
+| `registry_coordination::recovered_node_resynchronizes_a_commit_missed_during_partition` | Production-transport recovery gate | Three independent three-node loopback-mTLS partitions and registry resynchronizations with recovery timing | Fresh cluster per cycle; no partitioned guest mailbox or owner-exit recovery |
+| `wasm_link_death::actual_wasm_trap_drives_supervisor_restart_policy` | Production local recovery gate | Three immediate actual-Wasm traps drive three Supervisor replacements before a stable fourth start, followed by zero-registration teardown | Host-side local Supervisor only; no distributed supervision or recovery-time objective |
 | `distributed_registry_e2e::replayed_message_executes_server_side_effect_once_across_reconnect` | Production replay E2E | Reconnects an authenticated peer with the same transport ID and proves the real destination mailbox observes the side effect once | Deterministic correctness gate, not a throughput measurement |
 
-`distributed_registry_live_mailbox_round_trip` is the production-path measurement. Its persistent two-node harness resolves the live echo process from the global registry on node 1, sends through the production distributed client and full node server to node 2, receives the request in a real Lunatic mailbox, sends a confirmed reply, and observes that reply in a live node-1 mailbox. By contrast, `distributed_quic_message_dispatch_2kb` in `distributed_messaging.rs` deliberately stops at the decoded callback boundary and is transport-boundary evidence only.
+`distributed_registry_live_mailbox_round_trip` is the Criterion production-path measurement for native processes. Its persistent two-node harness resolves the live echo process from the global registry on node 1, sends through the production distributed client and full node server to node 2, receives the request in a real Lunatic mailbox, sends a confirmed reply, and observes that reply in a live node-1 mailbox. The guest-Wasm E2E gate separately includes both guest host-call boundaries and reports a fixed sixteen-sample distribution. By contrast, `distributed_quic_message_dispatch_2kb` in `distributed_messaging.rs` deliberately stops at the decoded callback boundary and is transport-boundary evidence only.
 
 ## Quick Start
 
@@ -57,6 +63,20 @@ cargo bench --bench instance_pool
 cargo bench --bench distributed_messaging
 cargo bench --bench distributed_latency
 ```
+
+Run the bounded production acceptance gates:
+
+```bash
+cargo test --release --test wasm_scale_soak \
+  actual_wasm_scale_soak_and_resource_pressure_are_bounded \
+  -- --exact --nocapture
+
+cargo test --release --test live_hot_reload_scale \
+  production_hot_reload_scale_soak_preserves_full_mailboxes_and_rolls_back \
+  -- --ignored --exact --nocapture
+```
+
+The first gate emits `LUNATIC_SCALE_EVIDENCE` JSON lines. On Linux those lines include one process-wide RSS baseline before the incremental 1/8/32 live population and the cumulative after/delta values for each point; other platforms emit `null` rather than substituting a projection. The reload gate prints the actual fixed-round commit and rollback distributions. Both use generous deadlock/runaway watchdogs and exact semantic assertions.
 
 Criterion HTML reports are written below `target/criterion/`.
 
@@ -107,6 +127,8 @@ See [`BENCHMARK_RESULTS.md`](BENCHMARK_RESULTS.md) for the retained details.
 
 On Linux, `.github/workflows/ci.yml` is configured to invoke all eight suites listed above and retain their combined textual output for 30 days.
 
+The separate pinned-Rust `production_evidence` job runs scale, live-reload, timed guest-Wasm distribution, three-cycle partition recovery, slow-consumer fairness, and three-crash Supervisor recovery gates in release mode. It records commit/toolchain/kernel/CPU/memory metadata and retains the raw scale/reload/resilience output for 30 days. Release publication depends on this job and, for version tags, on the reusable two-hour `production-soak.yml` workflow. `scripts/check_core_value_docs.py` parses those records and keeps the corresponding product targets unchecked unless their evidence boundary actually qualifies; it also rejects stale README/CORE_VALUES/status claims. The soak's accepted-run state is recorded in the inventory row above and the canonical status.
+
 The workflow also runs `scripts/check_bench_thresholds.py`, which separately executes and enforces ceilings for these three suites only:
 
 - `messaging`;
@@ -133,7 +155,7 @@ limits replaces the aspirational `<10µs` product target. See
 [`SPAWN_BASELINE_ANALYSIS.md`](SPAWN_BASELINE_ANALYSIS.md) for the decision and
 reproduction record.
 
-Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete. The live-mailbox threshold likewise covers only its fixed two-node native-process fixture, not the guest-Wasm boundary or broader production readiness.
+Passing a threshold protects only that named harness and workload. It does not promote a micro/component/transport benchmark into production E2E evidence and does not mark a `CORE_VALUES.md` target complete. The Criterion live-mailbox threshold covers only its fixed two-node native-process fixture; the separate guest-Wasm evidence covers its fixed sixteen-sample localhost workload, not broader production readiness.
 
 ## Adding or Changing a Benchmark
 
@@ -182,13 +204,13 @@ spawn process           time:   [22.971 µs 23.055 µs 23.139 µs]
 
 ## Required Production Evidence
 
-The suite still needs:
+The bounded gates close the former absence of any live reload or live-Wasm scale measurement for their exact fixtures. The suite still needs:
 
-1. A live running-Wasm `Signal::HotReload` benchmark that asserts interruption, state transition, acknowledgement, commit, failure, and rollback.
-2. A local guest sender-to-live-guest receiver benchmark with serialization, scheduling, bounded-mailbox pressure, and tail latency.
-3. A distributed guest-Wasm round trip through registry lookup, host calls, routing, mTLS QUIC, destination mailbox, and reply. The native-process production-path benchmark does not include the guest host-call boundary.
-4. Actual process RSS/reachable-heap measurement under idle and loaded states.
-5. Increasing-count scale tests and sustained soak tests with resource usage, queue depth, latency percentiles, failures, and recovery.
+1. A calibrated paired-base/head policy for the live-reload distribution and a broader guest entrypoint-reentry workload before treating `<100ms` as portable product evidence.
+2. A sustained guest sender-to-live-guest workload combining guest-side serialization, bounded-mailbox pressure, scheduler contention, and tail latency. The new distributed guest fixture measures sixteen sequential request/replies, while the scale gate uses a host sender and native observer.
+3. Multi-host and partitioned guest-Wasm latency/recovery through registry lookup, host calls, routing, mTLS QUIC, destination mailbox, and reply. The current guest measurement is a fixed healthy loopback fixture.
+4. Allocator/reachable-heap attribution per live process under idle and loaded states. The Linux `[1, 8, 32]` curve uses one pre-guest process-wide RSS baseline and cumulative live populations, while each delta divided by live guest count remains only a non-allocator-attributable proxy for committed bytes.
+5. Fresh retained runs of the two-hour population-32 soak, followed by larger increasing-count and sustained chaos runs with longitudinal CPU, queue depth, failure, and recovery telemetry. Ten rounds or 80 lifecycles remain bounded regression gates and do not establish multi-day stability.
 6. Supervisor/link failure and resource-limit overhead benchmarks on their production paths.
 
 Until those exist, the live reload, end-to-end messaging, one-million-process, and production-readiness targets remain unverified regardless of component benchmark speed.

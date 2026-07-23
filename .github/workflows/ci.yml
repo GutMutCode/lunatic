@@ -18,8 +18,12 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Validate workspace versions and changelog contract
         run: python scripts/check_release_contract.py
+      - name: Validate core-value evidence and documentation contract
+        run: python scripts/check_core_value_docs.py --self-test
 
   public_api:
     name: Public API compatibility
@@ -220,6 +224,82 @@ jobs:
           LUNATIC_MULTILANGUAGE_GUESTS_REQUIRED: "1"
         run: cargo +1.94.0 test --test multilanguage_guest_e2e -- --nocapture
 
+  production_evidence:
+    name: Production scale and resilience evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install pinned Rust
+        uses: dtolnay/rust-toolchain@1.94.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Record production evidence environment
+        shell: bash
+        run: |
+          set -o pipefail
+          {
+            git rev-parse HEAD
+            rustc -Vv
+            uname -a
+            lscpu
+            free -b
+          } | tee production-environment.txt
+      - name: Run actual-Wasm scale, pressure, and bounded-soak gate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test wasm_scale_soak \
+            actual_wasm_scale_soak_and_resource_pressure_are_bounded \
+            -- --exact --nocapture 2>&1 | tee wasm-scale-soak.txt
+      - name: Run production live-reload commit and rollback scale gate
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --release --locked --test live_hot_reload_scale \
+            production_hot_reload_scale_soak_preserves_full_mailboxes_and_rolls_back \
+            -- --ignored --exact --nocapture 2>&1 | tee live-hot-reload-scale.txt
+      - name: Run distributed and crash-recovery resilience gates
+        shell: bash
+        run: |
+          set -o pipefail
+          : > production-resilience.txt
+          cargo test --release --locked --test distributed_registry_e2e \
+            guest_registry_resolves_a_live_remote_mailbox_and_cleans_up_owner_exit \
+            -- --exact --nocapture 2>&1 | tee -a production-resilience.txt
+          cargo test --release --locked -p lunatic-distributed --test registry_coordination \
+            recovered_node_resynchronizes_a_commit_missed_during_partition \
+            -- --exact --nocapture 2>&1 | tee -a production-resilience.txt
+          cargo test --release --locked -p lunatic-distributed \
+            congestion::tests::adversarial_slow_destination_fairness_benchmark \
+            -- --exact --nocapture 2>&1 | tee -a production-resilience.txt
+          cargo test --release --locked --test wasm_link_death \
+            actual_wasm_trap_drives_supervisor_restart_policy \
+            -- --exact --nocapture 2>&1 | tee -a production-resilience.txt
+      - name: Compare production evidence with core-value claims
+        run: >-
+          python scripts/check_core_value_docs.py
+          --scale-output wasm-scale-soak.txt
+          --require-linux-rss
+          --live-reload-output live-hot-reload-scale.txt
+          --resilience-output production-resilience.txt
+      - name: Upload production evidence
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: production-evidence-${{ github.sha }}
+          path: |
+            production-environment.txt
+            wasm-scale-soak.txt
+            live-hot-reload-scale.txt
+            production-resilience.txt
+          if-no-files-found: error
+          retention-days: 30
+
   test_or_release:
     name: Test & (release)
     runs-on: ${{ matrix.os }}
@@ -245,6 +325,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - name: Install latest Rust
         if: runner.os != 'macOS'
         uses: dtolnay/rust-toolchain@stable
@@ -259,7 +341,7 @@ jobs:
       # Rust builds can take some time, cache them.
       - uses: Swatinem/rust-cache@v2
       - name: "Run clippy check"
-        run: cargo clippy --examples --tests --benches -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: "Check formatting"
         run: cargo fmt --all -- --check
       - name: "Verify Windows Wasm lifecycle semantics"
@@ -294,6 +376,9 @@ jobs:
       - name: "Check benchmark thresholds"
         if: runner.os == 'Linux'
         run: ./scripts/check_bench_thresholds.py
+      - name: "Compare core-value claims with benchmark evidence"
+        if: runner.os == 'Linux'
+        run: python scripts/check_core_value_docs.py --benchmark-output benchmark_output.txt
 
       - name: Build project on Linux and Windows
         if: runner.os != 'macOS'
@@ -321,10 +406,15 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  release_soak:
+    name: Release two-hour production soak
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/production-soak.yml
+
   release:
     name: Publish draft release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [public_api, release_contract, spawn_regression, multilanguage_guests, test_or_release]
+    needs: [public_api, release_contract, spawn_regression, multilanguage_guests, production_evidence, test_or_release, release_soak]
     runs-on: ubuntu-latest
     permissions:
       contents: write

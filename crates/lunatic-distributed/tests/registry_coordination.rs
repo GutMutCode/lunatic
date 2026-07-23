@@ -439,28 +439,50 @@ async fn registration_does_not_succeed_before_a_majority_responds() -> Result<()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn recovered_node_resynchronizes_a_commit_missed_during_partition() -> Result<()> {
+    const PARTITION_CYCLES: usize = 3;
+
     let _test_guard = TEST_CLUSTER_LOCK.lock().await;
-    let mut cluster = TestCluster::new(3).await?;
-    cluster.pause(2).await;
+    let mut recovery_latencies = Vec::with_capacity(PARTITION_CYCLES);
 
-    let gpid = GlobalProcessId::new(1, 1, 900);
-    cluster
-        .client(0)
-        .register_global("partitioned-service", gpid)
-        .await?;
-    assert!(
-        cluster.nodes[2]
-            .client
-            .registry()
-            .lookup_global("partitioned-service")
-            .is_none(),
-        "partitioned node unexpectedly observed the commit"
+    for cycle in 0..PARTITION_CYCLES {
+        // Use a fresh production-transport cluster for each cycle. QUIC endpoints intentionally
+        // retain connection state after a close, so immediately rebinding one logical node to
+        // the same UDP address would turn this into an OS socket-reuse test rather than a
+        // registry recovery test.
+        let mut cluster = TestCluster::new(3).await?;
+        cluster.pause(2).await;
+
+        let name = format!("partitioned-service-{cycle}");
+        let gpid = GlobalProcessId::new(1, 1, 900 + cycle as u64);
+        cluster
+            .client(0)
+            .register_global(name.as_str(), gpid)
+            .await?;
+        assert!(
+            cluster.nodes[2]
+                .client
+                .registry()
+                .lookup_global(name.as_str())
+                .is_none(),
+            "partitioned node unexpectedly observed cycle {cycle}'s commit"
+        );
+
+        let recovery_started = Instant::now();
+        cluster.resume(2).await?;
+        cluster
+            .wait_for_value(&name, gpid, Duration::from_secs(6))
+            .await?;
+        recovery_latencies.push(recovery_started.elapsed());
+    }
+
+    recovery_latencies.sort_unstable();
+    let p50 = recovery_latencies[PARTITION_CYCLES.div_ceil(2) - 1];
+    let p99 = recovery_latencies[PARTITION_CYCLES - 1];
+    println!(
+        "LUNATIC_RESILIENCE_EVIDENCE {{\"kind\":\"registry_partition_recovery\",\"cycles\":{PARTITION_CYCLES},\"converged\":true,\"recovery_p50_ms\":{:.3},\"recovery_p99_ms\":{:.3}}}",
+        p50.as_secs_f64() * 1_000.0,
+        p99.as_secs_f64() * 1_000.0
     );
-
-    cluster.resume(2).await?;
-    cluster
-        .wait_for_value("partitioned-service", gpid, Duration::from_secs(6))
-        .await?;
     Ok(())
 }
 

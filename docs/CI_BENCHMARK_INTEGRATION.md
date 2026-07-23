@@ -6,7 +6,31 @@ Lunatic keeps Criterion benchmarks in the repository-root [`benches/`](../benche
 directory. [The main CI workflow](../.github/workflows/ci.yml) retains the
 current commit's Linux results, applies absolute limits to workloads with a
 stable service boundary, and evaluates process spawn with a same-runner paired
-base/head comparison.
+base/head comparison. A separate production-evidence job exercises bounded
+actual-Wasm scale/pressure/soak and live reload/rollback paths. A new
+[production-soak workflow](../.github/workflows/production-soak.yml) is also
+defined for Sunday/manual two-hour population-32 lifecycle/message soaks with a
+512MiB process-wide RSS-growth guard and retained artifacts. The canonical
+status and benchmark suite record whether an accepted run exists. The same
+workflow is reusable from the main CI graph: version-tag publication depends
+on it, while ordinary branch and pull-request runs leave the two-hour job
+skipped.
+
+When the accepted-evidence state changes, replace the pending wording in both
+the canonical status and benchmark suite with the same run URL and checkout SHA
+in this form:
+
+```text
+Verified two-hour soak: [GitHub Actions run 123](https://github.com/owner/repository/actions/runs/123) at commit `<40-character SHA>`
+```
+
+The documentation checker accepts either the consistent pending state or one
+matching run URL/SHA pair in both documents, so the initial pre-run wording is
+not a permanent contract. In CI, its offline provenance check restricts the URL
+to that workflow's repository; local checks accept a configured GitHub remote.
+It also requires the named commit to exist and be an ancestor of the checkout. Completing the Hanary task still
+requires inspecting the linked run conclusion and retained artifacts; the
+offline checker does not query GitHub to attest those remote facts.
 
 ## Current benchmark targets
 
@@ -62,6 +86,30 @@ before the comparison starts can legitimately leave no artifact. The 75µs
 backstop is an emergency bound for this minimal harness; paired change is the
 normal regression signal.
 
+The `production_evidence` job uses pinned Rust 1.94.0 in release mode. It runs
+`tests/wasm_scale_soak.rs`, the ignored `tests/live_hot_reload_scale.rs` gate,
+the timed guest-Wasm distributed E2E, three partition-recovery cycles, the
+slow-consumer fairness gate, and three crash-driven actual-Wasm Supervisor
+restarts. It records the commit/toolchain/kernel/CPU/memory environment and
+uploads the raw scale, reload, and resilience logs for 30 days. The scale gate emits machine-readable live-population,
+one discarded warm-up plus five measured batches per population, spawn and mailbox throughput/rate,
+spawn/readiness/echo p50/p95/p99, RSS, mailbox/memory-pressure, and bounded-
+lifecycle records, including 64KiB committed Wasm bytes per guest and a Linux
+single-baseline process-wide RSS curve at cumulative live populations 1/8/32,
+with each delta divided by its live guest count. The live-reload gate emits the 16-
+process, 10-round workload summary with 5 commit + 5 rollback rounds, 1,280
+FIFO messages, 160 exact mailbox-full denials, separate fixed-round
+commit/rollback percentiles, and separately asserts the expected terminal
+coordinator state after every round. Its hard timing values are runaway guards,
+not a portable performance SLA.
+
+`scripts/check_core_value_docs.py` consumes the current benchmark and
+production-evidence outputs in CI. It checks fixed workload counts and fails if
+a component or microbenchmark is used to complete a production target, if
+protected checkboxes drift from their executable evidence, or if active
+documentation reintroduces known stale claims. The scheduled workflow passes
+`--require-extended-soak`, which rejects an incomplete or sub-two-hour record.
+
 ## Local commands
 
 Run one target directly:
@@ -83,6 +131,25 @@ Run the paired spawn comparison used by CI:
 python scripts/compare_spawn_bench.py <base> <head> \
   --output-dir spawn-comparison
 ```
+
+Run the bounded production gates:
+
+```bash
+cargo test --release --test wasm_scale_soak \
+  actual_wasm_scale_soak_and_resource_pressure_are_bounded -- --exact --nocapture
+cargo test --release --test live_hot_reload_scale \
+  production_hot_reload_scale_soak_preserves_full_mailboxes_and_rolls_back \
+  -- --ignored --exact --nocapture
+
+cargo test --release --test distributed_registry_e2e \
+  guest_registry_resolves_a_live_remote_mailbox_and_cleans_up_owner_exit \
+  -- --exact --nocapture
+```
+
+The two-hour test is ignored in ordinary workspace runs. Use the manual
+`Production actual-Wasm soak` workflow to preserve its environment and raw
+output; shortening its duration is suitable only for a local smoke test and
+does not satisfy the evidence checker.
 
 Use an otherwise idle machine. The script isolates the commits' Cargo targets
 and Criterion homes, records the resolved revisions and environment, and

@@ -386,6 +386,7 @@ struct WasmHarness {
 
 static SUPERVISED_WASM_HARNESS: OnceLock<WasmHarness> = OnceLock::new();
 static SUPERVISED_WASM_STARTS: AtomicUsize = AtomicUsize::new(0);
+const SUPERVISED_WASM_FAILURES_BEFORE_STABLE: usize = 3;
 
 impl WasmHarness {
     fn new() -> Result<Self> {
@@ -448,7 +449,9 @@ fn start_supervised_wasm(
     let harness = SUPERVISED_WASM_HARNESS
         .get()
         .ok_or_else(|| "supervised Wasm harness was not initialized".to_string())?;
-    let function = if SUPERVISED_WASM_STARTS.fetch_add(1, Ordering::SeqCst) == 0 {
+    let function = if SUPERVISED_WASM_STARTS.fetch_add(1, Ordering::SeqCst)
+        < SUPERVISED_WASM_FAILURES_BEFORE_STABLE
+    {
         "fail_now"
     } else {
         "supervised_wait"
@@ -816,7 +819,7 @@ async fn actual_wasm_trap_drives_supervisor_restart_policy() -> Result<()> {
     let supervisor = Supervisor::spawn_with_environment(
         SupervisorSpec {
             strategy: RestartStrategy::OneForOne,
-            max_restarts: 3,
+            max_restarts: (SUPERVISED_WASM_FAILURES_BEFORE_STABLE + 1) as u32,
             max_seconds: 60,
             children: vec![ChildSpec {
                 id: "wasm-worker".to_string(),
@@ -829,15 +832,13 @@ async fn actual_wasm_trap_drives_supervisor_restart_policy() -> Result<()> {
         environment.clone(),
     )
     .map_err(anyhow::Error::msg)?;
-    let supervisor_id = supervisor.id();
 
     let replacement = timeout(TEST_TIMEOUT, async {
         loop {
-            if let Some(child) = supervisor
-                .which_children()
-                .into_iter()
-                .find(|child| child.id == "wasm-worker" && child.restart_count == 1)
-            {
+            if let Some(child) = supervisor.which_children().into_iter().find(|child| {
+                child.id == "wasm-worker"
+                    && child.restart_count == SUPERVISED_WASM_FAILURES_BEFORE_STABLE as u32
+            }) {
                 if let Some(process_id) = child.process_id {
                     break process_id;
                 }
@@ -850,7 +851,7 @@ async fn actual_wasm_trap_drives_supervisor_restart_policy() -> Result<()> {
         Ok(process_id) => process_id,
         Err(error) => {
             let _ = supervisor.shutdown();
-            return Err(error).context("Supervisor did not restart the trapped Wasm child");
+            return Err(error).context("Supervisor did not survive repeated trapped Wasm children");
         }
     };
     let replacement_was_active = environment.get_process(replacement_id).is_some();
@@ -859,25 +860,40 @@ async fn actual_wasm_trap_drives_supervisor_restart_policy() -> Result<()> {
 
     supervisor.shutdown().map_err(anyhow::Error::msg)?;
     timeout(TEST_TIMEOUT, async {
-        while environment.get_process(supervisor_id).is_some()
-            || environment.get_process(replacement_id).is_some()
-        {
+        while environment.process_count() != 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .context("Supervisor or replacement Wasm child remained registered after shutdown")?;
+    .with_context(|| {
+        format!(
+            "Supervisor teardown retained {} registered processes after shutdown",
+            environment.process_count()
+        )
+    })?;
+    let registered_after_shutdown = environment.process_count();
 
     assert_eq!(
-        start_count, 2,
-        "the immediate trap should cause exactly one replacement start"
+        start_count,
+        SUPERVISED_WASM_FAILURES_BEFORE_STABLE + 1,
+        "each immediate trap should cause one replacement before the stable child"
     );
     assert!(
         replacement_was_active,
         "the replacement Wasm child should remain active until supervisor shutdown"
     );
-    assert_eq!(restart_history.len(), 1);
-    assert_eq!(restart_history[0].1, "wasm-worker");
+    assert_eq!(
+        restart_history.len(),
+        SUPERVISED_WASM_FAILURES_BEFORE_STABLE
+    );
+    assert!(restart_history
+        .iter()
+        .all(|(_, child_id)| child_id == "wasm-worker"));
+    println!(
+        "LUNATIC_RESILIENCE_EVIDENCE {{\"kind\":\"repeated_wasm_crash_restart\",\"failures\":{},\"starts\":{},\"stable_replacement_active\":true,\"registered_after_shutdown\":{registered_after_shutdown}}}",
+        SUPERVISED_WASM_FAILURES_BEFORE_STABLE,
+        start_count
+    );
     Ok(())
 }
 
