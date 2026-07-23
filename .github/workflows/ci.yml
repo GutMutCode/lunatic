@@ -12,6 +12,7 @@ name: Test & (release)
 jobs:
   release_contract:
     name: Release contract
+    if: ${{ ! startsWith(github.ref, 'refs/tags/soak-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,6 +28,7 @@ jobs:
 
   public_api:
     name: Public API compatibility
+    if: ${{ ! startsWith(github.ref, 'refs/tags/soak-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -72,6 +74,7 @@ jobs:
         with:
           baseline-rev: ${{ steps.api_baseline.outputs.rev }}
           exclude: lunatic-otp-patterns
+          rust-toolchain: "1.94.0"
       - name: Compile the locked 0.13 downstream contract
         run: cargo check --locked --manifest-path tests/fixtures/public-api-0-13/Cargo.toml
       - name: Run the migrated downstream contract
@@ -81,6 +84,7 @@ jobs:
 
   spawn_regression:
     name: Paired spawn regression
+    if: ${{ ! startsWith(github.ref, 'refs/tags/soak-') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
@@ -99,6 +103,8 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           GIT_REF: ${{ github.ref }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Commit that introduced the paired spawn gate with the current fixtures.
+          SPAWN_BOOTSTRAP_BASELINE: 4419420e467f65c30f9895d567a702a881abe185
         run: |
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             baseline="$PR_BASE_SHA"
@@ -127,6 +133,23 @@ jobs:
           fi
           if [[ -z "$baseline" ]] || ! git cat-file -e "${baseline}^{commit}" 2>/dev/null; then
             echo "Unable to select a spawn benchmark baseline" >&2
+            exit 1
+          fi
+          if ! git cat-file -e "${baseline}:benches/spawn.rs" 2>/dev/null || \
+             ! git cat-file -e "${baseline}:wat/hello.wat" 2>/dev/null; then
+            if git cat-file -e "${SPAWN_BOOTSTRAP_BASELINE}^{commit}" 2>/dev/null && \
+               git merge-base --is-ancestor "$SPAWN_BOOTSTRAP_BASELINE" HEAD && \
+               git cat-file -e "${SPAWN_BOOTSTRAP_BASELINE}:benches/spawn.rs" 2>/dev/null && \
+               git cat-file -e "${SPAWN_BOOTSTRAP_BASELINE}:wat/hello.wat" 2>/dev/null && \
+               git diff --quiet "$SPAWN_BOOTSTRAP_BASELINE" HEAD -- benches/spawn.rs wat/hello.wat; then
+              echo "::notice::Selected baseline lacks the spawn parity fixtures; using the stable bootstrap anchor"
+              baseline="$SPAWN_BOOTSTRAP_BASELINE"
+            fi
+          fi
+          if ! git cat-file -e "${baseline}:benches/spawn.rs" 2>/dev/null || \
+             ! git cat-file -e "${baseline}:wat/hello.wat" 2>/dev/null || \
+             ! git diff --quiet "$baseline" HEAD -- benches/spawn.rs wat/hello.wat; then
+            echo "Spawn benchmark baseline must contain parity fixtures identical to HEAD" >&2
             exit 1
           fi
           echo "rev=$baseline" >> "$GITHUB_OUTPUT"
@@ -164,6 +187,7 @@ jobs:
 
   multilanguage_guests:
     name: Multi-language guest E2E
+    if: ${{ ! startsWith(github.ref, 'refs/tags/soak-') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -226,6 +250,7 @@ jobs:
 
   production_evidence:
     name: Production scale and resilience evidence
+    if: ${{ ! startsWith(github.ref, 'refs/tags/soak-') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -302,6 +327,7 @@ jobs:
 
   test_or_release:
     name: Test & (release)
+    if: ${{ ! startsWith(github.ref, 'refs/tags/soak-') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     permissions:
@@ -357,9 +383,9 @@ jobs:
           cargo bench --bench mailbox --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           cargo bench --bench hot_reload --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           cargo bench --bench memory_profile --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
-          cargo bench --bench instance_pool --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
-          cargo bench --bench messaging --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
-          cargo bench --bench distributed_messaging --no-fail-fast -- --output-format bencher --quick | tee -a benchmark_output.txt
+          cargo bench --bench instance_pool --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
+          cargo bench --bench messaging --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
+          cargo bench --bench distributed_messaging --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           cargo bench --bench distributed_latency --no-fail-fast -- --output-format bencher | tee -a benchmark_output.txt
           echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
@@ -407,8 +433,9 @@ jobs:
           retention-days: 30
 
   release_soak:
-    name: Release two-hour production soak
-    if: startsWith(github.ref, 'refs/tags/v')
+    name: Version or evidence two-hour production soak
+    # Evidence tags bootstrap a retained soak before this workflow reaches the default branch.
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/soak-')
     uses: ./.github/workflows/production-soak.yml
 
   release:

@@ -66,6 +66,8 @@ pub enum ConfigError {
     TomlEncodingFailed,
     TomlDecodingFailed,
     FileWriteFailed,
+    // Windows' replace primitive already requests write-through durability.
+    #[cfg_attr(not(unix), allow(dead_code))]
     FileDurabilityUncertain,
     FileReadFailed,
     CredentialStore(CredentialStoreError),
