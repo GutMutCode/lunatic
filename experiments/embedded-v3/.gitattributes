@@ -1,0 +1,4 @@
+protocol/candidate-wire-frozen.rs text eol=lf
+candidates/**/*.rs text eol=lf
+tools/*.mjs text eol=lf
+protocol/*.json text eol=lf

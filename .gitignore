@@ -14,3 +14,6 @@ examples/*/target/
 examples/*/.zig-cache/
 examples/*/zig-out/
 examples/go/*_example
+
+# Comparison experiment build artifacts.
+experiments/**/target/

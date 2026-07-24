@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v2/control.schema.json",
+  "title": "Embedded v2 oracle-to-candidate control",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment_id", "run_id", "request_id", "kind", "data"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "experiment_id": { "const": "embedded-v2-2026-07-23" },
+    "run_id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+    "request_id": { "$ref": "#/$defs/id" },
+    "kind": {
+      "enum": [
+        "hello",
+        "initialize",
+        "create_tenant",
+        "set_gate",
+        "command",
+        "rollout",
+        "snapshot",
+        "authority_canary",
+        "teardown",
+        "shutdown"
+      ]
+    },
+    "data": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "hello" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/empty" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "initialize" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/initialize" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "create_tenant" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/createTenant" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "set_gate" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/setGate" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "command" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/command" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "rollout" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/rollout" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "snapshot" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/tenantOnly" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "authority_canary" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/authority" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "enum": ["teardown", "shutdown"] } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/empty" } } }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "u64": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "tenant": { "type": "integer", "minimum": 0, "maximum": 31 },
+    "empty": { "type": "object", "additionalProperties": false, "maxProperties": 0 },
+    "initialize": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["worker_threads", "mailbox_limit", "max_payload_bytes", "cpu_deadline_ms"],
+      "properties": {
+        "worker_threads": { "const": 4 },
+        "mailbox_limit": { "const": 64 },
+        "max_payload_bytes": { "const": 1024 },
+        "cpu_deadline_ms": { "const": 50 }
+      }
+    },
+    "createTenant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "version"],
+      "properties": {
+        "tenant_id": { "$ref": "#/$defs/tenant" },
+        "version": { "enum": ["A", "B"] }
+      }
+    },
+    "setGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "state"],
+      "properties": {
+        "tenant_id": { "$ref": "#/$defs/tenant" },
+        "state": { "enum": ["open", "closed"] }
+      }
+    },
+    "command": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "command_id", "sequence", "operation", "payload_hex", "expected_version"],
+      "properties": {
+        "tenant_id": { "$ref": "#/$defs/tenant" },
+        "command_id": { "$ref": "#/$defs/id" },
+        "sequence": { "$ref": "#/$defs/u64" },
+        "operation": { "enum": ["increment", "probe", "trap", "cpu_loop"] },
+        "payload_hex": { "type": "string", "pattern": "^(?:[0-9a-f]{2})*$", "maxLength": 2050 },
+        "expected_version": { "enum": ["A", "B"] }
+      }
+    },
+    "rollout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rollout_id", "source_version", "artifact", "target_tenants"],
+      "properties": {
+        "rollout_id": { "$ref": "#/$defs/id" },
+        "source_version": { "enum": ["A", "B"] },
+        "artifact": { "enum": ["A", "B", "bad_A", "bad_B"] },
+        "target_tenants": {
+          "type": "array",
+          "minItems": 16,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "prefixItems": [
+            { "const": 0 }, { "const": 1 }, { "const": 2 }, { "const": 3 },
+            { "const": 4 }, { "const": 5 }, { "const": 6 }, { "const": 7 },
+            { "const": 8 }, { "const": 9 }, { "const": 10 }, { "const": 11 },
+            { "const": 12 }, { "const": 13 }, { "const": 14 }, { "const": 15 }
+          ],
+          "items": false
+        }
+      }
+    },
+    "tenantOnly": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id"],
+      "properties": { "tenant_id": { "$ref": "#/$defs/tenant" } }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tenant_id", "nonce_hex", "sentinel_path", "create_path", "tcp_port", "udp_port"],
+      "properties": {
+        "tenant_id": { "$ref": "#/$defs/tenant" },
+        "nonce_hex": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+        "sentinel_path": { "type": "string", "minLength": 1 },
+        "create_path": { "type": "string", "minLength": 1 },
+        "tcp_port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "udp_port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    }
+  }
+}

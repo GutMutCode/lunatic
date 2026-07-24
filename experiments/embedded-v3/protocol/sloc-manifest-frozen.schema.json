@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v3/sloc-manifest-frozen.schema.json",
+  "title": "Embedded v3 frozen candidate SLOC attribution",
+  "description": "Structural companion to tools/sloc-frozen.mjs. The tool additionally enforces complete attribution, filesystem identity, source topology, rustfmt, Cargo metadata, dependency pins, canonical byte identity, and guest provenance.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate", "entries"],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "candidate": {
+      "enum": ["lunatic", "direct-wasmtime", "extism"]
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 6,
+      "items": {
+        "oneOf": [
+          { "$ref": "#/$defs/production" },
+          { "$ref": "#/$defs/test" },
+          { "$ref": "#/$defs/accounting" },
+          { "$ref": "#/$defs/lockfile" },
+          { "$ref": "#/$defs/canonicalCopy" },
+          { "$ref": "#/$defs/binaryGuest" }
+        ]
+      },
+      "allOf": [
+        {
+          "contains": { "$ref": "#/$defs/accounting" },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": { "$ref": "#/$defs/lockfile" },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": { "$ref": "#/$defs/canonicalCopy" },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?($|/)).*[^/]$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "production": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "category"],
+      "properties": {
+        "path": {
+          "allOf": [
+            { "$ref": "#/$defs/path" },
+            { "not": { "enum": ["sloc-manifest.json", "Cargo.lock", "src/protocol.rs"] } },
+            {
+              "not": {
+                "pattern": "^(?:docs?/|(?:README|LICENSE|LICENCE|COPYING|NOTICE)(?:\\..+)?$)"
+              }
+            }
+          ]
+        },
+        "role": { "const": "production" },
+        "category": { "type": "string", "minLength": 1 }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "category"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^(?!.*(?:^|/)build\\.rs$)tests/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.rs$"
+        },
+        "role": { "const": "test" },
+        "category": { "type": "string", "minLength": 1 }
+      }
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "category"],
+      "properties": {
+        "path": { "const": "sloc-manifest.json" },
+        "role": { "const": "accounting" },
+        "category": { "const": "accounting-metadata" }
+      }
+    },
+    "lockfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "role", "category", "reason", "generator", "source"],
+      "properties": {
+        "path": { "const": "Cargo.lock" },
+        "role": { "const": "lockfile" },
+        "category": { "const": "dependency-lock" },
+        "reason": { "const": "Cargo dependency resolution; verified by cargo metadata --locked" },
+        "generator": { "const": "cargo" },
+        "source": { "const": "Cargo.toml" }
+      }
+    },
+    "canonicalCopy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "role",
+        "category",
+        "reason",
+        "generator",
+        "source",
+        "generated_kind",
+        "canonical_id",
+        "sha256"
+      ],
+      "properties": {
+        "path": { "const": "src/protocol.rs" },
+        "role": { "const": "generated" },
+        "category": { "const": "common-protocol" },
+        "reason": { "const": "Frozen runtime-neutral candidate wire bytes shared by every candidate" },
+        "generator": { "const": "exact-copy" },
+        "source": { "const": "protocol/candidate-wire-frozen.rs" },
+        "generated_kind": { "const": "canonical-copy" },
+        "canonical_id": { "const": "embedded-v3-candidate-wire-v3" },
+        "sha256": { "const": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682" }
+      }
+    },
+    "binaryGuest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "role",
+        "category",
+        "reason",
+        "generator",
+        "source",
+        "generated_kind",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^guest-artifacts/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\\.wasm$"
+        },
+        "role": { "const": "generated" },
+        "category": { "const": "guest-artifact" },
+        "reason": { "const": "Compiled WebAssembly guest artifact; source remains separately attributed" },
+        "generator": { "type": "string", "minLength": 1 },
+        "source": {
+          "type": "string",
+          "pattern": "^(?:candidate:[^\\\\]+|experiment:guests/core/[^\\\\]+)$"
+        },
+        "generated_kind": { "const": "binary-guest" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

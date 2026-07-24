@@ -1,0 +1,42 @@
+[package]
+name = "embedded-v3-oracle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+autobins = false
+
+[dependencies]
+anyhow.workspace = true
+embedded-v3-authority-guests.workspace = true
+extism.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlite.workspace = true
+thiserror.workspace = true
+wasmtime.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[[bin]]
+name = "embedded-v3-oracle"
+path = "src/bin/oracle_v3.rs"
+
+[[bin]]
+name = "fake-candidate"
+path = "src/bin/fake_candidate_v3.rs"
+
+[[bin]]
+name = "embedded-v3-core-smoke"
+path = "src/bin/core_smoke.rs"
+
+[[bin]]
+name = "embedded-v3-full-run"
+path = "src/bin/full_run.rs"
+
+[[bin]]
+name = "embedded-v3-verdict"
+path = "src/bin/verdict.rs"

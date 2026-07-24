@@ -1,0 +1,45 @@
+{
+  "schema_version": 3,
+  "candidate": "direct-wasmtime",
+  "entries": [
+    {
+      "path": "Cargo.lock",
+      "role": "lockfile",
+      "category": "dependency-lock",
+      "reason": "Cargo resolution is generated and excluded from handwritten SLOC",
+      "generator": "cargo",
+      "source": "Cargo.toml"
+    },
+    {
+      "path": "Cargo.toml",
+      "role": "production",
+      "category": "build-configuration"
+    },
+    {
+      "path": "generated.txt",
+      "role": "generated",
+      "category": "generated-fixture",
+      "reason": "Exercises generated-file attribution",
+      "generator": "embedded-v3 sloc self-test fixture",
+      "source": "tools/test-fixtures/normal"
+    },
+    {
+      "path": "sloc-manifest.json",
+      "role": "generated",
+      "category": "accounting-metadata",
+      "reason": "The accounting manifest is protocol metadata, not candidate implementation",
+      "generator": "hand-authored frozen fixture",
+      "source": "protocol/sloc-manifest.schema.json"
+    },
+    {
+      "path": "src/lib.rs",
+      "role": "production",
+      "category": "host"
+    },
+    {
+      "path": "tests/smoke.rs",
+      "role": "test",
+      "category": "test"
+    }
+  ]
+}

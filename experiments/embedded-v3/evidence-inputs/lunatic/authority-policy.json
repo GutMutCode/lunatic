@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "policy_id": "embedded-v3-lunatic-production-authority-v1",
+  "candidate": "lunatic",
+  "default_capability_decision": "deny",
+  "enforcement": {
+    "configuration": "CandidateState::register adds only the comparison ABI to Lunatic's Wasmtime linker, and CandidateState::new_state rejects guest child spawning.",
+    "declaration_binding": "The candidate validates and echoes production_policy_sha256 on every authority terminal event; the policy JSON is not interpreted at runtime. Linker behavior plus the external authority canary is the enforcement evidence.",
+    "source": [
+      {
+        "path": "experiments/embedded-v3/candidates/lunatic/src/state.rs",
+        "sha256": "6d2ea611fcde1c0951806c79ee1483af1ff1c4e3659110592b08cc7a310c1b07",
+        "symbols": [
+          "CandidateConfig::production",
+          "CandidateState::new_state",
+          "CandidateState::register"
+        ]
+      },
+      {
+        "path": "experiments/embedded-v3/candidates/lunatic/src/host.rs",
+        "sha256": "34e8b3ca8ee995c3cd1aff4c9158486469509066c210d98fd113fda5ba01f256",
+        "symbols": [
+          "Host::authority"
+        ]
+      }
+    ]
+  },
+  "custom_imports_allowed": [
+    "comparison::tenant_id",
+    "comparison::restore_counter",
+    "comparison::command_handle",
+    "comparison::activation_started",
+    "comparison::emit_result",
+    "comparison::execution_started",
+    "comparison::bind_observer",
+    "comparison::next_command"
+  ],
+  "capability_grants": {
+    "wasi_preview1": false,
+    "filesystem_read": false,
+    "filesystem_mutate": false,
+    "tcp": false,
+    "udp": false,
+    "sqlite": false,
+    "http": false,
+    "guest_child_spawn": false
+  },
+  "resource_limits": {
+    "linear_memory_bytes": 65536,
+    "table_elements": 1024,
+    "mailbox_messages": 64,
+    "signal_queue_messages": 65,
+    "message_bytes": 1024,
+    "message_resources": 0
+  },
+  "candidate_side_probe_import_match": false,
+  "candidate_side_probe_import_match_note": "Host::authority compiles the artifact and requires a genuine missing-import error but does not map probe to the exact import. The frozen artifact digest, probe pairing, and external no-effect observer provide that binding.",
+  "authority_probe_expectations": [
+    {
+      "probe": "wasi_p1_fs_read",
+      "stage": "compile",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "wasi_p1_fs_mutate",
+      "stage": "compile",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_tcp",
+      "stage": "compile",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_udp",
+      "stage": "compile",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_sqlite_create",
+      "stage": "compile",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "extism_http",
+      "stage": "compile",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    }
+  ]
+}

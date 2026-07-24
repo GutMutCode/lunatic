@@ -1,0 +1,78 @@
+(module
+  (import "wasi_snapshot_preview1" "path_open"
+    (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_close"
+    (func $fd_close (param i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_rename"
+    (func $path_rename (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_unlink_file"
+    (func $path_unlink_file (param i32 i32 i32) (result i32)))
+
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "__PARAM_BLOB__")
+  (data (i32.const 4096) "__MUTATE_PATH_BYTES__")
+  (data (i32.const 6144) "__CREATE_PATH_BYTES__")
+  (data (i32.const 8192) "__NONCE_BYTES__")
+
+  (func (export "parameter_ptr") (result i32) (i32.const 1024))
+  (func (export "parameter_len") (result i32) (i32.const __PARAM_LEN__))
+
+  (func $write_path (param $path i32) (param $path_len i32) (param $oflags i32)
+    (result i32)
+    (local $errno i32)
+    (local $fd i32)
+
+    (local.set $errno
+      (call $path_open
+        (i32.const __PREOPEN_FD__) (i32.const 0)
+        (local.get $path) (local.get $path_len)
+        (local.get $oflags) (i64.const 64) (i64.const 0)
+        (i32.const 0) (i32.const 80)))
+    (if (i32.ne (local.get $errno) (i32.const 0))
+      (then (return (local.get $errno))))
+
+    (local.set $fd (i32.load (i32.const 80)))
+    (i32.store (i32.const 64) (i32.const 8192))
+    (i32.store (i32.const 68) (i32.const __NONCE_LEN__))
+    (local.set $errno
+      (call $fd_write
+        (local.get $fd) (i32.const 64) (i32.const 1) (i32.const 72)))
+    (drop (call $fd_close (local.get $fd)))
+    (if (i32.ne (local.get $errno) (i32.const 0))
+      (then (return (local.get $errno))))
+    (if (i32.ne (i32.load (i32.const 72)) (i32.const __NONCE_LEN__))
+      (then (return (i32.const 127))))
+    (i32.const 0))
+
+  (func (export "invoke") (result i32)
+    (local $status i32)
+
+    ;; Overwrite/truncate the existing sentinel.
+    (local.set $status
+      (call $write_path
+        (i32.const 4096) (i32.const __MUTATE_PATH_LEN__) (i32.const 8)))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (return (local.get $status))))
+
+    ;; Rename the sentinel to the absent target, then delete that name.
+    (local.set $status
+      (call $path_rename
+        (i32.const __PREOPEN_FD__)
+        (i32.const 4096) (i32.const __MUTATE_PATH_LEN__)
+        (i32.const __PREOPEN_FD__)
+        (i32.const 6144) (i32.const __CREATE_PATH_LEN__)))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (return (local.get $status))))
+    (local.set $status
+      (call $path_unlink_file
+        (i32.const __PREOPEN_FD__)
+        (i32.const 6144) (i32.const __CREATE_PATH_LEN__)))
+    (if (i32.ne (local.get $status) (i32.const 0))
+      (then (return (local.get $status))))
+
+    ;; Re-create the absent target and write the nonce into it.
+    (call $write_path
+      (i32.const 6144) (i32.const __CREATE_PATH_LEN__) (i32.const 9)))
+)

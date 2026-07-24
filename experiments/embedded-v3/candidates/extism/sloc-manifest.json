@@ -1,0 +1,100 @@
+{
+  "schema_version": 3,
+  "candidate": "extism",
+  "entries": [
+    {
+      "path": "Cargo.lock",
+      "role": "lockfile",
+      "category": "dependency-lock",
+      "reason": "Cargo dependency resolution; verified by cargo metadata --locked",
+      "generator": "cargo",
+      "source": "Cargo.toml"
+    },
+    {
+      "path": "Cargo.toml",
+      "role": "production",
+      "category": "build-configuration"
+    },
+    {
+      "path": "guest-artifacts/tenant-a.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "reason": "Compiled WebAssembly guest artifact; source remains separately attributed",
+      "generator": "cargo run --locked --bin build-core-guests",
+      "source": "experiment:guests/core/templates/tenant.wat.in",
+      "generated_kind": "binary-guest",
+      "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1"
+    },
+    {
+      "path": "guest-artifacts/tenant-b.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "reason": "Compiled WebAssembly guest artifact; source remains separately attributed",
+      "generator": "cargo run --locked --bin build-core-guests",
+      "source": "experiment:guests/core/templates/tenant.wat.in",
+      "generated_kind": "binary-guest",
+      "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e"
+    },
+    {
+      "path": "guest-artifacts/tenant-bad-a.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "reason": "Compiled WebAssembly guest artifact; source remains separately attributed",
+      "generator": "cargo run --locked --bin build-core-guests",
+      "source": "experiment:guests/core/templates/tenant.wat.in",
+      "generated_kind": "binary-guest",
+      "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d"
+    },
+    {
+      "path": "guest-artifacts/tenant-bad-b.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "reason": "Compiled WebAssembly guest artifact; source remains separately attributed",
+      "generator": "cargo run --locked --bin build-core-guests",
+      "source": "experiment:guests/core/templates/tenant.wat.in",
+      "generated_kind": "binary-guest",
+      "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557"
+    },
+    {
+      "path": "sloc-manifest.json",
+      "role": "accounting",
+      "category": "accounting-metadata"
+    },
+    {
+      "path": "src/authority.rs",
+      "role": "production",
+      "category": "authority-policy"
+    },
+    {
+      "path": "src/guest.rs",
+      "role": "production",
+      "category": "extism-guest-adapter"
+    },
+    {
+      "path": "src/main.rs",
+      "role": "production",
+      "category": "control-dispatch"
+    },
+    {
+      "path": "src/protocol.rs",
+      "role": "generated",
+      "category": "common-protocol",
+      "reason": "Frozen runtime-neutral candidate wire bytes shared by every candidate",
+      "generator": "exact-copy",
+      "source": "protocol/candidate-wire-frozen.rs",
+      "generated_kind": "canonical-copy",
+      "canonical_id": "embedded-v3-candidate-wire-v3",
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682"
+    },
+    {
+      "path": "src/runtime.rs",
+      "role": "production",
+      "category": "extism-runtime-adapter"
+    },
+    {
+      "path": "tests/full_contract.rs",
+      "role": "test",
+      "category": "production-contract-test"
+    }
+  ]
+}

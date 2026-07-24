@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "review_id": "embedded-v3-extism-static-architecture-review-v1",
+  "candidate": "extism",
+  "review_kind": "static architecture and source review",
+  "reviewer_independence": "Performed by a separate evidence-audit agent that did not implement or edit the candidate source.",
+  "scope": "Frozen one-process, 32-tenant, volatile-recovery embedded-v3 workload only.",
+  "reviewed_files": [
+    {
+      "path": "experiments/embedded-v3/candidates/extism/Cargo.toml",
+      "sha256": "55019e249cfb5c74648223fb25859744ec39e16fb5c0a73dc8ad6a09da2fbd5d"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/extism/src/authority.rs",
+      "sha256": "3a7bb77ba4394ac88bbd26bdb8034277e8ef1e928a44dfee28e071ebcf1532b0"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/extism/src/guest.rs",
+      "sha256": "3edae41207128573a8e72de58b55295a958e89dbe5c88964377cefa82efe3269"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/extism/src/main.rs",
+      "sha256": "68ae7da590a4351ea1de7fbf8e4b08de56fb1413e32976882899b0f905388a34"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/extism/src/protocol.rs",
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/extism/src/runtime.rs",
+      "sha256": "5877987eee8674956dd9eda97c66945da3f8978f9327bc379e07930fae279e77"
+    }
+  ],
+  "dependency_facts": {
+    "product_runtime": "extism 1.30.0 from crates.io with default features disabled and only wasmtime-default-features",
+    "scheduler": "one std::thread tenant worker per ready tenant; no candidate Tokio runtime",
+    "tokio_worker_threads": 0,
+    "external_path_dependencies_present": false,
+    "cargo_metadata_package_count": 286
+  },
+  "checks": [
+    {
+      "topic": "unfair_serialization",
+      "verdict": "pass_with_observation",
+      "evidence": "Each ready tenant has its own bounded sync_channel and OS worker thread. Guest execution is not protected by a global execution lock; only the required single NDJSON writer is globally serialized.",
+      "observation": "The architecture uses 32 long-lived tenant threads for the frozen population, so this result cannot be extrapolated to actor densities far above the preregistered workload."
+    },
+    {
+      "topic": "avoidable_copies",
+      "verdict": "pass_with_optimization_finding",
+      "evidence": "GuestCatalog compiles each hash-pinned artifact once and reuses CompiledPlugin handles for instantiation.",
+      "observation": "A successful rollout instantiates and discards one preflight plugin per target, then instantiates a second replacement per target after freeze. Keeping the preflight replacements would remove this duplicate instantiation, but the frozen run must measure the reviewed code as written."
+    },
+    {
+      "topic": "allocator_and_engine_use",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "The adapter uses Extism PluginBuilder and CompiledPlugin rather than constructing a separate Wasmtime Engine per tenant or command. Core artifacts are compiled once, and the hash-pinned guest declares memory 1 1."
+    },
+    {
+      "topic": "maintained_crates",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "The candidate uses Extism's maintained plugin compilation, instantiation, host-function, and cancellation APIs. The actor lifecycle, admission, idempotency, recovery, and rollout layer is necessarily candidate adapter code in this comparison."
+    },
+    {
+      "topic": "authority_boundary",
+      "verdict": "pass",
+      "evidence": "Both core and authority PluginBuilder paths call with_wasi(false). Only comparison custom functions are registered. Five foreign ABI probes require exact unknown-import failures, while the native Extism HTTP canary must reach the explicit no-http policy denial at invocation."
+    },
+    {
+      "topic": "fault_isolation_and_recovery",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "Trap and CancelHandle CPU-deadline failures are handled inside the target tenant worker, followed by target-only Plugin replacement, incarnation advance, and volatile-state reset."
+    },
+    {
+      "topic": "transactional_update",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "All target activations are preflighted before freeze. Failed preflight leaves running instances unchanged; successful preflight freezes all targets, creates all replacements, and reports InDoubt on a failed swap rather than false commit."
+    }
+  ],
+  "known_limitations": [
+    "The one-thread-per-tenant architecture is acceptable only for the frozen 32-tenant lane and is not evidence of high actor density.",
+    "Successful rollout performs duplicate preflight and replacement instantiation.",
+    "The candidate has zero Tokio worker threads; any run-manifest rule requiring four Tokio workers for every candidate would be factually incompatible with this implementation.",
+    "Passing this static review is permission to run the frozen experiment, not evidence that its dynamic gates or SLOs pass."
+  ],
+  "blocking_findings": [],
+  "overall_verdict": "static_review_pass_for_execution_freeze"
+}

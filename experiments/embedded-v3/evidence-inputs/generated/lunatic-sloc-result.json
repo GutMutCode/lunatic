@@ -1,0 +1,464 @@
+{
+  "schema_version": 3,
+  "accounting_policy": "embedded-v3-sloc-frozen-v3",
+  "candidate": "lunatic",
+  "manifest_sha256": "df705a8c29716a87263f913a9ce81796a329ed209c493d4f2e46776a771d8229",
+  "production_sloc": 1587,
+  "test_sloc": 523,
+  "formatting": {
+    "version": "rustfmt 1.9.0-stable (59807616e1 2026-04-14)",
+    "edition": "2018",
+    "checked_files": [
+      "src/events.rs",
+      "src/host.rs",
+      "src/lib.rs",
+      "src/main.rs",
+      "src/protocol.rs",
+      "src/runtime.rs",
+      "src/state.rs",
+      "tests/production_session.rs"
+    ],
+    "maximum_counted_line_bytes": 120,
+    "include_and_path_macros": "forbidden in production Rust"
+  },
+  "enumeration": {
+    "attributed_regular_files": 15,
+    "exclusions": [],
+    "root_target_policy": "forbidden; all present regular files must be attributed"
+  },
+  "frozen_canonical_allowlist": [
+    {
+      "canonical_id": "embedded-v3-candidate-wire-v3",
+      "destination": "src/protocol.rs",
+      "source": "protocol/candidate-wire-frozen.rs",
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682",
+      "line_endings": "LF",
+      "required_exactly_once": true
+    }
+  ],
+  "role_totals": {
+    "accounting": {
+      "files": 1,
+      "bytes": 3707,
+      "sloc": 0
+    },
+    "generated": {
+      "files": 5,
+      "bytes": 52073,
+      "sloc": 0
+    },
+    "lockfile": {
+      "files": 1,
+      "bytes": 60634,
+      "sloc": 0
+    },
+    "production": {
+      "files": 7,
+      "bytes": 54323,
+      "sloc": 1587
+    },
+    "test": {
+      "files": 1,
+      "bytes": 18323,
+      "sloc": 523
+    }
+  },
+  "category_totals": {
+    "accounting-metadata": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 1,
+      "files": 1
+    },
+    "build-configuration": {
+      "production_sloc": 14,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "candidate-dispatch": {
+      "production_sloc": 777,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "candidate-entrypoint": {
+      "production_sloc": 9,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 2
+    },
+    "common-protocol": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 1,
+      "files": 1
+    },
+    "dependency-lock": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 1,
+      "files": 1
+    },
+    "guest-artifact": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 4,
+      "files": 4
+    },
+    "lunatic-process-state": {
+      "production_sloc": 360,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "lunatic-runtime-adapter": {
+      "production_sloc": 389,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "ordered-event-transport": {
+      "production_sloc": 38,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "production-session-test": {
+      "production_sloc": 0,
+      "test_sloc": 523,
+      "excluded_files": 0,
+      "files": 1
+    }
+  },
+  "cargo_metadata": {
+    "status": "verified",
+    "command": "cargo metadata --format-version 1 --locked --manifest-path <candidate>/Cargo.toml",
+    "package_count": 244,
+    "candidate_package_count": 1,
+    "targets": [
+      {
+        "name": "embedded_v3_lunatic",
+        "kind": [
+          "lib"
+        ],
+        "src_path": "src/lib.rs",
+        "role": "production"
+      },
+      {
+        "name": "embedded-v3-lunatic",
+        "kind": [
+          "bin"
+        ],
+        "src_path": "src/main.rs",
+        "role": "production"
+      },
+      {
+        "name": "production_session",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/production_session.rs",
+        "role": "test"
+      }
+    ],
+    "extism_version": null,
+    "wasmtime_version": null,
+    "direct_dependencies": {
+      "policy": "embedded-v3-direct-dependencies-v1",
+      "policy_sha256": "3e6621bccfff101ca554cd4dc1dce854d539190213677f57a5d3da0d92e3fb9f",
+      "declarations": [
+        {
+          "name": "anyhow",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.0.100",
+          "default_features": false,
+          "features": [
+            "std"
+          ]
+        },
+        {
+          "name": "lunatic-process",
+          "kind": "product-path",
+          "product_path": "crates/lunatic-process",
+          "version": "0.14.0",
+          "default_features": false,
+          "features": []
+        },
+        {
+          "name": "serde",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.0.229",
+          "default_features": false,
+          "features": [
+            "derive",
+            "std"
+          ]
+        },
+        {
+          "name": "serde_json",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.0.151",
+          "default_features": false,
+          "features": [
+            "std"
+          ]
+        },
+        {
+          "name": "sha2",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.10.9",
+          "default_features": false,
+          "features": [
+            "std"
+          ]
+        },
+        {
+          "name": "tokio",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.53.1",
+          "default_features": false,
+          "features": [
+            "macros",
+            "rt-multi-thread",
+            "sync",
+            "time"
+          ]
+        },
+        {
+          "name": "wasmtime",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "46.0.1",
+          "default_features": false,
+          "features": []
+        }
+      ]
+    },
+    "external_path_dependencies": [
+      {
+        "path": "C:\\Users\\jinho\\source\\repos\\lunatic\\crates\\hash-map-id",
+        "classification": "external-existing-runtime:repo-crates",
+        "owners": [
+          "dependency:lunatic-error-api@0.14.0->hash-map-id",
+          "dependency:lunatic-networking-api@0.14.0->hash-map-id",
+          "dependency:lunatic-process@0.14.0->hash-map-id",
+          "package:hash-map-id@0.14.0"
+        ]
+      },
+      {
+        "path": "C:\\Users\\jinho\\source\\repos\\lunatic\\crates\\lunatic-common-api",
+        "classification": "external-existing-runtime:repo-crates",
+        "owners": [
+          "dependency:lunatic-error-api@0.14.0->lunatic-common-api",
+          "dependency:lunatic-networking-api@0.14.0->lunatic-common-api",
+          "package:lunatic-common-api@0.14.0"
+        ]
+      },
+      {
+        "path": "C:\\Users\\jinho\\source\\repos\\lunatic\\crates\\lunatic-error-api",
+        "classification": "external-existing-runtime:repo-crates",
+        "owners": [
+          "dependency:lunatic-networking-api@0.14.0->lunatic-error-api",
+          "package:lunatic-error-api@0.14.0"
+        ]
+      },
+      {
+        "path": "C:\\Users\\jinho\\source\\repos\\lunatic\\crates\\lunatic-networking-api",
+        "classification": "external-existing-runtime:repo-crates",
+        "owners": [
+          "dependency:lunatic-process@0.14.0->lunatic-networking-api",
+          "package:lunatic-networking-api@0.14.0"
+        ]
+      },
+      {
+        "path": "C:\\Users\\jinho\\source\\repos\\lunatic\\crates\\lunatic-process",
+        "classification": "external-existing-runtime:repo-crates",
+        "owners": [
+          "dependency:embedded-v3-lunatic@0.1.0->lunatic-process",
+          "package:lunatic-process@0.14.0"
+        ]
+      }
+    ],
+    "lunatic_product_binding": {
+      "policy": "embedded-v3-lunatic-product-v1",
+      "pinned_git_commit": "f5ba0831ef757e2a134fbeafe622c0d0280a55dd",
+      "verified_paths": [
+        "Cargo.toml",
+        "Cargo.lock",
+        "src",
+        "crates"
+      ],
+      "binding_sha256": "f75c5dfea9418bad4bbdfb03b326607ea3983a6193b409246b351445bb90b731"
+    }
+  },
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "role": "lockfile",
+      "category": "dependency-lock",
+      "bytes": 60634,
+      "sloc": 0,
+      "sha256": "52dba9abe8523b33add42ada6be4b6bd974a9e51ee927bb43efeae9070d6ed30"
+    },
+    {
+      "path": "Cargo.toml",
+      "role": "production",
+      "category": "build-configuration",
+      "bytes": 739,
+      "sloc": 14,
+      "sha256": "12f4b4b9e6397c0346dd94732c636eec079bc987dbcd33d5276b9813f8db4360"
+    },
+    {
+      "path": "guest-artifacts/tenant-a.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 885,
+      "sloc": 0,
+      "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "guest-artifacts/tenant-b.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 885,
+      "sloc": 0,
+      "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "guest-artifacts/tenant-bad-a.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 893,
+      "sloc": 0,
+      "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "guest-artifacts/tenant-bad-b.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 893,
+      "sloc": 0,
+      "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "sloc-manifest.json",
+      "role": "accounting",
+      "category": "accounting-metadata",
+      "bytes": 3707,
+      "sloc": 0,
+      "sha256": "df705a8c29716a87263f913a9ce81796a329ed209c493d4f2e46776a771d8229"
+    },
+    {
+      "path": "src/events.rs",
+      "role": "production",
+      "category": "ordered-event-transport",
+      "bytes": 1251,
+      "sloc": 38,
+      "sha256": "7f2eb306e3837faa26c8d66654dae9d560c5408bc881efe8dae64ed4583647e3"
+    },
+    {
+      "path": "src/host.rs",
+      "role": "production",
+      "category": "candidate-dispatch",
+      "bytes": 27462,
+      "sloc": 777,
+      "sha256": "34e8b3ca8ee995c3cd1aff4c9158486469509066c210d98fd113fda5ba01f256"
+    },
+    {
+      "path": "src/lib.rs",
+      "role": "production",
+      "category": "candidate-entrypoint",
+      "bytes": 84,
+      "sloc": 6,
+      "sha256": "a3236072c428a9ce6ed73864d7240d5fadbf5bf1df6514dbd85a3a3ee4897e35"
+    },
+    {
+      "path": "src/main.rs",
+      "role": "production",
+      "category": "candidate-entrypoint",
+      "bytes": 67,
+      "sloc": 3,
+      "sha256": "f9862a0dac423eb5e9ebb7db84d259d33499ca2717f3ed99b7b7c746e2a0e61c"
+    },
+    {
+      "path": "src/protocol.rs",
+      "role": "generated",
+      "category": "common-protocol",
+      "bytes": 48517,
+      "sloc": 0,
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682",
+      "exclusion": {
+        "kind": "canonical-copy",
+        "canonical_id": "embedded-v3-candidate-wire-v3",
+        "source": "protocol/candidate-wire-frozen.rs",
+        "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682"
+      }
+    },
+    {
+      "path": "src/runtime.rs",
+      "role": "production",
+      "category": "lunatic-runtime-adapter",
+      "bytes": 13303,
+      "sloc": 389,
+      "sha256": "7d68ad58bfdf81dd4bbf619871cd449212d79cb5f1170df6eb47d323a973fc41"
+    },
+    {
+      "path": "src/state.rs",
+      "role": "production",
+      "category": "lunatic-process-state",
+      "bytes": 11417,
+      "sloc": 360,
+      "sha256": "6d2ea611fcde1c0951806c79ee1483af1ff1c4e3659110592b08cc7a310c1b07"
+    },
+    {
+      "path": "tests/production_session.rs",
+      "role": "test",
+      "category": "production-session-test",
+      "bytes": 18323,
+      "sloc": 523,
+      "sha256": "be66f34b009657d6ecd9a32fa2883871dda1ae7a98398ae46556644c7d1424aa"
+    }
+  ]
+}

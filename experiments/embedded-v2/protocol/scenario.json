@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v2-2026-07-23",
+  "decision_lane": "outcome_equivalent_embedded_volatile_state",
+  "tenants": 32,
+  "worker_threads": 4,
+  "mailbox_limit": 64,
+  "max_payload_bytes": 1024,
+  "cpu_deadline_ms": 50,
+  "cpu_terminal_not_before_ms": 40,
+  "cpu_terminal_not_after_ms": 100,
+  "target_tenants": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+  "phases": [
+    {
+      "name": "warm_start",
+      "action": "send create_tenant for tenants 0..31 without waiting between writes; all start at A, generation 0, counter 0"
+    },
+    {
+      "name": "warmup",
+      "commands": 1024,
+      "schedule": "sequential round-robin increment; tenant = index mod 32; 64-byte payload"
+    },
+    {
+      "name": "normal",
+      "rounds": 320,
+      "commands_per_round": 32,
+      "schedule": "one increment per tenant written without waiting; next round begins after all 32 complete",
+      "duplicate_rule": "after original completion, resend the same command_id when (round*32+tenant+1) mod 128 equals 0",
+      "expected_duplicate_probes": 80,
+      "payload_bytes": 64
+    },
+    {
+      "name": "admission",
+      "tenant": 0,
+      "schedule": "close gate; write 65 ascending-sequence increments; require exactly 64 accepted and one retryable_rejection; open gate; await 64 completions; retry rejected command unchanged and require completion",
+      "oversize_tenant": 1,
+      "oversize_rejected_bytes": 1025,
+      "boundary_accepted_bytes": 1024
+    },
+    {
+      "name": "trap",
+      "cycles": 30,
+      "target_rule": "cycle mod 32",
+      "sibling_rule": "(target+1) mod 32",
+      "schedule": "write trap command and sibling probe back-to-back; require failed guest_trap terminal, generation+1 ready(counter=0), and sibling completion"
+    },
+    {
+      "name": "cpu",
+      "cycles": 30,
+      "target_rule": "(cycle+16) mod 32",
+      "sibling_rule": "(target+1) mod 32",
+      "schedule": "write cpu_loop command and sibling probe back-to-back; candidate interrupts the executing guest at the frozen wall-clock deadline; require failed cpu_deadline_exceeded terminal, generation+1 ready(counter=0), and sibling completion"
+    },
+    {
+      "name": "authority",
+      "tenant": 31,
+      "schedule": "runner positive-controls filesystem and TCP/UDP observers; a canary using the production tenant configuration attempts sentinel read/overwrite/delete/rename, new-file create/write, TCP connect/write, and UDP send; observe until canary termination plus 500ms"
+    },
+    {
+      "name": "updates",
+      "cycles": 30,
+      "failed_and_valid_per_cycle": true,
+      "schedule": "even cycle: A->bad_B must fail_rolled_back then A->B must succeed; odd cycle: B->bad_A must fail_rolled_back then B->A must succeed; tenant 7 is the sole activation-failure tenant; targets are always 0..15",
+      "concurrent_commands": "one closed-loop probe per target plus one increment submitted after rollout started; rejection is retried unchanged; every accepted command must complete before external rollout completion",
+      "confirmation_snapshots": 3
+    },
+    {
+      "name": "cleanup",
+      "warmup_cycles": 5,
+      "measured_cycles": 30,
+      "schedule": "create 32 A tenants concurrently, run one increment each, one rotating trap, one valid 16-tenant rollout, teardown, and prove stale endpoints unreachable"
+    }
+  ],
+  "command_id": "first 16 bytes of SHA-256 over UTF-8 experiment_id|run_id|phase|cycle|round|tenant|sequence|operation",
+  "pairing": {
+    "pairs": 10,
+    "warmup_pair": 0,
+    "retained_pairs": [1, 2, 3, 4, 5, 6, 7, 8, 9],
+    "odd_order": ["lunatic", "direct-wasmtime"],
+    "even_order": ["direct-wasmtime", "lunatic"]
+  }
+}

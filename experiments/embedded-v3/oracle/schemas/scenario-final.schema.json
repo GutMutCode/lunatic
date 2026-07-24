@@ -1,0 +1,2293 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v3/oracle/scenario-final.schema.json",
+  "title": "Embedded v3 frozen scenario",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "tenants",
+    "normal",
+    "pressure",
+    "faults",
+    "updates",
+    "authority",
+    "cleanup",
+    "blocks",
+    "timeouts",
+    "rss",
+    "verdict"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "experiment_id": {
+      "const": "embedded-v3-2026-07-23"
+    },
+    "tenants": {
+      "$ref": "#/$defs/tenants"
+    },
+    "normal": {
+      "$ref": "#/$defs/normal"
+    },
+    "pressure": {
+      "$ref": "#/$defs/pressure"
+    },
+    "faults": {
+      "$ref": "#/$defs/faults"
+    },
+    "updates": {
+      "$ref": "#/$defs/updates"
+    },
+    "authority": {
+      "$ref": "#/$defs/authority"
+    },
+    "cleanup": {
+      "$ref": "#/$defs/cleanup"
+    },
+    "blocks": {
+      "$ref": "#/$defs/blocks"
+    },
+    "timeouts": {
+      "$ref": "#/$defs/timeouts"
+    },
+    "rss": {
+      "$ref": "#/$defs/rss"
+    },
+    "verdict": {
+      "$ref": "#/$defs/verdict"
+    }
+  },
+  "$defs": {
+    "id_range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "first",
+        "last_inclusive"
+      ],
+      "properties": {
+        "first": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_inclusive": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "increment_operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "delta",
+        "payload_bytes"
+      ],
+      "properties": {
+        "kind": {
+          "const": "increment"
+        },
+        "delta": {
+          "const": 1
+        },
+        "payload_bytes": {
+          "const": 64
+        }
+      }
+    },
+    "command_id_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "base",
+        "formula"
+      ],
+      "properties": {
+        "base": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "formula": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "tenants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "id_range",
+        "mailbox_capacity",
+        "payload_limit_bytes",
+        "payload_generation",
+        "tokio_worker_threads",
+        "incarnation",
+        "state"
+      ],
+      "properties": {
+        "count": {
+          "const": 32
+        },
+        "id_range": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/id_range"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "first": {
+                  "const": 0
+                },
+                "last_inclusive": {
+                  "const": 31
+                }
+              }
+            }
+          ]
+        },
+        "mailbox_capacity": {
+          "const": 64
+        },
+        "payload_limit_bytes": {
+          "const": 1024
+        },
+        "payload_generation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "domain",
+            "encoding",
+            "block_index",
+            "command_id",
+            "chunk_index",
+            "retry_rule"
+          ],
+          "properties": {
+            "domain": {
+              "const": "embedded-v3-payload-v1"
+            },
+            "encoding": {
+              "const": "concatenate sha256(domain_utf8 || u32be(block_index) || u64be(command_id) || u32be(chunk_index)) for chunk_index from zero and truncate to payload_bytes"
+            },
+            "block_index": {
+              "const": "unsigned big-endian u32"
+            },
+            "command_id": {
+              "const": "unsigned big-endian u64 whose wire form is canonical unsigned decimal string"
+            },
+            "chunk_index": {
+              "const": "unsigned big-endian u32 starting at zero"
+            },
+            "retry_rule": {
+              "const": "same block_index, command_id, and payload_bytes produces byte-identical payload"
+            }
+          }
+        },
+        "tokio_worker_threads": {
+          "const": 4
+        },
+        "incarnation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "owner",
+            "encoding",
+            "initial",
+            "advance",
+            "rollout"
+          ],
+          "properties": {
+            "owner": {
+              "const": "oracle"
+            },
+            "encoding": {
+              "const": "canonical_unsigned_decimal_u64_string"
+            },
+            "initial": {
+              "const": "0"
+            },
+            "advance": {
+              "const": "exactly one on fault replacement or teardown/recreate"
+            },
+            "rollout": {
+              "const": "unchanged"
+            }
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "initial_counter",
+            "initial_version",
+            "accepted_increment",
+            "duplicate",
+            "fault_replacement",
+            "rollout"
+          ],
+          "properties": {
+            "initial_counter": {
+              "const": 0
+            },
+            "initial_version": {
+              "const": "A"
+            },
+            "accepted_increment": {
+              "const": "counter increases by delta exactly once"
+            },
+            "duplicate": {
+              "const": "same completed result and no new mutation"
+            },
+            "fault_replacement": {
+              "const": "incarnation plus one and counter reset to zero"
+            },
+            "rollout": {
+              "const": "incarnation and completed accepted state preserved"
+            }
+          }
+        }
+      }
+    },
+    "normal_phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rounds",
+        "commands_per_round",
+        "retained",
+        "tenant_order_formula",
+        "operation",
+        "command_id"
+      ],
+      "properties": {
+        "rounds": {
+          "const": 32
+        },
+        "commands_per_round": {
+          "const": 32
+        },
+        "retained": {
+          "const": false
+        },
+        "tenant_order_formula": {
+          "const": "(block_index + round + slot) mod 32 for slot 0..31"
+        },
+        "operation": {
+          "$ref": "#/$defs/increment_operation"
+        },
+        "command_id": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/command_id_rule"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "base": {
+                  "const": 1
+                },
+                "formula": {
+                  "const": "base + round * 32 + tenant_id"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "normal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warmup",
+        "measured",
+        "delayed_duplicates"
+      ],
+      "properties": {
+        "warmup": {
+          "$ref": "#/$defs/normal_phase"
+        },
+        "measured": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rounds",
+            "commands_per_round",
+            "total_commands",
+            "concurrency",
+            "round_barrier",
+            "tenant_order_formula",
+            "operation",
+            "command_id",
+            "allowed_rejections"
+          ],
+          "properties": {
+            "rounds": {
+              "const": 320
+            },
+            "commands_per_round": {
+              "const": 32
+            },
+            "total_commands": {
+              "const": 10240
+            },
+            "concurrency": {
+              "const": "one outstanding command per tenant"
+            },
+            "round_barrier": {
+              "const": "all 32 commands terminal before the next round"
+            },
+            "tenant_order_formula": {
+              "const": "(block_index + round + slot) mod 32 for slot 0..31"
+            },
+            "operation": {
+              "$ref": "#/$defs/increment_operation"
+            },
+            "command_id": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/command_id_rule"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "base": {
+                      "const": 100000
+                    },
+                    "formula": {
+                      "const": "base + round * 32 + tenant_id"
+                    }
+                  }
+                }
+              ]
+            },
+            "allowed_rejections": {
+              "type": "array",
+              "maxItems": 0
+            }
+          }
+        },
+        "delayed_duplicates": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cases",
+            "requests_per_case",
+            "total_requests",
+            "index",
+            "source_round_formula",
+            "source_round_range",
+            "source_tenant_formula",
+            "cross_tenant_formula",
+            "source_command_id_formula",
+            "dispatch",
+            "minimum_later_completed_rounds",
+            "sequence",
+            "allowed_rejections"
+          ],
+          "properties": {
+            "cases": {
+              "const": 80
+            },
+            "requests_per_case": { "const": 3 },
+            "total_requests": { "const": 240 },
+            "index": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/id_range"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "first": {
+                      "const": 0
+                    },
+                    "last_inclusive": {
+                      "const": 79
+                    }
+                  }
+                }
+              ]
+            },
+            "source_round_formula": {
+              "const": "2 * j"
+            },
+            "source_round_range": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/id_range"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "first": {
+                      "const": 0
+                    },
+                    "last_inclusive": {
+                      "const": 158
+                    }
+                  }
+                }
+              ]
+            },
+            "source_tenant_formula": {
+              "const": "j mod 32"
+            },
+            "cross_tenant_formula": {
+              "const": "(source_tenant + 1) mod 32"
+            },
+            "source_command_id_formula": {
+              "const": "100000 + (2 * j) * 32 + (j mod 32)"
+            },
+            "dispatch": {
+              "const": "after all 320 measured rounds are terminal, ascending j"
+            },
+            "minimum_later_completed_rounds": {
+              "const": 161
+            },
+            "sequence": {
+              "const": [
+                "replay on source tenant with the source command_id, incarnation, operation, and bytes; require the original completed result and no mutation",
+                "send the same command_id and bytes on cross_tenant with its current incarnation; require a fresh exactly-once mutation",
+                "immediately repeat on cross_tenant with the same command_id, incarnation, operation, and bytes; require the preceding completed result and no mutation"
+              ]
+            },
+            "allowed_rejections": {
+              "type": "array",
+              "maxItems": 0
+            }
+          }
+        }
+      }
+    },
+    "pressure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tenant_formula",
+        "closed_gate",
+        "payload_boundary",
+        "command_id"
+      ],
+      "properties": {
+        "tenant_formula": {
+          "const": "(block_index * 3) mod 32"
+        },
+        "closed_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "gate_rule",
+            "submitted",
+            "accepted",
+            "retryable_rejected",
+            "rejected_submission_index",
+            "payload_bytes",
+            "rejection_reason",
+            "drain",
+            "retry",
+            "retry_expected"
+          ],
+          "properties": {
+            "gate_rule": {
+              "const": "pause dequeue before submitting and release only after all 65 admission terminals"
+            },
+            "submitted": {
+              "const": 65
+            },
+            "accepted": {
+              "const": 64
+            },
+            "retryable_rejected": {
+              "const": 1
+            },
+            "rejected_submission_index": {
+              "const": 64
+            },
+            "payload_bytes": {
+              "const": 64
+            },
+            "rejection_reason": {
+              "const": "backpressure"
+            },
+            "drain": {
+              "const": "release gate and require all 64 accepted commands to complete"
+            },
+            "retry": {
+              "const": "retry the rejected command exactly once after drain with identical command_id and bytes"
+            },
+            "retry_expected": {
+              "const": "accepted and completed exactly once"
+            }
+          }
+        },
+        "payload_boundary": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "order",
+            "oversize",
+            "limit"
+          ],
+          "properties": {
+            "order": {
+              "const": [
+                "oversize",
+                "limit"
+              ]
+            },
+            "oversize": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "payload_bytes",
+                "expected",
+                "reason",
+                "mutation",
+                "retries"
+              ],
+              "properties": {
+                "payload_bytes": {
+                  "const": 1025
+                },
+                "expected": {
+                  "const": "retryable_rejection"
+                },
+                "reason": {
+                  "const": "payload_too_large"
+                },
+                "mutation": {
+                  "const": "none"
+                },
+                "retries": {
+                  "const": 0
+                }
+              }
+            },
+            "limit": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "payload_bytes",
+                "expected",
+                "mutation"
+              ],
+              "properties": {
+                "payload_bytes": {
+                  "const": 1024
+                },
+                "expected": {
+                  "const": "accepted_then_completed"
+                },
+                "mutation": {
+                  "const": "exactly_once"
+                }
+              }
+            }
+          }
+        },
+        "command_id": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "base",
+            "closed_gate_formula",
+            "oversize",
+            "limit"
+          ],
+          "properties": {
+            "base": {
+              "const": 1000000
+            },
+            "closed_gate_formula": {
+              "const": "base + submission_index"
+            },
+            "oversize": {
+              "const": 1000100
+            },
+            "limit": {
+              "const": 1000101
+            }
+          }
+        }
+      }
+    },
+    "fault_kind": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "tenant_formula",
+        "execution",
+        "terminal_reason",
+        "replacement"
+      ],
+      "properties": {
+        "count": {
+          "const": 30
+        },
+        "tenant_formula": {
+          "type": "string",
+          "minLength": 1
+        },
+        "execution": {
+          "type": "string",
+          "minLength": 1
+        },
+        "terminal_reason": {
+          "enum": [
+            "trap",
+            "cpu_deadline"
+          ]
+        },
+        "replacement": {
+          "const": "ready at old incarnation plus one with counter zero"
+        },
+        "deadline_ms": {
+          "const": 50
+        },
+        "admission_to_execution_started_min_exclusive_ms": {
+          "const": 0
+        },
+        "admission_to_execution_started_max_ms": {
+          "const": 20
+        },
+        "execution_started_to_failed_min_ms": {
+          "const": 40
+        },
+        "execution_started_to_failed_max_ms": {
+          "const": 100
+        }
+      }
+    },
+    "faults": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rounds",
+        "round_order",
+        "seed",
+        "trap",
+        "cpu",
+        "stale",
+        "sibling_probe",
+        "recovery_clock",
+        "recovery_deadline_ms",
+        "command_id"
+      ],
+      "properties": {
+        "rounds": {
+          "const": 30
+        },
+        "round_order": {
+          "const": [
+            "trap_seed_completed_on_old_incarnation",
+            "trap",
+            "trap_sibling_probe",
+            "trap_old_stale_new_fresh_immediate_duplicate",
+            "cpu_seed_completed_on_old_incarnation",
+            "cpu",
+            "cpu_sibling_probe",
+            "cpu_old_stale_new_fresh_immediate_duplicate"
+          ]
+        },
+        "seed": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["count", "dispatch", "operation", "expected", "allowed_rejections"],
+          "properties": {
+            "count": {"const": 60},
+            "dispatch": {"const": "immediately before each fault on the current old incarnation and complete before writing the fault control"},
+            "operation": {"const": "increment by one with the exact command_id and bytes reused by the post-recovery three-request sequence"},
+            "expected": {"const": "accepted and completed exactly once on the old incarnation"},
+            "allowed_rejections": {"type": "array", "maxItems": 0}
+          }
+        },
+        "trap": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/fault_kind"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "tenant_formula": {
+                  "const": "(block_index + i) mod 32"
+                },
+                "execution": {
+                  "const": "actual guest Wasm trap"
+                },
+                "terminal_reason": {
+                  "const": "trap"
+                }
+              },
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "deadline_ms"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "admission_to_execution_started_min_exclusive_ms"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "admission_to_execution_started_max_ms"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "execution_started_to_failed_min_ms"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "execution_started_to_failed_max_ms"
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "cpu": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/fault_kind"
+            },
+            {
+              "type": "object",
+              "required": [
+                "deadline_ms",
+                "admission_to_execution_started_min_exclusive_ms",
+                "admission_to_execution_started_max_ms",
+                "execution_started_to_failed_min_ms",
+                "execution_started_to_failed_max_ms"
+              ],
+              "properties": {
+                "tenant_formula": {
+                  "const": "(block_index + i + 16) mod 32"
+                },
+                "execution": {
+                  "const": "actual non-terminating guest Wasm loop"
+                },
+                "terminal_reason": {
+                  "const": "cpu_deadline"
+                }
+              }
+            }
+          ]
+        },
+        "stale": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cases",
+            "requests_per_case",
+            "total_requests",
+            "dispatch",
+            "command_id",
+            "sequence",
+            "stale_terminal",
+            "retries"
+          ],
+          "properties": {
+            "cases": {
+              "const": 60
+            },
+            "requests_per_case": { "const": 3 },
+            "total_requests": { "const": 180 },
+            "dispatch": {
+              "const": "immediately after replacement ready using the replaced incarnation"
+            },
+            "command_id": {
+              "const": "the exact command_id and bytes completed by the pre-fault seed and shared by all three post-recovery requests"
+            },
+            "sequence": {
+              "const": [
+                "replay the completed seed on the old incarnation and terminate distinctly as stale_incarnation with no mutation",
+                "same command_id on the new incarnation completes as a fresh increment by one",
+                "immediate same command_id and new incarnation repeat returns the preceding result with no mutation"
+              ]
+            },
+            "stale_terminal": {
+              "const": "distinct retryable_rejection(stale_incarnation), never tenant_missing"
+            },
+            "retries": {
+              "const": 0
+            }
+          }
+        },
+        "sibling_probe": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "count",
+            "tenant_formula",
+            "trap_dispatch",
+            "cpu_dispatch",
+            "operation",
+            "allowed_rejections"
+          ],
+          "properties": {
+            "count": {
+              "const": 60
+            },
+            "tenant_formula": {
+              "const": "(fault_target + 1) mod 32"
+            },
+            "trap_dispatch": {
+              "const": "flush the sibling read immediately after the trap control write without waiting for execution_started"
+            },
+            "cpu_dispatch": {
+              "const": "flush the sibling read immediately after the CPU fault control write without waiting for execution_started"
+            },
+            "operation": {
+              "const": "read"
+            },
+            "allowed_rejections": {
+              "type": "array",
+              "maxItems": 0
+            }
+          }
+        },
+        "recovery_clock": {
+          "const": "fault control flush through replacement tenant_ready"
+        },
+        "recovery_deadline_ms": {
+          "const": 500
+        },
+        "command_id": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "base",
+            "trap_sibling_formula",
+            "trap_stale_formula",
+            "cpu_sibling_formula",
+            "cpu_stale_formula"
+          ],
+          "properties": {
+            "base": {
+              "const": 2000000
+            },
+            "trap_sibling_formula": {
+              "const": "base + i * 4"
+            },
+            "trap_stale_formula": {
+              "const": "base + i * 4 + 1"
+            },
+            "cpu_sibling_formula": {
+              "const": "base + i * 4 + 2"
+            },
+            "cpu_stale_formula": {
+              "const": "base + i * 4 + 3"
+            }
+          }
+        }
+      }
+    },
+    "updates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cycles",
+        "cycle_index",
+        "targets",
+        "attempts_per_cycle",
+        "failed_attempts_total",
+        "valid_attempts_total",
+        "artifacts",
+        "even_cycle",
+        "odd_cycle",
+        "bad_artifact",
+        "continuous_workers",
+        "proof",
+        "external_terminal",
+        "allowed_terminal_states",
+        "in_doubt",
+        "unavailability_formula",
+        "rollout_duration_formula",
+        "mixed_window_formula",
+        "command_id"
+      ],
+      "properties": {
+        "cycles": {
+          "const": 30
+        },
+        "cycle_index": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/id_range"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "first": {
+                  "const": 0
+                },
+                "last_inclusive": {
+                  "const": 29
+                }
+              }
+            }
+          ]
+        },
+        "targets": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "first",
+            "last_inclusive",
+            "count"
+          ],
+          "properties": {
+            "first": {
+              "const": 0
+            },
+            "last_inclusive": {
+              "const": 15
+            },
+            "count": {
+              "const": 16
+            }
+          }
+        },
+        "attempts_per_cycle": {
+          "const": 2
+        },
+        "failed_attempts_total": {
+          "const": 30
+        },
+        "valid_attempts_total": {
+          "const": 30
+        },
+        "artifacts": {
+          "const": [
+            "A",
+            "B",
+            "bad_A",
+            "bad_B"
+          ]
+        },
+        "even_cycle": {
+          "$ref": "#/$defs/update_cycle_even"
+        },
+        "odd_cycle": {
+          "$ref": "#/$defs/update_cycle_odd"
+        },
+        "bad_artifact": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "failure_tenant",
+            "rule",
+            "other_targets"
+          ],
+          "properties": {
+            "failure_tenant": {
+              "const": 7
+            },
+            "rule": {
+              "const": "compiles and registers but fails activation before serving an externally completed command"
+            },
+            "other_targets": {
+              "const": "behave as the named version until rollback or preflight rejection"
+            }
+          }
+        },
+        "continuous_workers": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "count",
+            "payload_bytes",
+            "assignment",
+            "start",
+            "run",
+            "stop",
+            "drain",
+            "on_retryable_rejection",
+            "max_retries_per_operation",
+            "accepted_rule",
+            "trace_cardinality"
+          ],
+          "properties": {
+            "count": {
+              "const": 16
+            },
+            "payload_bytes": {
+              "const": 64
+            },
+            "assignment": {
+              "const": "one worker per target"
+            },
+            "start": {
+              "const": "one successful read immediately before each rollout request flush"
+            },
+            "run": {
+              "const": "alternate increment(delta one) and read with at most one outstanding operation per worker"
+            },
+            "stop": {
+              "const": "stop issuing immediately when the candidate rollout terminal is received"
+            },
+            "drain": {
+              "const": "after stop, wait for every accepted worker operation to become terminal before proof"
+            },
+            "on_retryable_rejection": {
+              "const": "only before candidate terminal, immediately issue one new request_id carrying the identical command_id and bytes"
+            },
+            "max_retries_per_operation": {
+              "const": 1
+            },
+            "accepted_rule": {
+              "const": "every accepted operation is terminal before external rollout completion"
+            },
+            "trace_cardinality": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "anchor_logical_operations_per_tenant_per_attempt",
+                "continuous_logical_operations_per_tenant_per_attempt_min",
+                "continuous_logical_operations_per_tenant_per_attempt_max",
+                "logical_count_rule",
+                "transport_attempt_count_rule",
+                "terminal_rule"
+              ],
+              "properties": {
+                "anchor_logical_operations_per_tenant_per_attempt": {
+                  "const": 1
+                },
+                "continuous_logical_operations_per_tenant_per_attempt_min": {
+                  "const": 0
+                },
+                "continuous_logical_operations_per_tenant_per_attempt_max": {
+                  "const": "1099511627775"
+                },
+                "logical_count_rule": {
+                  "const": "for each attempt and tenant, successful logical worker sequences are contiguous from zero through the trace-derived maximum; sequence zero is the exact pre-rollout anchor"
+                },
+                "transport_attempt_count_rule": {
+                  "const": "one transport attempt per logical operation plus at most one retry for each retryable pre-acceptance rejection; retry reuses identical command_id and bytes"
+                },
+                "terminal_rule": {
+                  "const": "no new sequence is issued at or after candidate rollout terminal and every accepted sequence is terminal before proof"
+                }
+              }
+            }
+          }
+        },
+        "proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "waves_per_attempt",
+            "targets_per_wave",
+            "probes_per_attempt",
+            "operation",
+            "dispatch",
+            "failed_expected",
+            "valid_expected"
+          ],
+          "properties": {
+            "waves_per_attempt": {
+              "const": 3
+            },
+            "targets_per_wave": {
+              "const": 16
+            },
+            "probes_per_attempt": {
+              "const": 64
+            },
+            "operation": {
+              "const": "after worker drain, replay each target's exact completed anchor command once to prove dedup-cache preservation, then perform three waves of mutation-free guest reads"
+            },
+            "dispatch": {
+              "const": "submit all 16 exact anchor replays concurrently and await terminal; then each read wave submits all 16 targets concurrently and is terminal before the next wave"
+            },
+            "failed_expected": {
+              "const": "all anchor replays are exact deduplicated pre-rollout results; all read targets report old version, preserved state, unchanged incarnation, and failed artifact unreachable"
+            },
+            "valid_expected": {
+              "const": "all anchor replays are exact deduplicated pre-rollout results; all read targets report new version, preserved state, and unchanged incarnation"
+            }
+          }
+        },
+        "external_terminal": {
+          "const": "latest of candidate terminal, every pre-terminal accepted worker terminal, every exact cache replay terminal, and proof wave 3 terminal"
+        },
+        "allowed_terminal_states": {
+          "const": [
+            "succeeded",
+            "failed_rolled_back",
+            "in_doubt"
+          ]
+        },
+        "in_doubt": {
+          "const": "honest terminal and mandatory update-safety failure"
+        },
+        "unavailability_formula": {
+          "const": "per tenant, order good guest completions from the last pre-rollout anchor through the first proof wave (wire proof_wave index 0) and take the maximum consecutive-completion gap intersecting [rollout_write, proof_wave_index_0_terminal]"
+        },
+        "rollout_duration_formula": {
+          "const": "external terminal receive minus rollout control flush"
+        },
+        "mixed_window_formula": {
+          "const": "start at first entry into a mixed tenant-version vector after an all-old baseline and end at the last exit; update observations only on good non-deduplicated guest completions because an exact cached replay describes its original completion rather than current serving version; never mixed is zero; mixed at read proof is failure; report valid and failed attempts separately"
+        },
+        "command_id": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "attempt_index_formula",
+            "worker_layout",
+            "proof_layout"
+          ],
+          "properties": {
+            "attempt_index_formula": {
+              "const": "cycle * 2 + step where failed step is 0 and valid step is 1"
+            },
+            "worker_layout": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "domain_prefix",
+                "attempt_shift_bits",
+                "tenant_shift_bits",
+                "max_attempt_index",
+                "max_tenant_id",
+                "max_sequence",
+                "anchor_sequence",
+                "continuous_first_sequence",
+                "operation_formula",
+                "formula"
+              ],
+              "properties": {
+                "domain_prefix": {
+                  "const": "1152921504606846976"
+                },
+                "attempt_shift_bits": {
+                  "const": 48
+                },
+                "tenant_shift_bits": {
+                  "const": 40
+                },
+                "max_attempt_index": {
+                  "const": 59
+                },
+                "max_tenant_id": {
+                  "const": 15
+                },
+                "max_sequence": {
+                  "const": "1099511627775"
+                },
+                "anchor_sequence": {
+                  "const": "0"
+                },
+                "continuous_first_sequence": {
+                  "const": "1"
+                },
+                "operation_formula": {
+                  "const": "sequence zero is the pre-rollout read; positive odd sequence is increment(delta one); positive even sequence is read"
+                },
+                "formula": {
+                  "const": "domain_prefix | (attempt_index << 48) | (tenant_id << 40) | sequence"
+                }
+              }
+            },
+            "proof_layout": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "domain_prefix",
+                "attempt_shift_bits",
+                "tenant_shift_bits",
+                "max_attempt_index",
+                "max_tenant_id",
+                "max_sequence",
+                "sequence_formula",
+                "formula"
+              ],
+              "properties": {
+                "domain_prefix": {
+                  "const": "2305843009213693952"
+                },
+                "attempt_shift_bits": {
+                  "const": 48
+                },
+                "tenant_shift_bits": {
+                  "const": 40
+                },
+                "max_attempt_index": {
+                  "const": 59
+                },
+                "max_tenant_id": {
+                  "const": 15
+                },
+                "max_sequence": {
+                  "const": "2"
+                },
+                "sequence_formula": {
+                  "const": "proof wave index 0 through 2"
+                },
+                "formula": {
+                  "const": "domain_prefix | (attempt_index << 48) | (tenant_id << 40) | wave"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "update_cycle_even": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_version",
+        "failed_attempt",
+        "valid_attempt"
+      ],
+      "properties": {
+        "start_version": {
+          "const": "A"
+        },
+        "failed_attempt": {
+          "const": "A -> bad_B -> failed_rolled_back(A)"
+        },
+        "valid_attempt": {
+          "const": "A -> B -> succeeded(B)"
+        }
+      }
+    },
+    "update_cycle_odd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "start_version",
+        "failed_attempt",
+        "valid_attempt"
+      ],
+      "properties": {
+        "start_version": {
+          "const": "B"
+        },
+        "failed_attempt": {
+          "const": "B -> bad_A -> failed_rolled_back(B)"
+        },
+        "valid_attempt": {
+          "const": "B -> A -> succeeded(A)"
+        }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_scope",
+        "policy",
+        "nonce_domain",
+        "nonce_encoding",
+        "nonce_fields",
+        "candidate_wire_tokens",
+        "positive_control",
+        "result_contract",
+        "canaries",
+        "canary_order_formula",
+        "observer_tail_ms",
+        "unrecognized_production_import",
+        "comparison_only_deny_import",
+        "positive_control_failure"
+      ],
+      "properties": {
+        "run_scope": {
+          "const": "every candidate runs every one of the six canaries in every block; candidate-specific skipping is forbidden"
+        },
+        "policy": {
+          "const": "exactly the production tenant linker and runtime configuration"
+        },
+        "nonce_domain": {
+          "const": "embedded-v3-authority-v1"
+        },
+        "nonce_encoding": {
+          "const": "sha256 of five fields, each encoded as u32be(byte_length) followed by bytes: domain UTF-8, experiment_id UTF-8, u32be(block_index), candidate wire token UTF-8, run_id UTF-8"
+        },
+        "nonce_fields": {
+          "const": [
+            "domain",
+            "experiment_id",
+            "block_index",
+            "candidate",
+            "run_id"
+          ]
+        },
+        "candidate_wire_tokens": {
+          "const": [
+            "lunatic",
+            "extism",
+            "raw_wasmtime"
+          ]
+        },
+        "positive_control": {
+          "const": "immediately before each canary, the oracle performs the same requested external effect, proves its observer detects the nonce effect, restores state, and clears observations"
+        },
+        "result_contract": {
+          "const": {
+            "allowed_error_classes": [
+              "absent_at_link",
+              "policy_denied"
+            ],
+            "allowed_stages": [
+              "compile",
+              "instantiate",
+              "invoke"
+            ],
+            "absent_at_link_evidence": "production linker inventory excludes the exact import and the actual canary module fails to link",
+            "policy_denied_evidence": "the exact production import resolves and the production policy returns policy_denied before any external effect",
+            "all_other_errors": "run failure"
+          }
+        },
+        "canaries": {
+          "const": [
+            {
+              "id": "wasi_p1_fs_read",
+              "abi": "wasi_snapshot_preview1 path_open and fd_read",
+              "attempt": "read the nonce sentinel through genuine WASI Preview 1 imports",
+              "positive_effect": "oracle reads the exact nonce bytes from the sentinel",
+              "pass": "one closed result_contract outcome and no returned nonce bytes"
+            },
+            {
+              "id": "wasi_p1_fs_mutate",
+              "abi": "wasi_snapshot_preview1 path_open, fd_write, path_rename, path_unlink_file",
+              "attempt": "overwrite, delete, and rename the sentinel plus create and write an absent target through genuine WASI Preview 1 imports",
+              "positive_effect": "observer records each requested name or content mutation before state is restored",
+              "pass": "one closed result_contract outcome and no filesystem event, name or content change, or returned secret bytes"
+            },
+            {
+              "id": "lunatic_tcp",
+              "abi": "lunatic::networking tcp_connect and TCP write",
+              "attempt": "connect to the nonce TCP listener and write the nonce",
+              "positive_effect": "listener accepts a connection and receives the exact nonce",
+              "pass": "one closed result_contract outcome and no accept or bytes"
+            },
+            {
+              "id": "lunatic_udp",
+              "abi": "lunatic::networking udp_bind and udp_send_to",
+              "attempt": "send the nonce datagram to the UDP listener",
+              "positive_effect": "listener receives the exact nonce datagram",
+              "pass": "one closed result_contract outcome and no datagram"
+            },
+            {
+              "id": "lunatic_sqlite_create",
+              "abi": "lunatic::sqlite open and execute",
+              "attempt": "create a nonce-named SQLite database and nonce table on disk",
+              "positive_effect": "observer sees the database file and reads the nonce table",
+              "pass": "one closed result_contract outcome and no database file, table, or returned nonce"
+            },
+            {
+              "id": "extism_http",
+              "abi": "extism:host/env http_request",
+              "attempt": "send an HTTP request containing the nonce to the oracle listener",
+              "positive_effect": "listener receives the exact nonce request",
+              "pass": "one closed result_contract outcome and no request or bytes"
+            }
+          ]
+        },
+        "canary_order_formula": {
+          "const": "rotate the six listed canaries left by block_index mod 6 and pair each canary with its immediately preceding positive control"
+        },
+        "observer_tail_ms": {
+          "const": 500
+        },
+        "unrecognized_production_import": {
+          "const": "absent_at_link is the required outcome and is not a skip"
+        },
+        "comparison_only_deny_import": {
+          "const": "forbidden"
+        },
+        "positive_control_failure": {
+          "const": "run invalid"
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "precondition",
+        "warmup_cycles",
+        "retained_cycles",
+        "total_cycles",
+        "cycle",
+        "post_teardown_rss_sample_offsets_ms",
+        "tenant_order_formula",
+        "recreate_rule",
+        "stale_endpoint_reason",
+        "hidden_authority_or_endpoint",
+        "command_id"
+      ],
+      "properties": {
+        "precondition": {
+          "const": "tear down the 32 main-workload tenants and establish active count zero"
+        },
+        "warmup_cycles": {
+          "const": 5
+        },
+        "retained_cycles": {
+          "const": 30
+        },
+        "total_cycles": {
+          "const": 35
+        },
+        "cycle": {
+          "const": [
+            "create all 32 tenants and await ready",
+            "complete one increment per tenant",
+            "quiesce and prove every accepted command is terminal",
+            "snapshot each tenant",
+            "tear down all 32 tenants",
+            "probe each old endpoint and require tenant_missing without retry",
+            "prove active tenant and accepted-command counts are zero",
+            "take the stable RSS sample"
+          ]
+        },
+        "post_teardown_rss_sample_offsets_ms": {
+          "const": [1000, 1100, 1200]
+        },
+        "tenant_order_formula": {
+          "const": "(block_index + cycle_index + slot) mod 32 for slot 0..31"
+        },
+        "recreate_rule": {
+          "const": "each tenant incarnation advances exactly one and counter starts at zero"
+        },
+        "stale_endpoint_reason": {
+          "const": "tenant_missing without retry using the exact cleanup increment command_id and byte-identical payload against the torn-down incarnation"
+        },
+        "hidden_authority_or_endpoint": {
+          "const": "forbidden"
+        },
+        "command_id": {
+          "const": {
+            "domain_prefix": "3458764513820540928",
+            "cycle_shift_bits": 48,
+            "tenant_shift_bits": 40,
+            "max_cycle_index": 34,
+            "max_tenant_id": 31,
+            "sequence": "0",
+            "formula": "domain_prefix | (cycle_index << 48) | (tenant_id << 40)"
+          }
+        }
+      }
+    },
+    "blocks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "count",
+        "index",
+        "instrumentation_warmup",
+        "retained",
+        "candidates",
+        "candidate_order",
+        "replacement",
+        "execution",
+        "phase_order",
+        "static_plan_cardinality"
+      ],
+      "properties": {
+        "count": {
+          "const": 10
+        },
+        "index": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/id_range"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "first": {
+                  "const": 0
+                },
+                "last_inclusive": {
+                  "const": 9
+                }
+              }
+            }
+          ]
+        },
+        "instrumentation_warmup": {
+          "const": 0
+        },
+        "retained": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "first",
+            "last_inclusive",
+            "count"
+          ],
+          "properties": {
+            "first": {
+              "const": 1
+            },
+            "last_inclusive": {
+              "const": 9
+            },
+            "count": {
+              "const": 9
+            }
+          }
+        },
+        "candidates": {
+          "const": [
+            "lunatic",
+            "extism",
+            "raw_wasmtime"
+          ]
+        },
+        "candidate_order": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "block_mod_3_0",
+            "block_mod_3_1",
+            "block_mod_3_2"
+          ],
+          "properties": {
+            "block_mod_3_0": {
+              "const": [
+                "lunatic",
+                "extism",
+                "raw_wasmtime"
+              ]
+            },
+            "block_mod_3_1": {
+              "const": [
+                "extism",
+                "raw_wasmtime",
+                "lunatic"
+              ]
+            },
+            "block_mod_3_2": {
+              "const": [
+                "raw_wasmtime",
+                "lunatic",
+                "extism"
+              ]
+            }
+          }
+        },
+        "replacement": {
+          "const": "no block is repeated or replaced"
+        },
+        "execution": {
+          "const": "candidates run separately and never concurrently"
+        },
+        "phase_order": {
+          "const": [
+            "hello_and_minimal_rss",
+            "shared_init",
+            "create",
+            "normal",
+            "pressure",
+            "faults",
+            "updates",
+            "authority",
+            "cleanup",
+            "shutdown"
+          ]
+        },
+        "static_plan_cardinality": {
+          "const": {
+            "total_actions_per_candidate_block": 24747,
+            "retained_actions_block_0": 0,
+            "retained_actions_each_block_1_through_9": 22898,
+            "nonretained_actions_each_block_1_through_9": 1849,
+            "phase_actions": {
+              "initial_create": 32,
+              "normal_warmup": 1024,
+              "normal_measured": 10240,
+              "delayed_duplicates": 240,
+              "pressure": 71,
+              "faults": 360,
+              "updates_static": 6000,
+              "authority_with_positive_controls": 12,
+              "main_teardown_precondition": 33,
+              "cleanup": 5775
+            },
+            "dynamic_update_workers": "not included in static actions; after 16 exact anchor reads per attempt, one worker per target issues a trace-derived sequence until candidate terminal under the frozen ID, alternation, outstanding, retry, stop, and drain rules"
+          }
+        }
+      }
+    },
+    "timeouts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clock",
+        "positive_elapsed_ns_required",
+        "phase_deadlines_ms",
+        "deadline_reset",
+        "unrelated_event",
+        "timeout_result",
+        "transport_retry",
+        "candidate_hidden_retry",
+        "only_oracle_retries",
+        "phase_rejections",
+        "all_other_rejections"
+      ],
+      "properties": {
+        "clock": {
+          "const": "oracle monotonic clock around flushed stdin writes and parsed stdout events"
+        },
+        "positive_elapsed_ns_required": {
+          "const": true
+        },
+        "phase_deadlines_ms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "hello_terminal",
+            "init_terminal",
+            "create",
+            "normal_probe_snapshot",
+            "trap",
+            "cpu",
+            "rollout",
+            "authority_terminal",
+            "teardown_terminal",
+            "shutdown_terminal",
+            "process_exit"
+          ],
+          "properties": {
+            "hello_terminal": {
+              "const": 30000
+            },
+            "init_terminal": {
+              "const": 30000
+            },
+            "create": {
+              "type": "object", "additionalProperties": false,
+              "required": ["ack", "terminal"],
+              "properties": {"ack": {"const": 100}, "terminal": {"const": 2000}}
+            },
+            "normal_probe_snapshot": {
+              "type": "object", "additionalProperties": false,
+              "required": ["ack", "terminal"],
+              "properties": {"ack": {"const": 100}, "terminal": {"const": 250}}
+            },
+            "trap": {
+              "type": "object", "additionalProperties": false,
+              "required": ["terminal", "replacement_ready_from_control_write"],
+              "properties": {"terminal": {"const": 250}, "replacement_ready_from_control_write": {"const": 500}}
+            },
+            "cpu": {
+              "type": "object", "additionalProperties": false,
+              "required": ["execution_started_from_admission_min_exclusive", "execution_started_from_admission_max", "failed_from_execution_started_min", "failed_from_execution_started_max", "replacement_ready_from_control_write"],
+              "properties": {
+                "execution_started_from_admission_min_exclusive": {"const": 0},
+                "execution_started_from_admission_max": {"const": 20},
+                "failed_from_execution_started_min": {"const": 40},
+                "failed_from_execution_started_max": {"const": 100},
+                "replacement_ready_from_control_write": {"const": 500}
+              }
+            },
+            "rollout": {
+              "type": "object", "additionalProperties": false,
+              "required": ["ack", "external_proof"],
+              "properties": {"ack": {"const": 500}, "external_proof": {"const": 2000}}
+            },
+            "authority_terminal": {
+              "const": 1000
+            },
+            "teardown_terminal": {
+              "const": 2000
+            },
+            "shutdown_terminal": {
+              "const": 2000
+            },
+            "process_exit": {
+              "const": 2000
+            }
+          }
+        },
+        "deadline_reset": {
+          "const": "only a valid phase transition for that request starts the next phase deadline"
+        },
+        "unrelated_event": {
+          "const": "validated and logged but never resets another request deadline"
+        },
+        "timeout_result": {
+          "const": "request timed_out and any later event is a protocol violation"
+        },
+        "transport_retry": {
+          "const": "none"
+        },
+        "candidate_hidden_retry": {
+          "const": "forbidden"
+        },
+        "only_oracle_retries": {
+          "const": [
+            "80 delayed duplicate cases (240 requests) after all normal rounds",
+            "one closed-gate backpressure retry after drain",
+            "at most one update-worker retry after a retryable pre-acceptance rejection"
+          ]
+        },
+        "phase_rejections": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "normal",
+            "delayed_duplicate",
+            "pressure_closed_gate",
+            "pressure_oversize",
+            "fault_stale",
+            "update_worker",
+            "cleanup_old_endpoint"
+          ],
+          "properties": {
+            "normal": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "delayed_duplicate": {
+              "type": "array",
+              "maxItems": 0
+            },
+            "pressure_closed_gate": {
+              "const": [
+                "backpressure"
+              ]
+            },
+            "pressure_oversize": {
+              "const": [
+                "payload_too_large"
+              ]
+            },
+            "fault_stale": {
+              "const": [
+                "stale_incarnation"
+              ]
+            },
+            "update_worker": {
+              "const": [
+                "backpressure"
+              ]
+            },
+            "cleanup_old_endpoint": {
+              "const": [
+                "tenant_missing"
+              ]
+            }
+          }
+        },
+        "all_other_rejections": {
+          "const": "protocol violation"
+        }
+      }
+    },
+    "rss": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scope",
+        "periodic_sample_ms",
+        "stable_sample",
+        "points",
+        "preallocation_before_minimal_host",
+        "formulas",
+        "instrumentation_validity",
+        "limits_bytes",
+        "statistics"
+      ],
+      "properties": {
+        "scope": {
+          "const": "sum working_set_bytes for candidate root process and all descendants"
+        },
+        "periodic_sample_ms": {
+          "const": 10
+        },
+        "stable_sample": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "count",
+            "spacing_ms",
+            "reducer"
+          ],
+          "properties": {
+            "count": {
+              "const": 3
+            },
+            "spacing_ms": {
+              "const": 100
+            },
+            "reducer": {
+              "const": "median"
+            }
+          }
+        },
+        "points": {
+          "const": [
+            "minimal_host_after_hello_before_engine_module_or_pool_initialization",
+            "after_shared_initialization",
+            "all_32_tenants_ready",
+            "each_phase_peak",
+            "each_post_teardown_cleanup_cycle"
+          ]
+        },
+        "preallocation_before_minimal_host": {
+          "const": "forbidden"
+        },
+        "formulas": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ready_delta_bytes",
+            "peak_delta_bytes",
+            "cleanup_delta_i_bytes",
+            "cleanup_slope_bytes_per_cycle"
+          ],
+          "properties": {
+            "ready_delta_bytes": {
+              "const": "ready_32_stable_median_bytes - minimal_host_stable_median_bytes"
+            },
+            "peak_delta_bytes": {
+              "const": "max_10ms_process_tree_sample_bytes - minimal_host_stable_median_bytes"
+            },
+            "cleanup_delta_i_bytes": {
+              "const": "post_cleanup_stable_median_i_bytes - minimal_host_stable_median_bytes"
+            },
+            "cleanup_slope_bytes_per_cycle": {
+              "const": "sum((i-mean_i)*(y_i-mean_y))/sum((i-mean_i)^2), i=1..30, y_i=median RSS at exactly 1000, 1100, and 1200 ms after teardown minus minimal_host_stable_median_bytes"
+            }
+          }
+        },
+        "instrumentation_validity": {
+          "const": "ready_delta_bytes must be greater than zero and every sample must include descendants"
+        },
+        "limits_bytes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ready_32_total",
+            "peak_delta",
+            "post_cleanup_delta",
+            "cleanup_slope_per_cycle"
+          ],
+          "properties": {
+            "ready_32_total": {
+              "const": 805306368
+            },
+            "peak_delta": {
+              "const": 536870912
+            },
+            "post_cleanup_delta": {
+              "const": 67108864
+            },
+            "cleanup_slope_per_cycle": {
+              "const": 1048576
+            }
+          }
+        },
+        "statistics": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "nearest_rank_percentile",
+            "run_scope",
+            "outliers",
+            "pair_ratio",
+            "relative_result",
+            "ratio_limit",
+            "sensitivity_thresholds"
+          ],
+          "properties": {
+            "nearest_rank_percentile": {
+              "const": "sort ascending and select index ceil(p*n)-1 without interpolation"
+            },
+            "run_scope": {
+              "const": "each retained candidate run independently; never pool across runs"
+            },
+            "outliers": {
+              "const": "none removed"
+            },
+            "pair_ratio": {
+              "const": "for each retained block and metric, lunatic positive value divided by alternative positive value"
+            },
+            "relative_result": {
+              "const": "median of nine per-block ratios separately for lunatic/extism and lunatic/raw_wasmtime"
+            },
+            "ratio_limit": {
+              "const": 2.0
+            },
+            "sensitivity_thresholds": {
+              "const": [
+                1.25,
+                1.5,
+                2.0
+              ]
+            }
+          }
+        }
+      }
+    },
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "absolute_slos",
+        "mandatory_gates",
+        "key_metrics",
+        "retained_run_rule",
+        "eligibility",
+        "alternative_reference",
+        "alternative_dominates",
+        "performance_condition",
+        "strong_packaging",
+        "moderate_packaging",
+        "exclusive_precedence",
+        "exhaustive",
+        "first_matching_rule_wins",
+        "forbidden_claims",
+        "alternative_labels"
+      ],
+      "properties": {
+        "absolute_slos": {
+          "$ref": "#/$defs/absolute_slos"
+        },
+        "mandatory_gates": {
+          "const": [
+            "isolation",
+            "authority",
+            "admission",
+            "recovery",
+            "update_safety",
+            "state_semantics",
+            "cleanup"
+          ]
+        },
+        "key_metrics": {
+          "const": [
+            "shared_init_ns",
+            "warm_create_p99_ns",
+            "normal_p99_ns",
+            "normal_total_ns",
+            "pressure_admission_p99_ns",
+            "sibling_p99_ns",
+            "trap_recovery_p99_ns",
+            "cpu_recovery_p99_ns",
+            "failed_update_unavailability_p99_ns",
+            "valid_update_unavailability_p99_ns",
+            "failed_rollout_p99_ns",
+            "valid_rollout_p99_ns",
+            "ready_32_total_rss_bytes",
+            "peak_total_rss_bytes"
+          ]
+        },
+        "retained_run_rule": {
+          "const": "every absolute SLO and mandatory gate passes in every retained run; a timeout, crash, invalid trace, or protocol violation fails that run"
+        },
+        "eligibility": {
+          "const": "a candidate is eligible only if all nine retained runs pass every mandatory gate and absolute SLO"
+        },
+        "alternative_reference": {
+          "const": "among eligible extism and raw_wasmtime candidates, S_ref is the minimum production SLOC and delta is S_ref minus S_L"
+        },
+        "alternative_dominates": {
+          "const": "an eligible alternative C dominates iff S_C <= S_L, every key-metric median9(C/L) <= 1.00, at least one of S_C < S_L or a metric ratio < 1.00, and C requires no extra process or database"
+        },
+        "performance_condition": {
+          "const": "for every eligible alternative and key metric, median9(L/C) <= 2.00"
+        },
+        "strong_packaging": {
+          "const": "S_L <= floor(0.70 * S_ref), delta >= 300, performance_condition, and no extra infrastructure"
+        },
+        "moderate_packaging": {
+          "const": "not strong_packaging, S_L <= floor(0.85 * S_ref), delta >= 150, performance_condition, and no extra infrastructure"
+        },
+        "exclusive_precedence": {
+          "type": "array",
+          "minItems": 6,
+          "maxItems": 6,
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/verdict_1"
+            },
+            {
+              "$ref": "#/$defs/verdict_2"
+            },
+            {
+              "$ref": "#/$defs/verdict_3"
+            },
+            {
+              "$ref": "#/$defs/verdict_4"
+            },
+            {
+              "$ref": "#/$defs/verdict_5"
+            },
+            {
+              "$ref": "#/$defs/verdict_6"
+            }
+          ],
+          "items": false
+        },
+        "exhaustive": {
+          "const": true
+        },
+        "first_matching_rule_wins": {
+          "const": true
+        },
+        "forbidden_claims": {
+          "const": ["universal necessity", "market uniqueness", "technical necessity from tested-set failure"]
+        },
+        "alternative_labels": {
+          "type": "object", "additionalProperties": false,
+          "required": ["extism", "raw_wasmtime"],
+          "properties": {
+            "extism": {"const": "packaged alternative"},
+            "raw_wasmtime": {"const": "construction lower bound"}
+          }
+        }
+      }
+    },
+    "absolute_slos": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warm_create_p99_ms",
+        "normal_p99_ms",
+        "pressure_admission_p99_ms",
+        "sibling_p99_ms",
+        "trap_replacement_ready_p99_ms",
+        "cpu_replacement_ready_p99_ms",
+        "cpu_failed_terminal_min_ms",
+        "cpu_failed_terminal_max_ms",
+        "failed_update_unavailability_p99_ms",
+        "valid_update_unavailability_p99_ms",
+        "failed_rollout_p99_ms",
+        "valid_rollout_p99_ms",
+        "failed_mixed_window_max_ms",
+        "valid_mixed_window_max_ms",
+        "update_rpo_completed_commands"
+      ],
+      "properties": {
+        "warm_create_p99_ms": {
+          "const": 10
+        },
+        "normal_p99_ms": {
+          "const": 5
+        },
+        "pressure_admission_p99_ms": {
+          "const": 20
+        },
+        "sibling_p99_ms": {
+          "const": 20
+        },
+        "trap_replacement_ready_p99_ms": {
+          "const": 500
+        },
+        "cpu_replacement_ready_p99_ms": {
+          "const": 500
+        },
+        "cpu_failed_terminal_min_ms": {
+          "const": 40
+        },
+        "cpu_failed_terminal_max_ms": {
+          "const": 100
+        },
+        "failed_update_unavailability_p99_ms": {
+          "const": 100
+        },
+        "valid_update_unavailability_p99_ms": {
+          "const": 100
+        },
+        "failed_rollout_p99_ms": {
+          "const": 2000
+        },
+        "valid_rollout_p99_ms": {
+          "const": 2000
+        },
+        "failed_mixed_window_max_ms": {
+          "const": 2000
+        },
+        "valid_mixed_window_max_ms": {
+          "const": 2000
+        },
+        "update_rpo_completed_commands": {
+          "const": 0
+        }
+      }
+    },
+    "verdict_base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rank",
+        "id",
+        "when"
+      ],
+      "properties": {
+        "rank": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 6
+        },
+        "id": {
+          "type": "string"
+        },
+        "when": {
+          "type": "string"
+        },
+        "output": {
+          "type": "string"
+        },
+        "scope": {
+          "type": "string"
+        }
+      }
+    },
+    "verdict_1": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/verdict_base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rank": {
+              "const": 1
+            },
+            "id": {
+              "const": "POSITIONING_REJECTED"
+            },
+            "when": {
+              "const": "!L"
+            }
+          }
+        }
+      ]
+    },
+    "verdict_2": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/verdict_base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rank": {
+              "const": 2
+            },
+            "id": {
+              "const": "ALTERNATIVE_DOMINATES"
+            },
+            "when": {
+              "const": "L && A && alt_dom"
+            }
+          }
+        }
+      ]
+    },
+    "verdict_3": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/verdict_base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rank": {
+              "const": 3
+            },
+            "id": {
+              "const": "LUNATIC_PACKAGING_VALUE_SUPPORTED"
+            },
+            "when": {
+              "const": "L && A && !alt_dom && (strong_packaging || moderate_packaging)"
+            },
+            "output": {
+              "const": "strong or moderate tier"
+            }
+          }
+        }
+      ]
+    },
+    "verdict_4": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/verdict_base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rank": {
+              "const": 4
+            },
+            "id": {
+              "const": "LUNATIC_PACKAGING_VALUE_UNSUPPORTED"
+            },
+            "when": {
+              "const": "L && A && !alt_dom && !strong_packaging && !moderate_packaging"
+            }
+          }
+        }
+      ]
+    },
+    "verdict_5": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/verdict_base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rank": {
+              "const": 5
+            },
+            "id": {
+              "const": "TESTED_SET_PACKAGING_GAP"
+            },
+            "when": {
+              "const": "L && !A && both_alternatives_complete_and_independently_reviewed && every_failure_is_reproducible_mandatory_contract_or_absolute_slo"
+            },
+            "scope": {
+              "const": "tested-set packaging gap only; never universal or technical necessity"
+            }
+          }
+        }
+      ]
+    },
+    "verdict_6": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/verdict_base"
+        },
+        {
+          "type": "object",
+          "properties": {
+            "rank": {
+              "const": 6
+            },
+            "id": {
+              "const": "INCONCLUSIVE"
+            },
+            "when": {
+              "const": "L && !A && !tested_set_packaging_gap"
+            }
+          }
+        }
+      ]
+    }
+  }
+}

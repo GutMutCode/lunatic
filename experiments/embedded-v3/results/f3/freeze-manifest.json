@@ -1,0 +1,105 @@
+{
+  "experiment_id": "embedded-v3-2026-07-23",
+  "freeze_revision": 3,
+  "freeze_utc": "2026-07-24T04:48:40Z",
+  "config_count": 30,
+  "evidence_root": "C:/tmp/e3f3-e",
+  "scratch_root": "C:/tmp/e3f3-s",
+  "machine_fingerprint_sha256": "acfd0b7c03acaa1dd4b2591ebdc61bf5667b85126e6e414c67f01caccb89910d",
+  "fingerprint_basis": "sha256(canonical JSON of system UUID, frozen OS, CPU, logical processors, physical memory); raw UUID not retained here",
+  "scenario": {
+    "bytes": 28784,
+    "sha256": "e5bcbc12981d4621fdeb551972e2c168fa8c48261b9ad8994ebccdf8ce1b166e",
+    "plan_sha256": "a451737674dd18b9ac69fd882d2024766c29d9b2e6c67c26d2e02326be525b32"
+  },
+  "static_evidence_manifest": {
+    "path": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/evidence-inputs/manifest.json",
+    "bytes": 12328,
+    "sha256": "2f1ca51e5e768aa488fb38ebcec96d3a696afd260526d4c771185145e6515e86",
+    "bound_artifact_roles": 14
+  },
+  "oracle_source_snapshot": {
+    "path": "C:/tmp/embedded-v3-freeze/oracle-source-f3.tar",
+    "bytes": 1088512,
+    "sha256": "3c815e20de41b6346712f388cdf3be6ea33988c9cb5f4eb990185b0d6fa74e3d",
+    "verified_files": 35,
+    "exact_current_tree": true
+  },
+  "candidate_source_snapshots": {
+    "lunatic": {
+      "path": "C:/tmp/embedded-v3-freeze/lunatic-source.tar",
+      "bytes": 203264,
+      "sha256": "8fbaf091b6896d8d5c9f1b23b9e9934c8234e5c133fdff58ae0b7b454e405150"
+    },
+    "extism": {
+      "path": "C:/tmp/embedded-v3-freeze/extism-source.tar",
+      "bytes": 226816,
+      "sha256": "ecfde6c5e1aada0b370573293591b1588ac3e5c3e0978a1ee3506717929e6220"
+    },
+    "raw_wasmtime": {
+      "path": "C:/tmp/embedded-v3-freeze/direct-wasmtime-source.tar",
+      "bytes": 201728,
+      "sha256": "4e88145e5174537cd832245ec84e07a51e35d0f38d7120028f0b6b9ac2567958"
+    }
+  },
+  "executables": {
+    "oracle": {
+      "path": "C:/tmp/embedded-v3-oracle-target-f3/release/embedded-v3-full-run.exe",
+      "bytes": 34630144,
+      "sha256": "21c8195632466dee8f4680fc66c71291a144acebd3c8015201f3285f375e00f4"
+    },
+    "verdict": {
+      "path": "C:/tmp/embedded-v3-oracle-target-f3/release/embedded-v3-verdict.exe",
+      "bytes": 2674688,
+      "sha256": "383aae572ca7e32356f17eb146825f6d0d35ae74b4d5772b17771ced953fb6b2"
+    },
+    "lunatic": {
+      "bytes": 16768512,
+      "sha256": "596e10d35513b3d289770dfcca44a244be0b31d195e066221bcf148d940b80b8"
+    },
+    "extism": {
+      "bytes": 18814464,
+      "sha256": "5386d91c73eab81b2473d34106374c4aff659ce5476ac1fe6dea250214207182"
+    },
+    "raw_wasmtime": {
+      "bytes": 11850752,
+      "sha256": "d0630158359e0f3ee8503efc74b7a16913d8bc9a3407c31dd65aad70d218b5cb"
+    }
+  },
+  "effort_basis": {
+    "lunatic": "106 minutes wall-clock from candidate directory creation to first complete core+authority pass",
+    "extism": "120 minutes wall-clock from candidate directory creation to first complete core+authority pass",
+    "raw_wasmtime": "123 minutes wall-clock from candidate directory creation to first complete core+authority pass",
+    "performance_tuning": "0 minutes and 0 revisions after candidate freeze for every candidate"
+  },
+  "preflight": {
+    "decision_bearing": false,
+    "successful_run": "C:/tmp/e3pf3-e2/preflight2-embedded-v3-b05-lunatic-f3",
+    "overall_pass": true,
+    "stream_trace_sha256": "250640cb9b4fa5bb4251fa60619deba818b3afdfc17626b8eae83835d855b32e",
+    "rollout_attempts": 60,
+    "post_terminal_same_attempt_worker_stdin": 0,
+    "trace_worker_attempts": 2682,
+    "completed_count_worker_attempts": 2682
+  },
+  "exclusions": [
+    {
+      "root": "C:/tmp/embedded-v3-evidence-20260724t035421z",
+      "reason": "freeze-2 discarded after Oracle causal-order and evidence-count correction"
+    },
+    {
+      "root": "C:/tmp/embedded-v3-preflight-evidence-20260724t044840z",
+      "reason": "failed non-decision preflight: SQLite rollback-journal path exceeded the legacy Windows path budget"
+    },
+    {
+      "root": "C:/tmp/e3pf3-e2",
+      "reason": "successful non-decision preflight excluded by design"
+    }
+  ],
+  "windows_path_budget": {
+    "scratch_root": "C:/tmp/e3f3-s",
+    "scratch_root_chars": 13,
+    "estimated_final_sqlite_path_chars": 219,
+    "estimated_final_sqlite_journal_chars": 227
+  }
+}

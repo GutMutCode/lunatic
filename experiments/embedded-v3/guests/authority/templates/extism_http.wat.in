@@ -1,0 +1,33 @@
+(module
+  (import "extism:host/env" "alloc"
+    (func $alloc (param i64) (result i64)))
+  (import "extism:host/env" "store_u8"
+    (func $store_u8 (param i64 i32)))
+  (import "extism:host/env" "http_request"
+    (func $http_request (param i64 i64) (result i64)))
+  (import "extism:host/env" "length"
+    (func $length (param i64) (result i64)))
+  (import "extism:host/env" "output_set"
+    (func $output_set (param i64 i64)))
+
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "__PARAM_BLOB__")
+
+  (func (export "parameter_ptr") (result i32) (i32.const 1024))
+  (func (export "parameter_len") (result i32) (i32.const __PARAM_LEN__))
+
+  (func (export "invoke") (result i32)
+    (local $request i64)
+    (local $body i64)
+    (local $response i64)
+
+    (local.set $request (call $alloc (i64.const __REQUEST_LEN__)))
+__REQUEST_STORE__
+    (local.set $body (call $alloc (i64.const __BODY_LEN__)))
+__BODY_STORE__
+    (local.set $response
+      (call $http_request (local.get $request) (local.get $body)))
+    (call $output_set
+      (local.get $response) (call $length (local.get $response)))
+    (i32.const 0))
+)

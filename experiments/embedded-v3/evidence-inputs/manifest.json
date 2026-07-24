@@ -1,0 +1,263 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "purpose": "Canonical source inputs and role definitions for the fourteen bound RunManifest artifacts. Deferred artifacts receive paths, byte lengths, and hashes only from the exact files selected at execution freeze.",
+  "fourteen_bound_artifacts": [
+    "authority_policy",
+    "source_review",
+    "oracle_source_snapshot",
+    "oracle_executable",
+    "candidate_source_snapshot",
+    "candidate_executable",
+    "candidate_cargo_lock",
+    "candidate_sloc_manifest",
+    "candidate_sloc_result",
+    "guest_A",
+    "guest_B",
+    "guest_bad_A",
+    "guest_bad_B",
+    "run_specific_authority_manifest"
+  ],
+  "deferred_artifact_roles": {
+    "oracle_source_snapshot": {
+      "run_manifest_field": "oracle.source_snapshot",
+      "status": "bind_after_oracle_source_freeze",
+      "artifact_kind": "uncompressed_tar",
+      "identity": "The exact selected tar bytes, byte length, and SHA-256; no static path or placeholder hash is valid before creation."
+    },
+    "oracle_executable": {
+      "run_manifest_field": "oracle.executable",
+      "status": "bind_after_release_build",
+      "artifact_kind": "release_executable",
+      "identity": "The exact executable bytes, byte length, and SHA-256 built from oracle_source_snapshot; no static path or placeholder hash is valid before creation."
+    }
+  },
+  "source_snapshot_rules": {
+    "common": {
+      "format": "uncompressed tar",
+      "excluded": [
+        "target",
+        ".git",
+        ".hg",
+        ".svn"
+      ],
+      "creation": "Create the tar once after the corresponding source freeze. Do not regenerate or overwrite it after measurement preparation; any later included-source change requires a new snapshot and execution freeze.",
+      "verification": "Compare every current non-excluded regular file path, byte length, and SHA-256 with the archive before execution. Directory headers, entry order, modes, timestamps, padding, and all other tar bytes remain part of the snapshot identity.",
+      "authority": "The byte length and SHA-256 of the exact fixed tar actually supplied to the run are authoritative. A reconstructed archive with identical extracted files is not interchangeable unless its complete tar bytes have the recorded identity."
+    },
+    "oracle_source_snapshot": {
+      "archive_root": "The frozen Oracle source root contents appear below ./ in the archive.",
+      "included": "Every non-excluded file needed to build and audit the common Oracle, including its Cargo manifests and lockfile, crates, schemas, and source. Its concrete path, byte length, and hash are intentionally deferred until the Oracle tar is created."
+    },
+    "candidate_source_snapshot": {
+      "archive_root": "The candidate directory contents appear below ./ in the archive.",
+      "included": "Every file and directory intended for the frozen candidate tree, including Cargo.toml, Cargo.lock, sloc-manifest.json, src, tests, and guest-artifacts."
+    }
+  },
+  "core_guests": {
+    "A": {
+      "path": "experiments/embedded-v3/guests/core/artifacts/tenant-a.wasm",
+      "bytes": 885,
+      "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1"
+    },
+    "B": {
+      "path": "experiments/embedded-v3/guests/core/artifacts/tenant-b.wasm",
+      "bytes": 885,
+      "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e"
+    },
+    "bad_A": {
+      "path": "experiments/embedded-v3/guests/core/artifacts/tenant-bad-a.wasm",
+      "bytes": 893,
+      "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d"
+    },
+    "bad_B": {
+      "path": "experiments/embedded-v3/guests/core/artifacts/tenant-bad-b.wasm",
+      "bytes": 893,
+      "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557"
+    },
+    "generator_manifest": {
+      "path": "experiments/embedded-v3/guests/core/artifacts/manifest.json",
+      "bytes": 1263,
+      "sha256": "df09ba9561628b257cea214ec6cd7fd665e3eb4bcab2b2de85795762c09b4c5d"
+    }
+  },
+  "authority_bundle": {
+    "binding_rule": "Generate after binding the run's deterministic nonce and live TCP, UDP, HTTP, filesystem, and SQLite parameters. Copy the generated manifest and all six member Wasm files into the immutable run bundle. Bind the generated manifest as RunManifest.guest_artifacts.authority and verify every member hash and parameter hash transitively.",
+    "final_run_sha256": "computed_per_run",
+    "checked_in_fixture": {
+      "warning": "This canary-0001 fixture proves generator determinism but is not the final run-specific authority artifact.",
+      "manifest": {
+        "path": "experiments/embedded-v3/guests/authority/artifacts/manifest.json",
+        "bytes": 11804,
+        "sha256": "f1f4743c235b991bc743cf0224afb3ba2f682adee05e7c33243b96c81eb9c05b"
+      },
+      "members": [
+        {
+          "probe": "wasi_p1_fs_read",
+          "path": "experiments/embedded-v3/guests/authority/artifacts/wasi_p1_fs_read.wasm",
+          "bytes": 717,
+          "sha256": "1952d9cbd3509c2a24391fa0cb46aaa395b4fdafce63f1f5ea96c903baabd038"
+        },
+        {
+          "probe": "wasi_p1_fs_mutate",
+          "path": "experiments/embedded-v3/guests/authority/artifacts/wasi_p1_fs_mutate.wasm",
+          "bytes": 1004,
+          "sha256": "7564e3fb0a67437e7bd31a7d2972b6e4ebe5842008f4dc6be0af89adcd885adb"
+        },
+        {
+          "probe": "lunatic_tcp",
+          "path": "experiments/embedded-v3/guests/authority/artifacts/lunatic_tcp.wasm",
+          "bytes": 632,
+          "sha256": "88523be61bf9e4b7c6bec00e52961fd4738ff87757b19007669a62bfa0a6470c"
+        },
+        {
+          "probe": "lunatic_udp",
+          "path": "experiments/embedded-v3/guests/authority/artifacts/lunatic_udp.wasm",
+          "bytes": 607,
+          "sha256": "d4fdab9980fc8774790f73b2da56cce2261db78310b5264da69d8ce1e4409dd0"
+        },
+        {
+          "probe": "lunatic_sqlite_create",
+          "path": "experiments/embedded-v3/guests/authority/artifacts/lunatic_sqlite_create.wasm",
+          "bytes": 708,
+          "sha256": "a3c78c7cfb21c1a37740a0b9fb92f1f2ce98b1bbb2f82333230e1a13c1207fee"
+        },
+        {
+          "probe": "extism_http",
+          "path": "experiments/embedded-v3/guests/authority/artifacts/extism_http.wasm",
+          "bytes": 2724,
+          "sha256": "07c1c408c9a8eb556bb6b708adc7dd8ad72ac034c0242a6d1a28573288ff9139"
+        }
+      ]
+    },
+    "generator_provenance": {
+      "cargo_lock": {
+        "path": "experiments/embedded-v3/guests/authority/Cargo.lock",
+        "sha256": "117ee9fe1e5ce9dcd2de8f4e9575b07c60c2c20a8591056c081829b1dcc08f0b"
+      },
+      "library": {
+        "path": "experiments/embedded-v3/guests/authority/src/lib.rs",
+        "sha256": "9cfb9371adcf5d963cb3a08a5e5b07ff8cc02adf3f3e6f23d76bf77692c57053"
+      },
+      "template_sha256": {
+        "wasi_p1_fs_read.wat.in": "a3292539b0e43f32cd6ad310493f187cf2fc465e32a51044994805bff44e86be",
+        "wasi_p1_fs_mutate.wat.in": "99bb787ab4e50fe8d42d4671d27d637544b61517003461024b807536d582b295",
+        "lunatic_tcp.wat.in": "f544e164cd6d3983a30519694bab7eb451ae6cc0d492e7590095a1805e908120",
+        "lunatic_udp.wat.in": "053c73559920a66adf33ad66bf2e698d4088062416c3dfdd5d2b4eae3477b75a",
+        "lunatic_sqlite_create.wat.in": "65aa904a26a73002b3ccbf16d24504371bb84f0bd3223d44c6107066d9ce2892",
+        "extism_http.wat.in": "cd31fc9a1dac19611455f58956cf1647e366f80138a4746c7e2a87b6e9a2406e"
+      }
+    }
+  },
+  "sloc_generation": {
+    "working_directory": "experiments/embedded-v3",
+    "self_test_command": "node tools/sloc-frozen.mjs --self-test",
+    "stdout_rule": "Capture successful native stdout bytes unchanged as UTF-8 JSON; do not reserialize before hashing or binding.",
+    "candidates": {
+      "raw-wasmtime": {
+        "command": "node tools/sloc-frozen.mjs candidates/direct-wasmtime/sloc-manifest.json",
+        "expected_production_sloc": 1887,
+        "expected_manifest_sha256": "7f84c73ba0fe56b98d046c6dbcc5c78e80ffb208c8ba205397fc287ae83d3340"
+      },
+      "lunatic": {
+        "command": "node tools/sloc-frozen.mjs candidates/lunatic/sloc-manifest.json",
+        "expected_production_sloc": 1587,
+        "expected_manifest_sha256": "df705a8c29716a87263f913a9ce81796a329ed209c493d4f2e46776a771d8229"
+      },
+      "extism": {
+        "command": "node tools/sloc-frozen.mjs candidates/extism/sloc-manifest.json",
+        "expected_production_sloc": 1831,
+        "expected_manifest_sha256": "9c386a22feaa3193df992dbc66cfec6bb6458444d2d746096aa9ae6d9686a72c"
+      }
+    }
+  },
+  "candidate_inputs": {
+    "raw-wasmtime": {
+      "authority_policy": {
+        "path": "experiments/embedded-v3/evidence-inputs/raw-wasmtime/authority-policy.json",
+        "bytes": 3120,
+        "sha256": "7736fe5c1133f875ed3749b1f8e907048306aa0b0ff830f93c9311cf6ee1a522"
+      },
+      "source_review": {
+        "path": "experiments/embedded-v3/evidence-inputs/raw-wasmtime/source-review.json",
+        "bytes": 5050,
+        "sha256": "7c783c7ef3f23751de4d28e0832bcced2af5c7621dabb064670f778fbd98dd78"
+      },
+      "candidate_source_snapshot": {
+        "path": "C:/tmp/embedded-v3-freeze/direct-wasmtime-source.tar",
+        "bytes": 201728,
+        "sha256": "4e88145e5174537cd832245ec84e07a51e35d0f38d7120028f0b6b9ac2567958",
+        "regular_files": 18,
+        "verified_against_current_tree": true
+      },
+      "cargo_lock": {
+        "path": "experiments/embedded-v3/candidates/direct-wasmtime/Cargo.lock",
+        "bytes": 27544,
+        "sha256": "0cd2b04700085e6d5a191547a4854b35092652088ae00325c91af73c97fac057"
+      },
+      "sloc_manifest": {
+        "path": "experiments/embedded-v3/candidates/direct-wasmtime/sloc-manifest.json",
+        "bytes": 3991,
+        "sha256": "7f84c73ba0fe56b98d046c6dbcc5c78e80ffb208c8ba205397fc287ae83d3340"
+      }
+    },
+    "lunatic": {
+      "authority_policy": {
+        "path": "experiments/embedded-v3/evidence-inputs/lunatic/authority-policy.json",
+        "bytes": 3184,
+        "sha256": "5d3c5e57591a2f5e3aea0da2f7b94affffb33116699b8383d3c8156fd320282f"
+      },
+      "source_review": {
+        "path": "experiments/embedded-v3/evidence-inputs/lunatic/source-review.json",
+        "bytes": 5975,
+        "sha256": "cf716f0ecaf5624a3ae1890172366382f48d0ba1787f4a3d9b2c2009ecc6b2e9"
+      },
+      "candidate_source_snapshot": {
+        "path": "C:/tmp/embedded-v3-freeze/lunatic-source.tar",
+        "bytes": 203264,
+        "sha256": "8fbaf091b6896d8d5c9f1b23b9e9934c8234e5c133fdff58ae0b7b454e405150",
+        "regular_files": 15,
+        "verified_against_current_tree": true
+      },
+      "cargo_lock": {
+        "path": "experiments/embedded-v3/candidates/lunatic/Cargo.lock",
+        "bytes": 60634,
+        "sha256": "52dba9abe8523b33add42ada6be4b6bd974a9e51ee927bb43efeae9070d6ed30"
+      },
+      "sloc_manifest": {
+        "path": "experiments/embedded-v3/candidates/lunatic/sloc-manifest.json",
+        "bytes": 3707,
+        "sha256": "df705a8c29716a87263f913a9ce81796a329ed209c493d4f2e46776a771d8229"
+      }
+    },
+    "extism": {
+      "authority_policy": {
+        "path": "experiments/embedded-v3/evidence-inputs/extism/authority-policy.json",
+        "bytes": 4063,
+        "sha256": "beacd517805e96f03125b231a48d0517baf16bb5b5f8fec56f3131eb26d7760d"
+      },
+      "source_review": {
+        "path": "experiments/embedded-v3/evidence-inputs/extism/source-review.json",
+        "bytes": 5266,
+        "sha256": "d3decf3122fc5646818df06098dd8dc13a70cb398a034af2a787d888c46547eb"
+      },
+      "candidate_source_snapshot": {
+        "path": "C:/tmp/embedded-v3-freeze/extism-source.tar",
+        "bytes": 226816,
+        "sha256": "ecfde6c5e1aada0b370573293591b1588ac3e5c3e0978a1ee3506717929e6220",
+        "regular_files": 13,
+        "verified_against_current_tree": true
+      },
+      "cargo_lock": {
+        "path": "experiments/embedded-v3/candidates/extism/Cargo.lock",
+        "bytes": 72276,
+        "sha256": "ccb0a67aa86745b7cef014fce6fef898079a5ab5465bd4c8985a276be7a9f08b"
+      },
+      "sloc_manifest": {
+        "path": "experiments/embedded-v3/candidates/extism/sloc-manifest.json",
+        "bytes": 3461,
+        "sha256": "9c386a22feaa3193df992dbc66cfec6bb6458444d2d746096aa9ae6d9686a72c"
+      }
+    }
+  }
+}

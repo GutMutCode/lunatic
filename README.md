@@ -13,6 +13,17 @@ It's inspired by Erlang. Languages can target it when their toolchains emit comp
 and provide bindings for the Lunatic host APIs they need.
 You can read more about the motivation behind Lunatic [here][2].
 
+## Positioning and evidence
+
+Lunatic packages actor lifecycle, recovery, authority, backpressure, and transactional-update
+contracts for stateful Wasm applications. These contracts are not unique to Lunatic: in a frozen
+32-tenant embedded comparison, a reviewed direct-Wasmtime implementation also passed every retained
+block. Lunatic implemented the mandatory contract in 1,587 candidate-specific production SLOC versus
+1,887 for direct Wasmtime (15.9% less), while all paired performance-cost ratios stayed within the
+experiment's accepted 2x envelope. This supports modest packaging leverage for the tested workload,
+not technical monopoly, market demand, or universal performance superiority. See the
+[reproducible comparison](docs/comparisons/EMBEDDED_V3_RESULTS.md) for the method, results, and limits.
+
 Language bindings and ecosystem libraries are available for:
 
 - [Rust][3]
@@ -39,6 +50,7 @@ Unchecked entries are active implementation areas, not unavailable concepts. The
 
 - [**CORE_VALUES.md**](CORE_VALUES.md) - Design principles and Erlang inspiration
 - [**docs/core_values/status.md**](docs/core_values/status.md) - Up-to-date implementation compliance review
+- [**docs/comparisons/EMBEDDED_V3_RESULTS.md**](docs/comparisons/EMBEDDED_V3_RESULTS.md) - Reproducible embedded-runtime comparison and positioning limits
 - [**docs/security/AUDIT_LOGGING.md**](docs/security/AUDIT_LOGGING.md) - How to capture and route audit log events
 - [**docs/security/NODE_CONTROL_BEARER.md**](docs/security/NODE_CONTROL_BEARER.md) - Node-control bearer transport, rotation, and revocation contract
 - [**docs/hot_reload/HOT_RELOAD_ARCHITECTURE.md**](docs/hot_reload/HOT_RELOAD_ARCHITECTURE.md) - Hot reload system design

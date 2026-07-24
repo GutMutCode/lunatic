@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "policy_id": "embedded-v3-extism-production-authority-v1",
+  "candidate": "extism",
+  "default_capability_decision": "deny",
+  "enforcement": {
+    "configuration": "Every production PluginBuilder disables WASI and registers only the comparison custom functions. The Extism dependency disables default features and enables only wasmtime-default-features; no HTTP, filesystem-registration, or ureq feature is enabled.",
+    "declaration_binding": "The candidate validates and echoes production_policy_sha256 on every authority terminal event; the policy JSON is not interpreted at runtime. Builder behavior plus the external authority canary is the enforcement evidence.",
+    "source": [
+      {
+        "path": "experiments/embedded-v3/candidates/extism/Cargo.toml",
+        "sha256": "55019e249cfb5c74648223fb25859744ec39e16fb5c0a73dc8ad6a09da2fbd5d"
+      },
+      {
+        "path": "experiments/embedded-v3/candidates/extism/src/guest.rs",
+        "sha256": "3edae41207128573a8e72de58b55295a958e89dbe5c88964377cefa82efe3269",
+        "symbols": [
+          "production_host_functions",
+          "GuestCatalog::load"
+        ]
+      },
+      {
+        "path": "experiments/embedded-v3/candidates/extism/src/authority.rs",
+        "sha256": "3a7bb77ba4394ac88bbd26bdb8034277e8ef1e928a44dfee28e071ebcf1532b0",
+        "symbols": [
+          "run_probe",
+          "classify_link_failure",
+          "expected_unavailable_import"
+        ]
+      }
+    ]
+  },
+  "custom_imports_allowed": [
+    "comparison::tenant_id",
+    "comparison::restore_counter",
+    "comparison::command_handle",
+    "comparison::activation_started",
+    "comparison::emit_result",
+    "comparison::execution_started",
+    "comparison::bind_observer",
+    "comparison::next_command"
+  ],
+  "runtime_base_abi": "Extism's non-capability base ABI remains available for plugin memory/input/output plumbing.",
+  "capability_grants": {
+    "wasi_preview1": false,
+    "filesystem_read": false,
+    "filesystem_mutate": false,
+    "tcp": false,
+    "udp": false,
+    "sqlite": false,
+    "http": false,
+    "guest_child_spawn": false
+  },
+  "resource_limits": {
+    "core_guest_linear_memory_pages": 1,
+    "core_guest_max_linear_memory_pages": 1,
+    "core_guest_memory_limit_source": "The hash-pinned core guest declares memory 1 1; the candidate accepts no other tenant artifact hashes.",
+    "mailbox_messages": 64,
+    "payload_bytes": 1024,
+    "cpu_deadline_milliseconds": 50
+  },
+  "authority_probe_expectations": [
+    {
+      "probe": "wasi_p1_fs_read",
+      "unavailable_import": "wasi_snapshot_preview1::path_open",
+      "stage": [
+        "compile",
+        "instantiate"
+      ],
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "wasi_p1_fs_mutate",
+      "unavailable_import": "wasi_snapshot_preview1::path_open",
+      "stage": [
+        "compile",
+        "instantiate"
+      ],
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_tcp",
+      "unavailable_import": "lunatic::networking::tcp_connect",
+      "stage": [
+        "compile",
+        "instantiate"
+      ],
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_udp",
+      "unavailable_import": "lunatic::networking::udp_bind",
+      "stage": [
+        "compile",
+        "instantiate"
+      ],
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_sqlite_create",
+      "unavailable_import": "lunatic::sqlite::open",
+      "stage": [
+        "compile",
+        "instantiate"
+      ],
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "extism_http",
+      "stage": "invoke",
+      "result": "policy_denied",
+      "error_class": "http_capability_denied",
+      "required_error_fragments": [
+        "http_request is not enabled",
+        "is not allowed"
+      ]
+    }
+  ]
+}

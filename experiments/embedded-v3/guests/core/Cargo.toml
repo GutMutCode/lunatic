@@ -1,0 +1,25 @@
+[package]
+name = "embedded-v3-core-guests"
+version = "0.1.0"
+edition = "2018"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+
+[workspace]
+
+[dependencies]
+sha2 = "=0.10.9"
+wat = "=1.254.0"
+
+[dev-dependencies]
+anyhow = "=1.0.100"
+extism = "=1.30.0"
+lunatic-process = { path = "../../../../crates/lunatic-process", version = "0.14" }
+serde = { version = "=1.0.228", features = ["derive"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+wasmtime = "=46.0.1"
+
+[[bin]]
+name = "build-core-guests"
+path = "src/bin/build_core_guests.rs"

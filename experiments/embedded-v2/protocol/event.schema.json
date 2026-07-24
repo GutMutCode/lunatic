@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v2/event.schema.json",
+  "title": "Embedded v2 candidate-to-oracle event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "experiment_id", "run_id", "event_seq", "request_id", "candidate", "kind", "tenant_id", "command_id", "data"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "experiment_id": { "const": "embedded-v2-2026-07-23" },
+    "run_id": { "type": "string", "pattern": "^[a-z0-9-]{1,64}$" },
+    "event_seq": { "$ref": "#/$defs/u64" },
+    "request_id": { "$ref": "#/$defs/id" },
+    "candidate": { "enum": ["lunatic", "direct-wasmtime"] },
+    "kind": {
+      "enum": [
+        "candidate_ready",
+        "control_ack",
+        "tenant_ready",
+        "command_admission",
+        "command_terminal",
+        "failure_observed",
+        "rollout_state",
+        "tenant_snapshot",
+        "authority_result",
+        "teardown_complete",
+        "fatal"
+      ]
+    },
+    "tenant_id": { "oneOf": [{ "$ref": "#/$defs/tenant" }, { "type": "null" }] },
+    "command_id": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "data": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "candidate_ready" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/candidateReady" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "control_ack" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/controlAck" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "tenant_ready" } } },
+      "then": { "properties": { "tenant_id": { "$ref": "#/$defs/tenant" }, "data": { "$ref": "#/$defs/snapshot" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "command_admission" } } },
+      "then": { "properties": { "tenant_id": { "$ref": "#/$defs/tenant" }, "command_id": { "$ref": "#/$defs/id" }, "data": { "$ref": "#/$defs/admission" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "command_terminal" } } },
+      "then": { "properties": { "tenant_id": { "$ref": "#/$defs/tenant" }, "command_id": { "$ref": "#/$defs/id" }, "data": { "$ref": "#/$defs/terminal" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "failure_observed" } } },
+      "then": { "properties": { "tenant_id": { "$ref": "#/$defs/tenant" }, "data": { "$ref": "#/$defs/failure" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "rollout_state" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/rolloutState" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "tenant_snapshot" } } },
+      "then": { "properties": { "tenant_id": { "$ref": "#/$defs/tenant" }, "data": { "$ref": "#/$defs/snapshot" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "authority_result" } } },
+      "then": { "properties": { "tenant_id": { "$ref": "#/$defs/tenant" }, "data": { "$ref": "#/$defs/authority" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "teardown_complete" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/teardown" } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "fatal" } } },
+      "then": { "properties": { "data": { "$ref": "#/$defs/fatal" } } }
+    }
+  ],
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "u64": { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+    "tenant": { "type": "integer", "minimum": 0, "maximum": 31 },
+    "version": { "enum": ["A", "B"] },
+    "candidateReady": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_version", "runtime_revision", "worker_threads"],
+      "properties": {
+        "candidate_version": { "type": "string", "minLength": 1 },
+        "runtime_revision": { "type": "string", "minLength": 1 },
+        "worker_threads": { "const": 4 }
+      }
+    },
+    "controlAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "const": "ok" } }
+    },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation", "version", "counter"],
+      "properties": {
+        "generation": { "$ref": "#/$defs/u64" },
+        "version": { "$ref": "#/$defs/version" },
+        "counter": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "admission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "enum": ["accepted", "retryable_rejection"] } }
+    },
+    "terminal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "sequence", "generation", "version", "counter", "failure_class"],
+      "properties": {
+        "status": { "enum": ["completed", "failed"] },
+        "sequence": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u64" },
+        "version": { "$ref": "#/$defs/version" },
+        "counter": { "$ref": "#/$defs/u64" },
+        "failure_class": {
+          "enum": [null, "guest_trap", "cpu_deadline_exceeded", "authority_denied"]
+        }
+      }
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failure_class", "generation_before"],
+      "properties": {
+        "failure_class": { "enum": ["guest_trap", "cpu_deadline_exceeded"] },
+        "generation_before": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "rolloutState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rollout_id", "state", "source_version", "target_version"],
+      "properties": {
+        "rollout_id": { "$ref": "#/$defs/id" },
+        "state": { "enum": ["started", "preparing", "activating", "rolling_back", "succeeded", "failed_rolled_back", "in_doubt"] },
+        "source_version": { "$ref": "#/$defs/version" },
+        "target_version": { "$ref": "#/$defs/version" }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "secret_hex", "guest_error"],
+      "properties": {
+        "outcome": { "enum": ["authority_denied", "denied_at_link", "guest_trap", "side_effect_observed"] },
+        "secret_hex": { "oneOf": [{ "type": "null" }, { "type": "string", "pattern": "^(?:[0-9a-f]{2})*$" }] },
+        "guest_error": { "oneOf": [{ "type": "null" }, { "type": "string" }] }
+      }
+    },
+    "teardown": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_tenants", "outstanding_commands"],
+      "properties": {
+        "active_tenants": { "const": 0 },
+        "outstanding_commands": { "const": 0 }
+      }
+    },
+    "fatal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["message"],
+      "properties": { "message": { "type": "string", "minLength": 1 } }
+    }
+  }
+}

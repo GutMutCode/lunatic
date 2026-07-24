@@ -1,0 +1,33 @@
+(module
+  (import "lunatic::sqlite" "open"
+    (func $sqlite_open (param i32 i32 i32) (result i64)))
+  (import "lunatic::sqlite" "execute"
+    (func $sqlite_execute (param i64 i32 i32) (result i32)))
+  (import "lunatic::sqlite" "sqlite3_close"
+    (func $sqlite_close (param i64)))
+
+  (memory (export "memory") 1)
+  (data (i32.const 1024) "__PARAM_BLOB__")
+  (data (i32.const 4096) "__SQLITE_PATH_BYTES__")
+  (data (i32.const 8192) "__SQLITE_QUERY_BYTES__")
+
+  (func (export "parameter_ptr") (result i32) (i32.const 1024))
+  (func (export "parameter_len") (result i32) (i32.const __PARAM_LEN__))
+
+  (func (export "invoke") (result i32)
+    (local $status i64)
+    (local $execute_status i32)
+    (local $connection i64)
+    (local.set $status
+      (call $sqlite_open
+        (i32.const 4096) (i32.const __SQLITE_PATH_LEN__) (i32.const 80)))
+    (if (i64.ne (local.get $status) (i64.const 0))
+      (then (return (i32.wrap_i64 (local.get $status)))))
+    (local.set $connection (i64.load (i32.const 80)))
+    (local.set $execute_status
+      (call $sqlite_execute
+        (local.get $connection)
+        (i32.const 8192) (i32.const __SQLITE_QUERY_LEN__)))
+    (call $sqlite_close (local.get $connection))
+    (local.get $execute_status))
+)

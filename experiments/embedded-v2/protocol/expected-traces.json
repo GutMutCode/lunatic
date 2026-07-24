@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v2-2026-07-23",
+  "traces": {
+    "normal": ["command_admission:accepted", "command_terminal:completed"],
+    "duplicate_after_completion": ["command_admission:accepted", "command_terminal:completed_with_cached_result", "no_additional_mutation"],
+    "pressure_rejection": ["command_admission:retryable_rejection", "no_command_terminal", "no_mutation", "same_id_retry_after_capacity", "completed_once"],
+    "trap": ["command_admission:accepted", "command_terminal:failed:guest_trap", "failure_observed:guest_trap", "tenant_ready:generation_plus_one:counter_zero"],
+    "cpu": ["command_admission:accepted", "40_to_100ms_execution_window", "command_terminal:failed:cpu_deadline_exceeded", "failure_observed:cpu_deadline_exceeded", "tenant_ready:generation_plus_one:counter_zero"],
+    "failed_rollout": ["started", "preparing_or_activating", "rolling_back_optional", "failed_rolled_back_or_in_doubt", "three_external_old_version_confirmations"],
+    "valid_rollout": ["started", "preparing_or_activating", "succeeded", "three_external_new_version_confirmations"],
+    "shutdown": ["all_accepted_commands_terminal", "teardown_complete:zero_counts", "all_old_endpoints_unreachable", "control_ack"]
+  },
+  "invariants": [
+    "event_seq is strictly increasing per candidate process",
+    "each request_id denotes exactly one control request",
+    "each command_id may have repeated attempts but at most one mutation and one distinct completed result",
+    "retryable_rejection occurs before acceptance and performs no mutation",
+    "accepted commands always receive exactly one terminal result before teardown or rollout completion",
+    "counter and sequence are monotonic within one generation; crash recovery may reset both only when generation increments",
+    "completed update-window increments survive success or rollback",
+    "candidate rollout status is not external success until the oracle completes three confirmation snapshots",
+    "all latency clocks and resource samples are owned by the external oracle"
+  ]
+}

@@ -1,0 +1,868 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v3/oracle/raw-summary.schema.json",
+  "title": "Embedded v3 per-candidate raw run summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "run_id",
+    "block_index",
+    "retained",
+    "candidate",
+    "scenario_sha256",
+    "manifest_sha256",
+    "started_monotonic_ns",
+    "finished_monotonic_ns",
+    "process_exit",
+    "outcome",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "experiment_id": {
+      "const": "embedded-v3-2026-07-23"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "block_index": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9
+    },
+    "retained": {
+      "type": "boolean"
+    },
+    "candidate": {
+      "$ref": "#/$defs/candidate"
+    },
+    "scenario_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "started_monotonic_ns": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "finished_monotonic_ns": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "process_exit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observed_monotonic_ns",
+        "code",
+        "success"
+      ],
+      "properties": {
+        "observed_monotonic_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "code": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "success": {
+          "type": "boolean"
+        }
+      }
+    },
+    "outcome": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/completed_outcome"
+        },
+        {
+          "$ref": "#/$defs/incomplete_outcome"
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_manifest",
+        "stream_trace",
+        "rss_trace",
+        "filesystem_observer_trace",
+        "network_observer_trace",
+        "stderr_trace"
+      ],
+      "properties": {
+        "run_manifest": {
+          "$ref": "#/$defs/file_evidence"
+        },
+        "stream_trace": {
+          "$ref": "#/$defs/file_evidence"
+        },
+        "rss_trace": {
+          "$ref": "#/$defs/file_evidence"
+        },
+        "filesystem_observer_trace": {
+          "$ref": "#/$defs/file_evidence"
+        },
+        "network_observer_trace": {
+          "$ref": "#/$defs/file_evidence"
+        },
+        "stderr_trace": {
+          "$ref": "#/$defs/file_evidence"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "block_index": {
+            "const": 0
+          }
+        },
+        "required": [
+          "block_index"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "retained": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "type": "object",
+        "properties": {
+          "retained": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "candidate": {
+      "enum": [
+        "lunatic",
+        "extism",
+        "raw_wasmtime"
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"
+    },
+    "file_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "gate_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pass",
+        "evidence_refs"
+      ],
+      "properties": {
+        "pass": {
+          "type": "boolean"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/relative_path"
+          }
+        }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_count",
+        "minimum_ns",
+        "nearest_rank_p99_ns",
+        "maximum_ns",
+        "slo_min_ns",
+        "slo_max_ns",
+        "pass"
+      ],
+      "properties": {
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimum_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nearest_rank_p99_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maximum_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "slo_min_ns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "slo_max_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pass": {
+          "type": "boolean"
+        }
+      }
+    },
+    "nonnegative_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_count",
+        "minimum_ns",
+        "nearest_rank_p99_ns",
+        "maximum_ns",
+        "slo_min_ns",
+        "slo_max_ns",
+        "pass"
+      ],
+      "properties": {
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimum_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "nearest_rank_p99_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "maximum_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "slo_min_ns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "slo_max_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pass": {
+          "type": "boolean"
+        }
+      }
+    },
+    "normal_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_count",
+        "minimum_ns",
+        "nearest_rank_p99_ns",
+        "maximum_ns",
+        "total_ns",
+        "slo_min_ns",
+        "slo_max_ns",
+        "pass"
+      ],
+      "properties": {
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "minimum_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "nearest_rank_p99_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "maximum_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "total_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "slo_min_ns": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "slo_max_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pass": {
+          "type": "boolean"
+        }
+      }
+    },
+    "completed_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "overall_pass",
+        "counts",
+        "gates",
+        "metrics_ns",
+        "rss",
+        "retry_audit",
+        "protocol_audit"
+      ],
+      "properties": {
+        "status": {
+          "const": "completed"
+        },
+        "overall_pass": {
+          "type": "boolean"
+        },
+        "counts": {
+          "$ref": "#/$defs/completed_counts"
+        },
+        "gates": {
+          "$ref": "#/$defs/gates"
+        },
+        "metrics_ns": {
+          "$ref": "#/$defs/metrics"
+        },
+        "rss": {
+          "$ref": "#/$defs/rss_result"
+        },
+        "retry_audit": {
+          "$ref": "#/$defs/retry_audit"
+        },
+        "protocol_audit": {
+          "$ref": "#/$defs/protocol_audit"
+        }
+      }
+    },
+    "completed_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warmup_commands",
+        "normal_original_commands",
+        "delayed_duplicate_cases",
+        "delayed_duplicate_requests",
+        "pressure_submissions",
+        "pressure_initial_accepted",
+        "pressure_retryable_rejected",
+        "pressure_retries",
+        "fault_seed_commands",
+        "trap_faults",
+        "cpu_faults",
+        "fault_post_recovery_cases",
+        "fault_post_recovery_requests",
+        "sibling_probes",
+        "update_failed_attempts",
+        "update_valid_attempts",
+        "update_proof_probes",
+        "update_worker_attempts",
+        "authority_canaries",
+        "cleanup_warmup_cycles",
+        "cleanup_retained_cycles",
+        "cleanup_old_endpoint_probes",
+        "accepted_commands",
+        "terminal_accepted_commands"
+      ],
+      "properties": {
+        "warmup_commands": {
+          "const": 1024
+        },
+        "normal_original_commands": {
+          "const": 10240
+        },
+        "delayed_duplicate_cases": {
+          "const": 80
+        },
+        "delayed_duplicate_requests": {
+          "const": 240
+        },
+        "pressure_submissions": {
+          "const": 68
+        },
+        "pressure_initial_accepted": {
+          "const": 64
+        },
+        "pressure_retryable_rejected": {
+          "const": 1
+        },
+        "pressure_retries": {
+          "const": 1
+        },
+        "fault_seed_commands": {
+          "const": 60
+        },
+        "trap_faults": {
+          "const": 30
+        },
+        "cpu_faults": {
+          "const": 30
+        },
+        "fault_post_recovery_cases": {
+          "const": 60
+        },
+        "fault_post_recovery_requests": {
+          "const": 180
+        },
+        "sibling_probes": {
+          "const": 60
+        },
+        "update_failed_attempts": {
+          "const": 30
+        },
+        "update_valid_attempts": {
+          "const": 30
+        },
+        "update_proof_probes": {
+          "const": 2880
+        },
+        "update_worker_attempts": {
+          "type": "integer",
+          "minimum": 960
+        },
+        "authority_canaries": {
+          "const": 6
+        },
+        "cleanup_warmup_cycles": {
+          "const": 5
+        },
+        "cleanup_retained_cycles": {
+          "const": 30
+        },
+        "cleanup_old_endpoint_probes": {
+          "const": 1120
+        },
+        "accepted_commands": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "terminal_accepted_commands": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "isolation",
+        "authority",
+        "admission",
+        "recovery",
+        "update_safety",
+        "state_semantics",
+        "cleanup"
+      ],
+      "properties": {
+        "isolation": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "authority": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "admission": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "recovery": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "update_safety": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "state_semantics": {
+          "$ref": "#/$defs/gate_result"
+        },
+        "cleanup": {
+          "$ref": "#/$defs/gate_result"
+        }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shared_init_ns",
+        "warm_create",
+        "normal",
+        "pressure_admission",
+        "sibling",
+        "trap_replacement_ready",
+        "cpu_replacement_ready",
+        "cpu_failed_terminal",
+        "failed_update_unavailability",
+        "valid_update_unavailability",
+        "failed_rollout",
+        "valid_rollout",
+        "failed_mixed_window",
+        "valid_mixed_window"
+      ],
+      "properties": {
+        "shared_init_ns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "warm_create": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 32 } } }
+          ]
+        },
+        "normal": {
+          "allOf": [
+            { "$ref": "#/$defs/normal_metric" },
+            { "properties": { "sample_count": { "const": 10240 } } }
+          ]
+        },
+        "pressure_admission": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 64 } } }
+          ]
+        },
+        "sibling": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 60 } } }
+          ]
+        },
+        "trap_replacement_ready": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        },
+        "cpu_replacement_ready": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        },
+        "cpu_failed_terminal": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        },
+        "failed_update_unavailability": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 480 } } }
+          ]
+        },
+        "valid_update_unavailability": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 480 } } }
+          ]
+        },
+        "failed_rollout": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        },
+        "valid_rollout": {
+          "allOf": [
+            { "$ref": "#/$defs/metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        },
+        "failed_mixed_window": {
+          "allOf": [
+            { "$ref": "#/$defs/nonnegative_metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        },
+        "valid_mixed_window": {
+          "allOf": [
+            { "$ref": "#/$defs/nonnegative_metric" },
+            { "properties": { "sample_count": { "const": 30 } } }
+          ]
+        }
+      }
+    },
+    "rss_result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "units",
+        "process_tree_complete",
+        "minimal_host_stable_median_bytes",
+        "shared_init_stable_median_bytes",
+        "ready_32_stable_median_bytes",
+        "ready_delta_bytes",
+        "phase_peak_bytes",
+        "peak_delta_bytes",
+        "cleanup_delta_bytes",
+        "maximum_post_cleanup_delta_bytes",
+        "cleanup_slope_bytes_per_cycle",
+        "pass"
+      ],
+      "properties": {
+        "units": {
+          "const": "bytes"
+        },
+        "process_tree_complete": {
+          "const": true
+        },
+        "minimal_host_stable_median_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "shared_init_stable_median_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ready_32_stable_median_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "ready_delta_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "phase_peak_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "peak_delta_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "cleanup_delta_bytes": {
+          "type": "array",
+          "minItems": 30,
+          "maxItems": 30,
+          "items": {
+            "type": "integer"
+          }
+        },
+        "maximum_post_cleanup_delta_bytes": {
+          "type": "integer"
+        },
+        "cleanup_slope_bytes_per_cycle": {
+          "type": "number"
+        },
+        "pass": {
+          "type": "boolean"
+        }
+      }
+    },
+    "retry_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "delayed_duplicate_cases",
+        "delayed_duplicate_requests",
+        "pressure_retries",
+        "update_worker_retries",
+        "oracle_transport_retries",
+        "candidate_hidden_retries",
+        "unauthorized_retries"
+      ],
+      "properties": {
+        "delayed_duplicate_cases": {
+          "const": 80
+        },
+        "delayed_duplicate_requests": {
+          "const": 240
+        },
+        "pressure_retries": {
+          "const": 1
+        },
+        "update_worker_retries": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "oracle_transport_retries": {
+          "const": 0
+        },
+        "candidate_hidden_retries": {
+          "const": 0
+        },
+        "unauthorized_retries": {
+          "const": 0
+        }
+      }
+    },
+    "protocol_audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "violations",
+        "invalid_json_lines",
+        "late_events",
+        "unexpected_rejections",
+        "timeouts",
+        "nonpositive_durations"
+      ],
+      "properties": {
+        "violations": {
+          "const": 0
+        },
+        "invalid_json_lines": {
+          "const": 0
+        },
+        "late_events": {
+          "const": 0
+        },
+        "unexpected_rejections": {
+          "const": 0
+        },
+        "timeouts": {
+          "const": 0
+        },
+        "nonpositive_durations": {
+          "const": 0
+        }
+      }
+    },
+    "incomplete_outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "failure",
+        "partial_counts",
+        "protocol_violations",
+        "hidden_retry_count"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "failed",
+            "timed_out",
+            "crashed",
+            "invalid"
+          ]
+        },
+        "failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "phase",
+            "code",
+            "message",
+            "request_id"
+          ],
+          "properties": {
+            "phase": {
+              "enum": [
+                "hello_and_minimal_rss",
+                "shared_init",
+                "create",
+                "normal",
+                "pressure",
+                "faults",
+                "updates",
+                "authority",
+                "cleanup",
+                "shutdown",
+                "process_exit"
+              ]
+            },
+            "code": {
+              "type": "string",
+              "minLength": 1
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1
+            },
+            "request_id": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 1
+            }
+          }
+        },
+        "partial_counts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "controls_sent",
+            "events_received"
+          ],
+          "properties": {
+            "controls_sent": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "events_received": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "protocol_violations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "hidden_retry_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

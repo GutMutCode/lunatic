@@ -1,0 +1,50 @@
+{
+  "evidence_root": "C:/tmp/e3f3-e",
+  "scratch_root": "C:/tmp/e3f3-s",
+  "metadata": {
+    "run_id": "embedded-v3-f3-b01-p1-raw-wasmtime",
+    "block_index": 1,
+    "candidate": "raw_wasmtime",
+    "freeze_utc": "2026-07-24T04:48:40Z",
+    "candidate_arguments": [],
+    "environment": {
+      "os": "Windows 11 Home 10.0.26200 build 26200",
+      "cpu": "Intel Core i7-14700K",
+      "logical_processors": 28,
+      "physical_memory_bytes": 68475179008,
+      "rustc": "1.95.0",
+      "cargo": "1.95.0",
+      "oracle_wasmtime": "46.0.1",
+      "tokio": "1.53.1",
+      "node": "24.4.1",
+      "machine_fingerprint_sha256": "acfd0b7c03acaa1dd4b2591ebdc61bf5667b85126e6e414c67f01caccb89910d"
+    },
+    "effort": {
+      "checkpoint_elapsed_minutes": 123,
+      "completion_elapsed_minutes": 123,
+      "tuning_elapsed_minutes": 0,
+      "tuning_revisions": 0
+    }
+  },
+  "sources": {
+    "authority_policy": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/evidence-inputs/raw-wasmtime/authority-policy.json",
+    "source_review": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/evidence-inputs/raw-wasmtime/source-review.json",
+    "oracle_source_snapshot": "C:/tmp/embedded-v3-freeze/oracle-source-f3.tar",
+    "oracle_executable": "C:/tmp/embedded-v3-oracle-target-f3/release/embedded-v3-full-run.exe",
+    "candidate_source_snapshot": "C:/tmp/embedded-v3-freeze/direct-wasmtime-source.tar",
+    "candidate_executable": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/candidates/direct-wasmtime/target/release/embedded-v3-direct-wasmtime.exe",
+    "candidate_cargo_lock": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/candidates/direct-wasmtime/Cargo.lock",
+    "candidate_sloc_manifest": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/candidates/direct-wasmtime/sloc-manifest.json",
+    "candidate_sloc_result": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/evidence-inputs/generated/direct-wasmtime-sloc-result.json",
+    "guest_a": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/guests/core/artifacts/tenant-a.wasm",
+    "guest_b": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/guests/core/artifacts/tenant-b.wasm",
+    "guest_bad_a": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/guests/core/artifacts/tenant-bad-a.wasm",
+    "guest_bad_b": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/guests/core/artifacts/tenant-bad-b.wasm",
+    "authority_guest_source_root": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/guests/authority",
+    "scenario": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/oracle/scenario-final.json",
+    "scenario_schema": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/oracle/schemas/scenario-final.schema.json",
+    "protocol_source": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/protocol/candidate-wire-frozen.rs",
+    "raw_summary_schema": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/oracle/schemas/raw-summary.schema.json",
+    "run_manifest_schema": "C:/Users/jinho/source/repos/lunatic/experiments/embedded-v3/oracle/schemas/run-manifest.schema.json"
+  }
+}

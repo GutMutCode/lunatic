@@ -1,0 +1,513 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v3/oracle/run-manifest.schema.json",
+  "title": "Embedded v3 immutable candidate run manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "run_id",
+    "block_index",
+    "retained",
+    "candidate",
+    "candidate_order_position",
+    "freeze_utc",
+    "plan_bundle_sha256",
+    "authority_policy_sha256",
+    "authority_policy",
+    "source_review_sha256",
+    "source_review",
+    "scenario",
+    "oracle",
+    "candidate_build",
+    "guest_artifacts",
+    "environment",
+    "effort"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "experiment_id": {
+      "const": "embedded-v3-2026-07-23"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"
+    },
+    "block_index": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9
+    },
+    "retained": {
+      "type": "boolean"
+    },
+    "candidate": {
+      "$ref": "#/$defs/candidate"
+    },
+    "candidate_order_position": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 2
+    },
+    "freeze_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "plan_bundle_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "authority_policy_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "authority_policy": {
+      "$ref": "#/$defs/artifact"
+    },
+    "source_review_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "source_review": {
+      "$ref": "#/$defs/artifact"
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "schema_path",
+        "schema_sha256"
+      ],
+      "properties": {
+        "path": {
+          "const": "scenario-final.json"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "schema_path": {
+          "const": "schemas/scenario-final.schema.json"
+        },
+        "schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "source_tree_sha256",
+        "source_snapshot",
+        "executable",
+        "protocol_source_sha256",
+        "raw_summary_schema_sha256",
+        "run_manifest_schema_sha256"
+      ],
+      "properties": {
+        "revision": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_tree_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_snapshot": {
+          "$ref": "#/$defs/artifact"
+        },
+        "executable": {
+          "$ref": "#/$defs/artifact"
+        },
+        "protocol_source_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "raw_summary_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "run_manifest_schema_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "candidate_build": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "source_tree_sha256",
+        "source_snapshot",
+        "executable",
+        "argv",
+        "cargo_lock",
+        "sloc_manifest",
+        "sloc_result",
+        "production_sloc",
+        "direct_dependencies",
+        "transitive_package_count",
+        "binary_bytes",
+        "execution_topology",
+        "embedded_wasm_engine",
+        "build_command"
+      ],
+      "properties": {
+        "source_revision": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_tree_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_snapshot": {
+          "$ref": "#/$defs/artifact"
+        },
+        "executable": {
+          "$ref": "#/$defs/artifact"
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        },
+        "cargo_lock": {
+          "$ref": "#/$defs/artifact"
+        },
+        "sloc_manifest": {
+          "$ref": "#/$defs/artifact"
+        },
+        "sloc_result": {
+          "$ref": "#/$defs/artifact"
+        },
+        "production_sloc": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "direct_dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_.-]+@[0-9][A-Za-z0-9.+-]*$"
+          }
+        },
+        "transitive_package_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "binary_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "execution_topology": {
+          "$ref": "#/$defs/execution_topology"
+        },
+        "embedded_wasm_engine": {
+          "$ref": "#/$defs/embedded_wasm_engine"
+        },
+        "build_command": {
+          "const": "cargo build --release --locked"
+        }
+      }
+    },
+    "guest_artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "A",
+        "B",
+        "bad_A",
+        "bad_B",
+        "authority"
+      ],
+      "properties": {
+        "A": {
+          "$ref": "#/$defs/artifact"
+        },
+        "B": {
+          "$ref": "#/$defs/artifact"
+        },
+        "bad_A": {
+          "$ref": "#/$defs/artifact"
+        },
+        "bad_B": {
+          "$ref": "#/$defs/artifact"
+        },
+        "authority": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "cpu",
+        "logical_processors",
+        "physical_memory_bytes",
+        "rustc",
+        "cargo",
+        "oracle_wasmtime",
+        "tokio",
+        "node",
+        "machine_fingerprint_sha256"
+      ],
+      "properties": {
+        "os": {
+          "const": "Windows 11 Home 10.0.26200 build 26200"
+        },
+        "cpu": {
+          "const": "Intel Core i7-14700K"
+        },
+        "logical_processors": {
+          "const": 28
+        },
+        "physical_memory_bytes": {
+          "const": 68475179008
+        },
+        "rustc": {
+          "const": "1.95.0"
+        },
+        "cargo": {
+          "const": "1.95.0"
+        },
+        "oracle_wasmtime": {
+          "const": "46.0.1"
+        },
+        "tokio": {
+          "const": "1.53.1"
+        },
+        "node": {
+          "const": "24.4.1"
+        },
+        "machine_fingerprint_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "effort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_elapsed_minutes",
+        "completion_elapsed_minutes",
+        "tuning_elapsed_minutes",
+        "tuning_revisions",
+        "architecture_review_sha256"
+      ],
+      "properties": {
+        "checkpoint_elapsed_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 960
+        },
+        "completion_elapsed_minutes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tuning_elapsed_minutes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 960
+        },
+        "tuning_revisions": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "architecture_review_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "block_index": {
+            "const": 0
+          }
+        },
+        "required": [
+          "block_index"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "retained": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "type": "object",
+        "properties": {
+          "retained": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "candidate": {
+            "const": "extism"
+          }
+        },
+        "required": [
+          "candidate"
+        ]
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "candidate_build": {
+            "type": "object",
+            "properties": {
+              "execution_topology": {
+                "const": {
+                  "os_processes": 1,
+                  "long_lived_helper_processes": 0,
+                  "tenant_execution_model": "dedicated_threads",
+                  "tokio_worker_threads": 0,
+                  "dedicated_tenant_threads": 32
+                }
+              },
+              "embedded_wasm_engine": {
+                "const": {
+                  "implementation": "wasmtime",
+                  "version": "43.0.2"
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "type": "object",
+        "properties": {
+          "candidate_build": {
+            "type": "object",
+            "properties": {
+              "execution_topology": {
+                "const": {
+                  "os_processes": 1,
+                  "long_lived_helper_processes": 0,
+                  "tenant_execution_model": "tokio_tasks",
+                  "tokio_worker_threads": 4,
+                  "dedicated_tenant_threads": 0
+                }
+              },
+              "embedded_wasm_engine": {
+                "const": {
+                  "implementation": "wasmtime",
+                  "version": "46.0.1"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "candidate": {
+      "enum": [
+        "lunatic",
+        "extism",
+        "raw_wasmtime"
+      ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "relative_path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?![A-Za-z]:)(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))[^\\\\]+$"
+    },
+    "execution_topology": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os_processes",
+        "long_lived_helper_processes",
+        "tenant_execution_model",
+        "tokio_worker_threads",
+        "dedicated_tenant_threads"
+      ],
+      "properties": {
+        "os_processes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "long_lived_helper_processes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tenant_execution_model": {
+          "enum": [
+            "tokio_tasks",
+            "dedicated_threads"
+          ]
+        },
+        "tokio_worker_threads": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "dedicated_tenant_threads": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "embedded_wasm_engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "implementation",
+        "version"
+      ],
+      "properties": {
+        "implementation": {
+          "const": "wasmtime"
+        },
+        "version": {
+          "enum": [
+            "46.0.1",
+            "43.0.2"
+          ]
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "bytes"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/relative_path"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

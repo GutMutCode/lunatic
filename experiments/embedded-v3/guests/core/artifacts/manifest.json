@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "abi_version": 2,
+  "source": {
+    "path": "templates/tenant.wat.in",
+    "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+  },
+  "recipe": {
+    "wat_crate": "1.254.0",
+    "command": "cargo run --locked --bin build-core-guests"
+  },
+  "artifacts": [
+    {
+      "file": "tenant-a.wasm",
+      "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1",
+      "bytes": 885,
+      "version": 1,
+      "build_marker": "0x41335633544e5401",
+      "bad_tenant": null
+    },
+    {
+      "file": "tenant-b.wasm",
+      "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e",
+      "bytes": 885,
+      "version": 2,
+      "build_marker": "0x42335633544e5402",
+      "bad_tenant": null
+    },
+    {
+      "file": "tenant-bad-a.wasm",
+      "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d",
+      "bytes": 893,
+      "version": 1,
+      "build_marker": "0x4133563342414401",
+      "bad_tenant": 7
+    },
+    {
+      "file": "tenant-bad-b.wasm",
+      "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557",
+      "bytes": 893,
+      "version": 2,
+      "build_marker": "0x4233563342414402",
+      "bad_tenant": 7
+    }
+  ]
+}

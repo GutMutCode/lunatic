@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "review_id": "embedded-v3-lunatic-static-architecture-review-v1",
+  "candidate": "lunatic",
+  "review_kind": "static architecture and source review",
+  "reviewer_independence": "Performed by a separate evidence-audit agent that did not implement or edit the candidate source.",
+  "scope": "Frozen one-process, 32-tenant, volatile-recovery embedded-v3 workload only.",
+  "reviewed_files": [
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/Cargo.toml",
+      "sha256": "12f4b4b9e6397c0346dd94732c636eec079bc987dbcd33d5276b9813f8db4360"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/events.rs",
+      "sha256": "7f2eb306e3837faa26c8d66654dae9d560c5408bc881efe8dae64ed4583647e3"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/host.rs",
+      "sha256": "34e8b3ca8ee995c3cd1aff4c9158486469509066c210d98fd113fda5ba01f256"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/lib.rs",
+      "sha256": "a3236072c428a9ce6ed73864d7240d5fadbf5bf1df6514dbd85a3a3ee4897e35"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/main.rs",
+      "sha256": "f9862a0dac423eb5e9ebb7db84d259d33499ca2717f3ed99b7b7c746e2a0e61c"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/protocol.rs",
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/runtime.rs",
+      "sha256": "7d68ad58bfdf81dd4bbf619871cd449212d79cb5f1170df6eb47d323a973fc41"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/lunatic/src/state.rs",
+      "sha256": "6d2ea611fcde1c0951806c79ee1483af1ff1c4e3659110592b08cc7a310c1b07"
+    }
+  ],
+  "dependency_facts": {
+    "product_runtime": "lunatic-process 0.14.0 from the repository path, default features disabled",
+    "product_commit": "f5ba0831ef757e2a134fbeafe622c0d0280a55dd",
+    "product_binding_sha256": "f75c5dfea9418bad4bbdfb03b326607ea3983a6193b409246b351445bb90b731",
+    "scheduler": "tokio 1.53.1 multi-thread runtime with four worker threads",
+    "direct_wasmtime_declaration": "wasmtime 46.0.1 with default features disabled and no features",
+    "direct_wasmtime_bypass_found": false,
+    "direct_wasmtime_use": "Caller, Linker, and ResourceLimiter API types required by ProcessState; no Engine, Module, Store, or Instance constructor is used by candidate source",
+    "cargo_metadata_package_count": 244
+  },
+  "checks": [
+    {
+      "topic": "unfair_serialization",
+      "verdict": "pass_with_observation",
+      "evidence": "Commands are admitted with per-tenant FIFO tickets and run as independent tracked Tokio tasks. A per-tenant AsyncMutex serializes only that tenant's Wasm instance; no global tenant-execution lock exists. The required single NDJSON writer is globally serialized.",
+      "observation": "Each guest call holds its tenant mutex, and rollout migration visits targets sequentially. Broader simultaneous blocking-host-call fairness is outside the frozen workload."
+    },
+    {
+      "topic": "avoidable_copies",
+      "verdict": "pass_with_observation",
+      "evidence": "RuntimeSet owns one WasmtimeRuntime and compiles each core artifact once. Rollout snapshots and restores each target's linear memory to preserve state across instance replacement.",
+      "observation": "The 64 KiB memory copy is stronger than the frozen counter-only guest strictly needs, but it is the candidate's generic state-preserving update mechanism and is measured rather than excluded."
+    },
+    {
+      "topic": "allocator_and_engine_use",
+      "verdict": "pass",
+      "evidence": "RuntimeSet creates one Lunatic WasmtimeRuntime and reuses compiled modules. Candidate source does not construct a Wasmtime Engine, Module, Store, or Instance through its direct wasmtime dependency."
+    },
+    {
+      "topic": "maintained_crates",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "The adapter uses the repository's pinned lunatic-process runtime for compilation, instantiation, process state, mailboxes, resource limiting, and memory snapshot/restore, with Tokio for orchestration."
+    },
+    {
+      "topic": "authority_boundary",
+      "verdict": "pass_with_observation",
+      "evidence": "CandidateState::register exposes only the comparison ABI, CandidateState::new_state denies guest child creation, and authority compilation must fail with a genuine missing-import error.",
+      "observation": "Host::authority does not independently map probe kind to the expected missing import; frozen artifact hashes and the external oracle provide that pairing."
+    },
+    {
+      "topic": "fault_isolation_and_recovery",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "Trap and timed CPU-hog paths replace only the target tenant instance, advance the oracle-owned incarnation, clear volatile completion state, and leave sibling Tenant objects independent."
+    },
+    {
+      "topic": "transactional_update",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "Target instances are migrated with memory snapshot/restore. Activation failure triggers reverse rollback of already migrated targets; rollback failure emits InDoubt instead of a false success."
+    }
+  ],
+  "known_limitations": [
+    "The candidate adapter manually implements the frozen admission, idempotency, recovery coordination, and rollout contract around lunatic-process primitives.",
+    "Target migration is sequential and holds each target's instance mutex during snapshot and replacement.",
+    "The candidate-side authority classifier does not verify the exact probe-to-import mapping.",
+    "Passing this static review is permission to run the frozen experiment, not evidence that its dynamic gates or SLOs pass."
+  ],
+  "blocking_findings": [],
+  "overall_verdict": "static_review_pass_for_execution_freeze"
+}

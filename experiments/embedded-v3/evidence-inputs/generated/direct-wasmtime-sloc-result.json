@@ -1,0 +1,490 @@
+{
+  "schema_version": 3,
+  "accounting_policy": "embedded-v3-sloc-frozen-v3",
+  "candidate": "direct-wasmtime",
+  "manifest_sha256": "7f84c73ba0fe56b98d046c6dbcc5c78e80ffb208c8ba205397fc287ae83d3340",
+  "production_sloc": 1887,
+  "test_sloc": 955,
+  "formatting": {
+    "version": "rustfmt 1.9.0-stable (59807616e1 2026-04-14)",
+    "edition": "2018",
+    "checked_files": [
+      "src/lib.rs",
+      "src/main.rs",
+      "src/runtime.rs",
+      "src/tenant.rs",
+      "src/protocol.rs",
+      "tests/authority.rs",
+      "tests/lifecycle.rs",
+      "tests/pressure.rs",
+      "tests/population.rs",
+      "tests/rollout.rs",
+      "tests/acceptance_order.rs"
+    ],
+    "maximum_counted_line_bytes": 120,
+    "include_and_path_macros": "forbidden in production Rust"
+  },
+  "enumeration": {
+    "attributed_regular_files": 18,
+    "exclusions": [],
+    "root_target_policy": "forbidden; all present regular files must be attributed"
+  },
+  "frozen_canonical_allowlist": [
+    {
+      "canonical_id": "embedded-v3-candidate-wire-v3",
+      "destination": "src/protocol.rs",
+      "source": "protocol/candidate-wire-frozen.rs",
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682",
+      "line_endings": "LF",
+      "required_exactly_once": true
+    }
+  ],
+  "role_totals": {
+    "accounting": {
+      "files": 1,
+      "bytes": 3991,
+      "sloc": 0
+    },
+    "generated": {
+      "files": 5,
+      "bytes": 52073,
+      "sloc": 0
+    },
+    "lockfile": {
+      "files": 1,
+      "bytes": 27544,
+      "sloc": 0
+    },
+    "production": {
+      "files": 5,
+      "bytes": 68078,
+      "sloc": 1887
+    },
+    "test": {
+      "files": 6,
+      "bytes": 33434,
+      "sloc": 955
+    }
+  },
+  "category_totals": {
+    "accounting-metadata": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 1,
+      "files": 1
+    },
+    "authority-linker": {
+      "production_sloc": 0,
+      "test_sloc": 42,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "bounded-admission": {
+      "production_sloc": 0,
+      "test_sloc": 226,
+      "excluded_files": 0,
+      "files": 2
+    },
+    "build-configuration": {
+      "production_sloc": 13,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "common-protocol": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 1,
+      "files": 1
+    },
+    "control-dispatch": {
+      "production_sloc": 447,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "dependency-lock": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 1,
+      "files": 1
+    },
+    "fault-recovery": {
+      "production_sloc": 0,
+      "test_sloc": 305,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "full-population": {
+      "production_sloc": 0,
+      "test_sloc": 147,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "guest-artifact": {
+      "production_sloc": 0,
+      "test_sloc": 0,
+      "excluded_files": 4,
+      "files": 4
+    },
+    "package-surface": {
+      "production_sloc": 3,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "tenant-lifecycle": {
+      "production_sloc": 778,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "transactional-rollout": {
+      "production_sloc": 0,
+      "test_sloc": 235,
+      "excluded_files": 0,
+      "files": 1
+    },
+    "wasmtime-runtime": {
+      "production_sloc": 646,
+      "test_sloc": 0,
+      "excluded_files": 0,
+      "files": 1
+    }
+  },
+  "cargo_metadata": {
+    "status": "verified",
+    "command": "cargo metadata --format-version 1 --locked --manifest-path <candidate>/Cargo.toml",
+    "package_count": 111,
+    "candidate_package_count": 1,
+    "targets": [
+      {
+        "name": "embedded_v3_direct_wasmtime",
+        "kind": [
+          "lib"
+        ],
+        "src_path": "src/lib.rs",
+        "role": "production"
+      },
+      {
+        "name": "embedded-v3-direct-wasmtime",
+        "kind": [
+          "bin"
+        ],
+        "src_path": "src/main.rs",
+        "role": "production"
+      },
+      {
+        "name": "acceptance_order",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/acceptance_order.rs",
+        "role": "test"
+      },
+      {
+        "name": "authority",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/authority.rs",
+        "role": "test"
+      },
+      {
+        "name": "lifecycle",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/lifecycle.rs",
+        "role": "test"
+      },
+      {
+        "name": "population",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/population.rs",
+        "role": "test"
+      },
+      {
+        "name": "pressure",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/pressure.rs",
+        "role": "test"
+      },
+      {
+        "name": "rollout",
+        "kind": [
+          "test"
+        ],
+        "src_path": "tests/rollout.rs",
+        "role": "test"
+      }
+    ],
+    "extism_version": null,
+    "wasmtime_version": "46.0.1",
+    "direct_dependencies": {
+      "policy": "embedded-v3-direct-dependencies-v1",
+      "policy_sha256": "39f750f76d9d8376573bbe8076300865dac1537db22b9eead6f07b95cb6decdd",
+      "declarations": [
+        {
+          "name": "anyhow",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.0.100",
+          "default_features": false,
+          "features": [
+            "std"
+          ]
+        },
+        {
+          "name": "serde",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.0.229",
+          "default_features": false,
+          "features": [
+            "derive",
+            "std"
+          ]
+        },
+        {
+          "name": "serde_json",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.0.151",
+          "default_features": false,
+          "features": [
+            "std"
+          ]
+        },
+        {
+          "name": "sha2",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "0.10.9",
+          "default_features": false,
+          "features": [
+            "std"
+          ]
+        },
+        {
+          "name": "tokio",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "1.53.1",
+          "default_features": false,
+          "features": [
+            "macros",
+            "rt-multi-thread",
+            "sync",
+            "time"
+          ]
+        },
+        {
+          "name": "wasmtime",
+          "kind": "registry",
+          "source": "registry+https://github.com/rust-lang/crates.io-index",
+          "version": "46.0.1",
+          "default_features": false,
+          "features": [
+            "cranelift",
+            "runtime"
+          ]
+        }
+      ]
+    },
+    "external_path_dependencies": [],
+    "lunatic_product_binding": null
+  },
+  "files": [
+    {
+      "path": "Cargo.lock",
+      "role": "lockfile",
+      "category": "dependency-lock",
+      "bytes": 27544,
+      "sloc": 0,
+      "sha256": "0cd2b04700085e6d5a191547a4854b35092652088ae00325c91af73c97fac057"
+    },
+    {
+      "path": "Cargo.toml",
+      "role": "production",
+      "category": "build-configuration",
+      "bytes": 671,
+      "sloc": 13,
+      "sha256": "e86cc468ff7c5a983516d46c9dcb6a49920bdae14a4ccccb1b8ba49cc76dce73"
+    },
+    {
+      "path": "guest-artifacts/tenant-a.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 885,
+      "sloc": 0,
+      "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "9bce3d46eceef79abe98d88d16c2a8ac75ec1ffd68a7f328cc34a9c1a1fae0d1",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "guest-artifacts/tenant-b.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 885,
+      "sloc": 0,
+      "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "5c918a4ea3730ac7109188ec94108a135fb4a537a713bcbf27fae325a5ea511e",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "guest-artifacts/tenant-bad-a.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 893,
+      "sloc": 0,
+      "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "d3675abac308b7a20513f2ff65042c9b0e9e84195c16ec5256f8472a15653a2d",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "guest-artifacts/tenant-bad-b.wasm",
+      "role": "generated",
+      "category": "guest-artifact",
+      "bytes": 893,
+      "sloc": 0,
+      "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557",
+      "exclusion": {
+        "kind": "binary-guest",
+        "sha256": "ab3274086121b6ff8af75b331c5c101b5216c187b86f8ea12cd06673e72dc557",
+        "source": {
+          "kind": "frozen-experiment-guest-source",
+          "path": "guests/core/templates/tenant.wat.in",
+          "sha256": "bf1ad239ed0616f04f78dc8cd88b642b082bb291db83730455039038b17f5cd3"
+        }
+      }
+    },
+    {
+      "path": "sloc-manifest.json",
+      "role": "accounting",
+      "category": "accounting-metadata",
+      "bytes": 3991,
+      "sloc": 0,
+      "sha256": "7f84c73ba0fe56b98d046c6dbcc5c78e80ffb208c8ba205397fc287ae83d3340"
+    },
+    {
+      "path": "src/lib.rs",
+      "role": "production",
+      "category": "package-surface",
+      "bytes": 51,
+      "sloc": 3,
+      "sha256": "b274e17a6d00b2b4e7a1756a05c9ef0a18acd3677e9890ddb579e215eff295a3"
+    },
+    {
+      "path": "src/main.rs",
+      "role": "production",
+      "category": "control-dispatch",
+      "bytes": 18366,
+      "sloc": 447,
+      "sha256": "90728a2781f83401e3bc4a4d8c417ea222af13f3e73c1672511a9c33b85ce24d"
+    },
+    {
+      "path": "src/protocol.rs",
+      "role": "generated",
+      "category": "common-protocol",
+      "bytes": 48517,
+      "sloc": 0,
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682",
+      "exclusion": {
+        "kind": "canonical-copy",
+        "canonical_id": "embedded-v3-candidate-wire-v3",
+        "source": "protocol/candidate-wire-frozen.rs",
+        "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682"
+      }
+    },
+    {
+      "path": "src/runtime.rs",
+      "role": "production",
+      "category": "wasmtime-runtime",
+      "bytes": 22495,
+      "sloc": 646,
+      "sha256": "752e400d8938217a18d827b772c7ec89243c8b170b911ce3062c5c7ff729c32f"
+    },
+    {
+      "path": "src/tenant.rs",
+      "role": "production",
+      "category": "tenant-lifecycle",
+      "bytes": 26495,
+      "sloc": 778,
+      "sha256": "f5377fa237e037b7db65d9d3709096522b52e1d4dd8b3f80355aa6cf9c6d58c6"
+    },
+    {
+      "path": "tests/acceptance_order.rs",
+      "role": "test",
+      "category": "bounded-admission",
+      "bytes": 1380,
+      "sloc": 34,
+      "sha256": "4ae58c99cd971f6cb6c5e9f4286b1d34d48eef0c56d8124e6cb3c4816c0d6a18"
+    },
+    {
+      "path": "tests/authority.rs",
+      "role": "test",
+      "category": "authority-linker",
+      "bytes": 1763,
+      "sloc": 42,
+      "sha256": "3e2fa25c96562f3a12fd7436ffe3464f27dda21d7eaf37ceebdac21d8ccf21f3"
+    },
+    {
+      "path": "tests/lifecycle.rs",
+      "role": "test",
+      "category": "fault-recovery",
+      "bytes": 10265,
+      "sloc": 305,
+      "sha256": "8c77d6232fd7e5148eae5a8d750b9b8b3a8be83d088ac5626c1348cfdfb2c13e"
+    },
+    {
+      "path": "tests/population.rs",
+      "role": "test",
+      "category": "full-population",
+      "bytes": 5244,
+      "sloc": 147,
+      "sha256": "5ffefa8300c8712f33f6a9fdbef33dda77413a39b5251f0a9b4dcdd598503051"
+    },
+    {
+      "path": "tests/pressure.rs",
+      "role": "test",
+      "category": "bounded-admission",
+      "bytes": 6795,
+      "sloc": 192,
+      "sha256": "3ba06594b624c11b2c6cb36f72ac8f285a8b20655219d0f00ed3a0290f8146c6"
+    },
+    {
+      "path": "tests/rollout.rs",
+      "role": "test",
+      "category": "transactional-rollout",
+      "bytes": 7987,
+      "sloc": 235,
+      "sha256": "f68cf0928163a7c1add99cab1fcd2ac2d06e1fe9a62be92df4e022d5e73d738f"
+    }
+  ]
+}

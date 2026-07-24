@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v2/sloc-manifest.schema.json",
+  "title": "Embedded v2 candidate SLOC attribution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate", "root", "entries"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "candidate": { "type": "string", "minLength": 1 },
+    "root": { "type": "string", "minLength": 1 },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "role", "category"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "role": {
+            "enum": ["production", "test", "generated", "lockfile"]
+          },
+          "category": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

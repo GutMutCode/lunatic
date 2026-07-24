@@ -1,0 +1,90 @@
+(module
+  (import "comparison" "tenant_id" (func $tenant_id (result i32)))
+  (import "comparison" "restore_counter" (func $restore_counter (result i64)))
+  (import "comparison" "command_handle" (func $command_handle (result i64)))
+  (import "comparison" "activation_started"
+    (func $activation_started (param i32 i32 i64)))
+  (import "comparison" "emit_result"
+    (func $emit_result (param i64 i64 i32 i32 i64)))
+  (import "comparison" "execution_started" (func $execution_started (param i64)))
+  (import "comparison" "bind_observer" (func $bind_observer (param i64)))
+  (import "comparison" "next_command" (func $next_command (result i32)))
+
+  (memory (export "memory") 1 1)
+  (global $version i32 (i32.const __VERSION__))
+  (global $build i64 (i64.const __BUILD_MARKER__))
+
+  (func $activate (local $tenant i32)
+    (local.set $tenant (call $tenant_id))
+    (call $activation_started
+      (local.get $tenant)
+      (global.get $version)
+      (global.get $build))
+    __ACTIVATION_GUARD__
+    (i64.store (i32.const 0) (call $restore_counter)))
+  (start $activate)
+
+  (func $emit (param $kind i32)
+    (call $emit_result
+      (call $command_handle)
+      (i64.load (i32.const 0))
+      (local.get $kind)
+      (global.get $version)
+      (global.get $build)))
+
+  (func $increment
+    (i64.store
+      (i32.const 0)
+      (i64.add (i64.load (i32.const 0)) (i64.const 1)))
+    (call $emit (i32.const 1)))
+
+  (func $probe
+    (call $emit (i32.const 2)))
+
+  (func $snapshot
+    (call $emit (i32.const 3)))
+
+  (func $trap
+    unreachable)
+
+  (func $cpu_loop
+    (call $execution_started (call $command_handle))
+    (loop $spin
+      br $spin))
+
+  (func (export "activation_check"))
+  (func (export "increment")
+    call $increment)
+  (func (export "probe")
+    call $probe)
+  (func (export "snapshot")
+    call $snapshot)
+  (func (export "trap")
+    call $trap)
+  (func (export "cpu_loop")
+    call $cpu_loop)
+
+  (func (export "run") (param $observer i64) (local $opcode i32)
+    (call $bind_observer (local.get $observer))
+    (loop $serve
+      (local.set $opcode (call $next_command))
+      (if (i32.eqz (local.get $opcode))
+        (then return))
+      (if (i32.eq (local.get $opcode) (i32.const 1))
+        (then
+          call $increment
+          br $serve))
+      (if (i32.eq (local.get $opcode) (i32.const 2))
+        (then
+          call $probe
+          br $serve))
+      (if (i32.eq (local.get $opcode) (i32.const 3))
+        (then
+          call $snapshot
+          br $serve))
+      (if (i32.eq (local.get $opcode) (i32.const 4))
+        (then call $trap))
+      (if (i32.eq (local.get $opcode) (i32.const 5))
+        (then call $cpu_loop))
+      unreachable))
+)

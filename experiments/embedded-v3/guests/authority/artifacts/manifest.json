@@ -1,0 +1,386 @@
+{
+  "schema_version": 1,
+  "abi_version": 1,
+  "parameter_encoding": "domain-separated-u32le-length-prefixed-v1",
+  "parameter_pointer": 1024,
+  "suite_parameter_sha256": "a7b077e096229c147474a2be3eb9bd2753df99f1d9c493b1030c1bbbddc618e1",
+  "parameters": {
+    "nonce": "embedded-v3-authority-canary-0001",
+    "wasi_preopen_fd": 3,
+    "wasi_read_path": "authority-read-sentinel.txt",
+    "wasi_mutate_path": "authority-mutate-sentinel.txt",
+    "wasi_create_path": "authority-created-sentinel.txt",
+    "sqlite_path": "authority-embedded-v3-authority-canary-0001.sqlite3",
+    "observer_ipv4": "127.0.0.1",
+    "tcp_port": 43171,
+    "udp_port": 43172,
+    "http_port": 43173,
+    "http_path": "/embedded-v3-authority"
+  },
+  "sources": [
+    {
+      "path": "templates/wasi_p1_fs_read.wat.in",
+      "sha256": "a3292539b0e43f32cd6ad310493f187cf2fc465e32a51044994805bff44e86be"
+    },
+    {
+      "path": "templates/wasi_p1_fs_mutate.wat.in",
+      "sha256": "99bb787ab4e50fe8d42d4671d27d637544b61517003461024b807536d582b295"
+    },
+    {
+      "path": "templates/lunatic_tcp.wat.in",
+      "sha256": "f544e164cd6d3983a30519694bab7eb451ae6cc0d492e7590095a1805e908120"
+    },
+    {
+      "path": "templates/lunatic_udp.wat.in",
+      "sha256": "053c73559920a66adf33ad66bf2e698d4088062416c3dfdd5d2b4eae3477b75a"
+    },
+    {
+      "path": "templates/lunatic_sqlite_create.wat.in",
+      "sha256": "65aa904a26a73002b3ccbf16d24504371bb84f0bd3223d44c6107066d9ce2892"
+    },
+    {
+      "path": "templates/extism_http.wat.in",
+      "sha256": "cd31fc9a1dac19611455f58956cf1647e366f80138a4746c7e2a87b6e9a2406e"
+    }
+  ],
+  "recipe": {
+    "wat_crate": "1.254.0",
+    "command": "cargo run --locked --bin build-authority-guests"
+  },
+  "artifacts": [
+    {
+      "probe": "wasi_p1_fs_read",
+      "file": "wasi_p1_fs_read.wasm",
+      "sha256": "1952d9cbd3509c2a24391fa0cb46aaa395b4fdafce63f1f5ea96c903baabd038",
+      "bytes": 717,
+      "parameter_sha256": "54036193974010613797dbe7eb0c38707a543cacc527c4629170f2dec9d3d94e",
+      "parameter_blob_hex": "200000006c756e617469632e656d6265646465642d76332e617574686f726974792e76310f000000776173695f70315f66735f72656164050000006e6f6e636521000000656d6265646465642d76332d617574686f726974792d63616e6172792d303030310a0000007072656f70656e5f6664010000003304000000706174681b000000617574686f726974792d726561642d73656e74696e656c2e747874",
+      "imports": [
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "path_open",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i64",
+            "i64",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "fd_read",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "fd_close",
+          "params": [
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        }
+      ],
+      "effect": "read the exact nonce bytes from the configured WASI preopen-relative path"
+    },
+    {
+      "probe": "wasi_p1_fs_mutate",
+      "file": "wasi_p1_fs_mutate.wasm",
+      "sha256": "7564e3fb0a67437e7bd31a7d2972b6e4ebe5842008f4dc6be0af89adcd885adb",
+      "bytes": 1004,
+      "parameter_sha256": "3957cafa04f03032968b384d163720cd7dd0d1b1fcd2d3a4711b4c90c11213b9",
+      "parameter_blob_hex": "200000006c756e617469632e656d6265646465642d76332e617574686f726974792e763111000000776173695f70315f66735f6d7574617465050000006e6f6e636521000000656d6265646465642d76332d617574686f726974792d63616e6172792d303030310a0000007072656f70656e5f666401000000330d00000073656e74696e656c5f706174681d000000617574686f726974792d6d75746174652d73656e74696e656c2e7478740b0000006372656174655f706174681e000000617574686f726974792d637265617465642d73656e74696e656c2e747874",
+      "imports": [
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "path_open",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i64",
+            "i64",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "fd_write",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "fd_close",
+          "params": [
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "path_rename",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "wasi_snapshot_preview1",
+          "name": "path_unlink_file",
+          "params": [
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        }
+      ],
+      "effect": "overwrite, rename, and unlink the sentinel, then create the absent target with nonce bytes"
+    },
+    {
+      "probe": "lunatic_tcp",
+      "file": "lunatic_tcp.wasm",
+      "sha256": "88523be61bf9e4b7c6bec00e52961fd4738ff87757b19007669a62bfa0a6470c",
+      "bytes": 632,
+      "parameter_sha256": "89bd340abc693b78722386c3a358c3604d2dc9d900157d61fbbe941ce44bc1ec",
+      "parameter_blob_hex": "200000006c756e617469632e656d6265646465642d76332e617574686f726974792e76310b0000006c756e617469635f746370050000006e6f6e636521000000656d6265646465642d76332d617574686f726974792d63616e6172792d303030310d0000006f627365727665725f69707634090000003132372e302e302e3104000000706f7274050000003433313731",
+      "imports": [
+        {
+          "module": "lunatic::networking",
+          "name": "tcp_connect",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i64",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "lunatic::networking",
+          "name": "tcp_write_vectored",
+          "params": [
+            "i64",
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "lunatic::networking",
+          "name": "drop_tcp_stream",
+          "params": [
+            "i64"
+          ],
+          "results": []
+        }
+      ],
+      "effect": "connect to the configured IPv4 TCP observer and write the exact nonce bytes"
+    },
+    {
+      "probe": "lunatic_udp",
+      "file": "lunatic_udp.wasm",
+      "sha256": "d4fdab9980fc8774790f73b2da56cce2261db78310b5264da69d8ce1e4409dd0",
+      "bytes": 607,
+      "parameter_sha256": "0978966bd17ed2efe9461d1ce6f342254e0c14095fb73043a01d795daeb70987",
+      "parameter_blob_hex": "200000006c756e617469632e656d6265646465642d76332e617574686f726974792e76310b0000006c756e617469635f756470050000006e6f6e636521000000656d6265646465642d76332d617574686f726974792d63616e6172792d303030310d0000006f627365727665725f69707634090000003132372e302e302e3104000000706f7274050000003433313732",
+      "imports": [
+        {
+          "module": "lunatic::networking",
+          "name": "udp_bind",
+          "params": [
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "lunatic::networking",
+          "name": "udp_send_to",
+          "params": [
+            "i64",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "lunatic::networking",
+          "name": "drop_udp_socket",
+          "params": [
+            "i64"
+          ],
+          "results": []
+        }
+      ],
+      "effect": "send one UDP datagram containing the exact nonce bytes to the observer"
+    },
+    {
+      "probe": "lunatic_sqlite_create",
+      "file": "lunatic_sqlite_create.wasm",
+      "sha256": "a3c78c7cfb21c1a37740a0b9fb92f1f2ce98b1bbb2f82333230e1a13c1207fee",
+      "bytes": 708,
+      "parameter_sha256": "9e8a8ea6c53c46f436b62c5263cdb8f6dbfc039ec23cf2a42c3623c13f3a2900",
+      "parameter_blob_hex": "200000006c756e617469632e656d6265646465642d76332e617574686f726974792e7631150000006c756e617469635f73716c6974655f637265617465050000006e6f6e636521000000656d6265646465642d76332d617574686f726974792d63616e6172792d30303031040000007061746833000000617574686f726974792d656d6265646465642d76332d617574686f726974792d63616e6172792d303030312e73716c69746533",
+      "imports": [
+        {
+          "module": "lunatic::sqlite",
+          "name": "open",
+          "params": [
+            "i32",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i64"
+          ]
+        },
+        {
+          "module": "lunatic::sqlite",
+          "name": "execute",
+          "params": [
+            "i64",
+            "i32",
+            "i32"
+          ],
+          "results": [
+            "i32"
+          ]
+        },
+        {
+          "module": "lunatic::sqlite",
+          "name": "sqlite3_close",
+          "params": [
+            "i64"
+          ],
+          "results": []
+        }
+      ],
+      "effect": "create the configured database and a nonce-named table containing the nonce"
+    },
+    {
+      "probe": "extism_http",
+      "file": "extism_http.wasm",
+      "sha256": "07c1c408c9a8eb556bb6b708adc7dd8ad72ac034c0242a6d1a28573288ff9139",
+      "bytes": 2724,
+      "parameter_sha256": "66c9c8415da5fe32257eae848617d3d296ce6a075df91979897c129fbb7d58e2",
+      "parameter_blob_hex": "200000006c756e617469632e656d6265646465642d76332e617574686f726974792e76310b00000065787469736d5f68747470050000006e6f6e636521000000656d6265646465642d76332d617574686f726974792d63616e6172792d303030310d0000006f627365727665725f69707634090000003132372e302e302e3104000000706f72740500000034333137330400000070617468160000002f656d6265646465642d76332d617574686f72697479",
+      "imports": [
+        {
+          "module": "extism:host/env",
+          "name": "alloc",
+          "params": [
+            "i64"
+          ],
+          "results": [
+            "i64"
+          ]
+        },
+        {
+          "module": "extism:host/env",
+          "name": "store_u8",
+          "params": [
+            "i64",
+            "i32"
+          ],
+          "results": []
+        },
+        {
+          "module": "extism:host/env",
+          "name": "http_request",
+          "params": [
+            "i64",
+            "i64"
+          ],
+          "results": [
+            "i64"
+          ]
+        },
+        {
+          "module": "extism:host/env",
+          "name": "length",
+          "params": [
+            "i64"
+          ],
+          "results": [
+            "i64"
+          ]
+        },
+        {
+          "module": "extism:host/env",
+          "name": "output_set",
+          "params": [
+            "i64",
+            "i64"
+          ],
+          "results": []
+        }
+      ],
+      "effect": "POST the exact nonce body to the configured HTTP observer and expose its response body"
+    }
+  ]
+}

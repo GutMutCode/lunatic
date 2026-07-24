@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "policy_id": "embedded-v3-raw-wasmtime-production-authority-v1",
+  "candidate": "raw_wasmtime",
+  "source_candidate_id": "direct-wasmtime",
+  "default_capability_decision": "deny",
+  "enforcement": {
+    "configuration": "The production Wasmtime Linker registers only the comparison ABI. It does not add WASI, Lunatic networking, Lunatic SQLite, or Extism host imports.",
+    "declaration_binding": "The candidate validates and echoes production_policy_sha256 on every authority terminal event; the policy JSON is not interpreted at runtime. Linker behavior plus the external authority canary is the enforcement evidence.",
+    "source": {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/src/runtime.rs",
+      "sha256": "752e400d8938217a18d827b772c7ec89243c8b170b911ce3062c5c7ff729c32f",
+      "symbols": [
+        "production_linker",
+        "authority_absent_at_link",
+        "expected_first_unresolved_import"
+      ]
+    }
+  },
+  "custom_imports_allowed": [
+    "comparison::tenant_id",
+    "comparison::restore_counter",
+    "comparison::command_handle",
+    "comparison::activation_started",
+    "comparison::emit_result",
+    "comparison::execution_started",
+    "comparison::bind_observer",
+    "comparison::next_command"
+  ],
+  "capability_grants": {
+    "wasi_preview1": false,
+    "filesystem_read": false,
+    "filesystem_mutate": false,
+    "tcp": false,
+    "udp": false,
+    "sqlite": false,
+    "http": false,
+    "guest_child_spawn": false
+  },
+  "resource_limits": {
+    "linear_memory_bytes": 10485760,
+    "instances_per_store": 1,
+    "memories_per_store": 1,
+    "mailbox_messages": 64,
+    "payload_bytes": 1024,
+    "cpu_deadline_ticks": 50,
+    "epoch_tick_milliseconds": 1
+  },
+  "authority_probe_expectations": [
+    {
+      "probe": "wasi_p1_fs_read",
+      "first_unresolved_import": "wasi_snapshot_preview1::path_open",
+      "stage": "instantiate",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "wasi_p1_fs_mutate",
+      "first_unresolved_import": "wasi_snapshot_preview1::path_open",
+      "stage": "instantiate",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_tcp",
+      "first_unresolved_import": "lunatic::networking::tcp_connect",
+      "stage": "instantiate",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_udp",
+      "first_unresolved_import": "lunatic::networking::udp_bind",
+      "stage": "instantiate",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "lunatic_sqlite_create",
+      "first_unresolved_import": "lunatic::sqlite::open",
+      "stage": "instantiate",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    },
+    {
+      "probe": "extism_http",
+      "first_unresolved_import": "extism:host/env::alloc",
+      "stage": "instantiate",
+      "result": "absent_at_link",
+      "error_class": "unknown_import"
+    }
+  ]
+}

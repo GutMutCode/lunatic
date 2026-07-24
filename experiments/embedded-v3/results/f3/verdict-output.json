@@ -1,0 +1,30 @@
+{
+  "verdict": "LUNATIC_PACKAGING_VALUE_SUPPORTED",
+  "lunatic_eligible": true,
+  "extism_eligible": false,
+  "direct_wasmtime_eligible": true,
+  "packaging": {
+    "reference_sloc": 1887,
+    "sloc_delta": 300,
+    "reference_time_to_first_full_pass_minutes": 123,
+    "lunatic_to_worst_eligible_alternative_median_ratios": {
+      "shared_init_ns": 0.9840638540478905,
+      "warm_create_p99_ns": 1.1016475844736107,
+      "normal_p99_ns": 1.021713265913147,
+      "normal_total_ns": 1.0029441880997347,
+      "pressure_admission_p99_ns": 0.6897810218978102,
+      "sibling_p99_ns": 1.0697201017811704,
+      "trap_recovery_p99_ns": 1.2444751381215469,
+      "cpu_recovery_p99_ns": 0.8427715745870088,
+      "failed_update_unavailability_p99_ns": 1.3860937410360852,
+      "valid_update_unavailability_p99_ns": 1.5195769050958392,
+      "failed_rollout_p99_ns": 1.095460775618802,
+      "valid_rollout_p99_ns": 1.2825518964081657,
+      "ready_32_total_rss_bytes": 1.7432686286787726,
+      "peak_total_rss_bytes": 1.6864117168429618
+    },
+    "performance_within_two_of_every_eligible_alternative": true,
+    "strength": "moderate",
+    "dominating_alternatives": []
+  }
+}

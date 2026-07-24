@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "review_id": "embedded-v3-raw-wasmtime-static-architecture-review-v1",
+  "candidate": "raw_wasmtime",
+  "source_candidate_id": "direct-wasmtime",
+  "review_kind": "static architecture and source review",
+  "reviewer_independence": "Performed by a separate evidence-audit agent that did not implement or edit the candidate source.",
+  "scope": "Frozen one-process, 32-tenant, volatile-recovery embedded-v3 workload only.",
+  "reviewed_files": [
+    {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/Cargo.toml",
+      "sha256": "e86cc468ff7c5a983516d46c9dcb6a49920bdae14a4ccccb1b8ba49cc76dce73"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/src/lib.rs",
+      "sha256": "b274e17a6d00b2b4e7a1756a05c9ef0a18acd3677e9890ddb579e215eff295a3"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/src/main.rs",
+      "sha256": "90728a2781f83401e3bc4a4d8c417ea222af13f3e73c1672511a9c33b85ce24d"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/src/protocol.rs",
+      "sha256": "55866a0037dd1c1c7edff270f873e1172bbab9c946196a9815086aa54df57682"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/src/runtime.rs",
+      "sha256": "752e400d8938217a18d827b772c7ec89243c8b170b911ce3062c5c7ff729c32f"
+    },
+    {
+      "path": "experiments/embedded-v3/candidates/direct-wasmtime/src/tenant.rs",
+      "sha256": "f5377fa237e037b7db65d9d3709096522b52e1d4dd8b3f80355aa6cf9c6d58c6"
+    }
+  ],
+  "dependency_facts": {
+    "direct_runtime": "wasmtime 46.0.1 with default features disabled and only cranelift,runtime",
+    "scheduler": "tokio 1.53.1 multi-thread runtime with four worker threads",
+    "lunatic_dependency_present": false,
+    "external_path_dependencies_present": false,
+    "cargo_metadata_package_count": 111
+  },
+  "checks": [
+    {
+      "topic": "unfair_serialization",
+      "verdict": "pass_with_observation",
+      "evidence": "Each tenant owns a bounded Tokio channel and a separate tenant task. Tenant execution is not protected by a global execution lock; only the required single NDJSON writer is globally serialized.",
+      "observation": "Synchronous Wasmtime calls execute on the four Tokio workers. A CPU-hog call occupies one worker until the shared epoch ticker interrupts it, so broader simultaneous blocking-host-call fairness is outside this review."
+    },
+    {
+      "topic": "avoidable_copies",
+      "verdict": "pass",
+      "evidence": "One shared Engine compiles the four core Modules once into ArtifactCatalog. Per-tenant creation instantiates a Store and Instance from a cloned Module handle; rollout prepares only one replacement instance per target."
+    },
+    {
+      "topic": "allocator_and_engine_use",
+      "verdict": "pass",
+      "evidence": "SharedRuntime creates one Engine and one 1 ms epoch ticker. Each tenant has one Store with StoreLimits of 10 MiB, one instance, and one memory. No Engine-per-message or Module-per-command path exists."
+    },
+    {
+      "topic": "maintained_crates",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "The adapter uses maintained Wasmtime and Tokio primitives directly. No maintained crate was identified that supplies the frozen incarnation, idempotency, bounded-admission, recovery, and transactional-rollout contract without equivalent adapter code."
+    },
+    {
+      "topic": "authority_boundary",
+      "verdict": "pass",
+      "evidence": "production_linker exposes only the comparison ABI. authority_absent_at_link verifies the probe-specific first import and requires an exact unknown-import instantiation failure."
+    },
+    {
+      "topic": "fault_isolation_and_recovery",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "Trap and CPU-deadline failures replace only the target tenant instance, advance the oracle-owned incarnation, reset volatile counter and idempotency state, and leave sibling tenant tasks independent."
+    },
+    {
+      "topic": "transactional_update",
+      "verdict": "pass_for_frozen_scope",
+      "evidence": "The coordinator prepares every target before settlement. It commits all prepared replacements only after all preparations pass and discards all prepared replacements after any failure; settlement failure becomes InDoubt."
+    }
+  ],
+  "known_limitations": [
+    "The unbounded tenant control channel is safe under the frozen oracle's serialized control traffic but is not a general bounded-control-plane guarantee.",
+    "Update state transfer is the frozen guest's counter through restore_counter, not arbitrary linear-memory or resource migration.",
+    "The review does not establish scheduler fairness for multiple simultaneous CPU hogs or blocking host calls.",
+    "Passing this static review is permission to run the frozen experiment, not evidence that its dynamic gates or SLOs pass."
+  ],
+  "blocking_findings": [],
+  "overall_verdict": "static_review_pass_for_execution_freeze"
+}

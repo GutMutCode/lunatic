@@ -1,0 +1,690 @@
+{
+  "schema_version": 3,
+  "experiment_id": "embedded-v3-2026-07-23",
+  "tenants": {
+    "count": 32,
+    "id_range": {
+      "first": 0,
+      "last_inclusive": 31
+    },
+    "mailbox_capacity": 64,
+    "payload_limit_bytes": 1024,
+    "payload_generation": {
+      "domain": "embedded-v3-payload-v1",
+      "encoding": "concatenate sha256(domain_utf8 || u32be(block_index) || u64be(command_id) || u32be(chunk_index)) for chunk_index from zero and truncate to payload_bytes",
+      "block_index": "unsigned big-endian u32",
+      "command_id": "unsigned big-endian u64 whose wire form is canonical unsigned decimal string",
+      "chunk_index": "unsigned big-endian u32 starting at zero",
+      "retry_rule": "same block_index, command_id, and payload_bytes produces byte-identical payload"
+    },
+    "tokio_worker_threads": 4,
+    "incarnation": {
+      "owner": "oracle",
+      "encoding": "canonical_unsigned_decimal_u64_string",
+      "initial": "0",
+      "advance": "exactly one on fault replacement or teardown/recreate",
+      "rollout": "unchanged"
+    },
+    "state": {
+      "initial_counter": 0,
+      "initial_version": "A",
+      "accepted_increment": "counter increases by delta exactly once",
+      "duplicate": "same completed result and no new mutation",
+      "fault_replacement": "incarnation plus one and counter reset to zero",
+      "rollout": "incarnation and completed accepted state preserved"
+    }
+  },
+  "normal": {
+    "warmup": {
+      "rounds": 32,
+      "commands_per_round": 32,
+      "retained": false,
+      "tenant_order_formula": "(block_index + round + slot) mod 32 for slot 0..31",
+      "operation": {
+        "kind": "increment",
+        "delta": 1,
+        "payload_bytes": 64
+      },
+      "command_id": {
+        "base": 1,
+        "formula": "base + round * 32 + tenant_id"
+      }
+    },
+    "measured": {
+      "rounds": 320,
+      "commands_per_round": 32,
+      "total_commands": 10240,
+      "concurrency": "one outstanding command per tenant",
+      "round_barrier": "all 32 commands terminal before the next round",
+      "tenant_order_formula": "(block_index + round + slot) mod 32 for slot 0..31",
+      "operation": {
+        "kind": "increment",
+        "delta": 1,
+        "payload_bytes": 64
+      },
+      "command_id": {
+        "base": 100000,
+        "formula": "base + round * 32 + tenant_id"
+      },
+      "allowed_rejections": []
+    },
+    "delayed_duplicates": {
+      "cases": 80,
+      "requests_per_case": 3,
+      "total_requests": 240,
+      "index": {
+        "first": 0,
+        "last_inclusive": 79
+      },
+      "source_round_formula": "2 * j",
+      "source_round_range": {
+        "first": 0,
+        "last_inclusive": 158
+      },
+      "source_tenant_formula": "j mod 32",
+      "cross_tenant_formula": "(source_tenant + 1) mod 32",
+      "source_command_id_formula": "100000 + (2 * j) * 32 + (j mod 32)",
+      "dispatch": "after all 320 measured rounds are terminal, ascending j",
+      "minimum_later_completed_rounds": 161,
+      "sequence": [
+        "replay on source tenant with the source command_id, incarnation, operation, and bytes; require the original completed result and no mutation",
+        "send the same command_id and bytes on cross_tenant with its current incarnation; require a fresh exactly-once mutation",
+        "immediately repeat on cross_tenant with the same command_id, incarnation, operation, and bytes; require the preceding completed result and no mutation"
+      ],
+      "allowed_rejections": []
+    }
+  },
+  "pressure": {
+    "tenant_formula": "(block_index * 3) mod 32",
+    "closed_gate": {
+      "gate_rule": "pause dequeue before submitting and release only after all 65 admission terminals",
+      "submitted": 65,
+      "accepted": 64,
+      "retryable_rejected": 1,
+      "rejected_submission_index": 64,
+      "payload_bytes": 64,
+      "rejection_reason": "backpressure",
+      "drain": "release gate and require all 64 accepted commands to complete",
+      "retry": "retry the rejected command exactly once after drain with identical command_id and bytes",
+      "retry_expected": "accepted and completed exactly once"
+    },
+    "payload_boundary": {
+      "order": [
+        "oversize",
+        "limit"
+      ],
+      "oversize": {
+        "payload_bytes": 1025,
+        "expected": "retryable_rejection",
+        "reason": "payload_too_large",
+        "mutation": "none",
+        "retries": 0
+      },
+      "limit": {
+        "payload_bytes": 1024,
+        "expected": "accepted_then_completed",
+        "mutation": "exactly_once"
+      }
+    },
+    "command_id": {
+      "base": 1000000,
+      "closed_gate_formula": "base + submission_index",
+      "oversize": 1000100,
+      "limit": 1000101
+    }
+  },
+  "faults": {
+    "rounds": 30,
+    "round_order": [
+      "trap_seed_completed_on_old_incarnation",
+      "trap",
+      "trap_sibling_probe",
+      "trap_old_stale_new_fresh_immediate_duplicate",
+      "cpu_seed_completed_on_old_incarnation",
+      "cpu",
+      "cpu_sibling_probe",
+      "cpu_old_stale_new_fresh_immediate_duplicate"
+    ],
+    "seed": {
+      "count": 60,
+      "dispatch": "immediately before each fault on the current old incarnation and complete before writing the fault control",
+      "operation": "increment by one with the exact command_id and bytes reused by the post-recovery three-request sequence",
+      "expected": "accepted and completed exactly once on the old incarnation",
+      "allowed_rejections": []
+    },
+    "trap": {
+      "count": 30,
+      "tenant_formula": "(block_index + i) mod 32",
+      "execution": "actual guest Wasm trap",
+      "terminal_reason": "trap",
+      "replacement": "ready at old incarnation plus one with counter zero"
+    },
+    "cpu": {
+      "count": 30,
+      "tenant_formula": "(block_index + i + 16) mod 32",
+      "execution": "actual non-terminating guest Wasm loop",
+      "deadline_ms": 50,
+      "admission_to_execution_started_min_exclusive_ms": 0,
+      "admission_to_execution_started_max_ms": 20,
+      "execution_started_to_failed_min_ms": 40,
+      "execution_started_to_failed_max_ms": 100,
+      "terminal_reason": "cpu_deadline",
+      "replacement": "ready at old incarnation plus one with counter zero"
+    },
+    "stale": {
+      "cases": 60,
+      "requests_per_case": 3,
+      "total_requests": 180,
+      "dispatch": "immediately after replacement ready using the replaced incarnation",
+      "command_id": "the exact command_id and bytes completed by the pre-fault seed and shared by all three post-recovery requests",
+      "sequence": [
+        "replay the completed seed on the old incarnation and terminate distinctly as stale_incarnation with no mutation",
+        "same command_id on the new incarnation completes as a fresh increment by one",
+        "immediate same command_id and new incarnation repeat returns the preceding result with no mutation"
+      ],
+      "stale_terminal": "distinct retryable_rejection(stale_incarnation), never tenant_missing",
+      "retries": 0
+    },
+    "sibling_probe": {
+      "count": 60,
+      "tenant_formula": "(fault_target + 1) mod 32",
+      "trap_dispatch": "flush the sibling read immediately after the trap control write without waiting for execution_started",
+      "cpu_dispatch": "flush the sibling read immediately after the CPU fault control write without waiting for execution_started",
+      "operation": "read",
+      "allowed_rejections": []
+    },
+    "recovery_clock": "fault control flush through replacement tenant_ready",
+    "recovery_deadline_ms": 500,
+    "command_id": {
+      "base": 2000000,
+      "trap_sibling_formula": "base + i * 4",
+      "trap_stale_formula": "base + i * 4 + 1",
+      "cpu_sibling_formula": "base + i * 4 + 2",
+      "cpu_stale_formula": "base + i * 4 + 3"
+    }
+  },
+  "updates": {
+    "cycles": 30,
+    "cycle_index": {
+      "first": 0,
+      "last_inclusive": 29
+    },
+    "targets": {
+      "first": 0,
+      "last_inclusive": 15,
+      "count": 16
+    },
+    "attempts_per_cycle": 2,
+    "failed_attempts_total": 30,
+    "valid_attempts_total": 30,
+    "artifacts": [
+      "A",
+      "B",
+      "bad_A",
+      "bad_B"
+    ],
+    "even_cycle": {
+      "start_version": "A",
+      "failed_attempt": "A -> bad_B -> failed_rolled_back(A)",
+      "valid_attempt": "A -> B -> succeeded(B)"
+    },
+    "odd_cycle": {
+      "start_version": "B",
+      "failed_attempt": "B -> bad_A -> failed_rolled_back(B)",
+      "valid_attempt": "B -> A -> succeeded(A)"
+    },
+    "bad_artifact": {
+      "failure_tenant": 7,
+      "rule": "compiles and registers but fails activation before serving an externally completed command",
+      "other_targets": "behave as the named version until rollback or preflight rejection"
+    },
+    "continuous_workers": {
+      "count": 16,
+      "payload_bytes": 64,
+      "assignment": "one worker per target",
+      "start": "one successful read immediately before each rollout request flush",
+      "run": "alternate increment(delta one) and read with at most one outstanding operation per worker",
+      "stop": "stop issuing immediately when the candidate rollout terminal is received",
+      "drain": "after stop, wait for every accepted worker operation to become terminal before proof",
+      "on_retryable_rejection": "only before candidate terminal, immediately issue one new request_id carrying the identical command_id and bytes",
+      "max_retries_per_operation": 1,
+      "accepted_rule": "every accepted operation is terminal before external rollout completion",
+      "trace_cardinality": {
+        "anchor_logical_operations_per_tenant_per_attempt": 1,
+        "continuous_logical_operations_per_tenant_per_attempt_min": 0,
+        "continuous_logical_operations_per_tenant_per_attempt_max": "1099511627775",
+        "logical_count_rule": "for each attempt and tenant, successful logical worker sequences are contiguous from zero through the trace-derived maximum; sequence zero is the exact pre-rollout anchor",
+        "transport_attempt_count_rule": "one transport attempt per logical operation plus at most one retry for each retryable pre-acceptance rejection; retry reuses identical command_id and bytes",
+        "terminal_rule": "no new sequence is issued at or after candidate rollout terminal and every accepted sequence is terminal before proof"
+      }
+    },
+    "proof": {
+      "waves_per_attempt": 3,
+      "targets_per_wave": 16,
+      "probes_per_attempt": 64,
+      "operation": "after worker drain, replay each target's exact completed anchor command once to prove dedup-cache preservation, then perform three waves of mutation-free guest reads",
+      "dispatch": "submit all 16 exact anchor replays concurrently and await terminal; then each read wave submits all 16 targets concurrently and is terminal before the next wave",
+      "failed_expected": "all anchor replays are exact deduplicated pre-rollout results; all read targets report old version, preserved state, unchanged incarnation, and failed artifact unreachable",
+      "valid_expected": "all anchor replays are exact deduplicated pre-rollout results; all read targets report new version, preserved state, and unchanged incarnation"
+    },
+    "external_terminal": "latest of candidate terminal, every pre-terminal accepted worker terminal, every exact cache replay terminal, and proof wave 3 terminal",
+    "allowed_terminal_states": [
+      "succeeded",
+      "failed_rolled_back",
+      "in_doubt"
+    ],
+    "in_doubt": "honest terminal and mandatory update-safety failure",
+    "unavailability_formula": "per tenant, order good guest completions from the last pre-rollout anchor through the first proof wave (wire proof_wave index 0) and take the maximum consecutive-completion gap intersecting [rollout_write, proof_wave_index_0_terminal]",
+    "rollout_duration_formula": "external terminal receive minus rollout control flush",
+    "mixed_window_formula": "start at first entry into a mixed tenant-version vector after an all-old baseline and end at the last exit; update observations only on good non-deduplicated guest completions because an exact cached replay describes its original completion rather than current serving version; never mixed is zero; mixed at read proof is failure; report valid and failed attempts separately",
+    "command_id": {
+      "attempt_index_formula": "cycle * 2 + step where failed step is 0 and valid step is 1",
+      "worker_layout": {
+        "domain_prefix": "1152921504606846976",
+        "attempt_shift_bits": 48,
+        "tenant_shift_bits": 40,
+        "max_attempt_index": 59,
+        "max_tenant_id": 15,
+        "max_sequence": "1099511627775",
+        "anchor_sequence": "0",
+        "continuous_first_sequence": "1",
+        "operation_formula": "sequence zero is the pre-rollout read; positive odd sequence is increment(delta one); positive even sequence is read",
+        "formula": "domain_prefix | (attempt_index << 48) | (tenant_id << 40) | sequence"
+      },
+      "proof_layout": {
+        "domain_prefix": "2305843009213693952",
+        "attempt_shift_bits": 48,
+        "tenant_shift_bits": 40,
+        "max_attempt_index": 59,
+        "max_tenant_id": 15,
+        "max_sequence": "2",
+        "sequence_formula": "proof wave index 0 through 2",
+        "formula": "domain_prefix | (attempt_index << 48) | (tenant_id << 40) | wave"
+      }
+    }
+  },
+  "authority": {
+    "run_scope": "every candidate runs every one of the six canaries in every block; candidate-specific skipping is forbidden",
+    "policy": "exactly the production tenant linker and runtime configuration",
+    "nonce_domain": "embedded-v3-authority-v1",
+    "nonce_encoding": "sha256 of five fields, each encoded as u32be(byte_length) followed by bytes: domain UTF-8, experiment_id UTF-8, u32be(block_index), candidate wire token UTF-8, run_id UTF-8",
+    "nonce_fields": [
+      "domain",
+      "experiment_id",
+      "block_index",
+      "candidate",
+      "run_id"
+    ],
+    "candidate_wire_tokens": [
+      "lunatic",
+      "extism",
+      "raw_wasmtime"
+    ],
+    "positive_control": "immediately before each canary, the oracle performs the same requested external effect, proves its observer detects the nonce effect, restores state, and clears observations",
+    "result_contract": {
+      "allowed_error_classes": [
+        "absent_at_link",
+        "policy_denied"
+      ],
+      "allowed_stages": [
+        "compile",
+        "instantiate",
+        "invoke"
+      ],
+      "absent_at_link_evidence": "production linker inventory excludes the exact import and the actual canary module fails to link",
+      "policy_denied_evidence": "the exact production import resolves and the production policy returns policy_denied before any external effect",
+      "all_other_errors": "run failure"
+    },
+    "canaries": [
+      {
+        "id": "wasi_p1_fs_read",
+        "abi": "wasi_snapshot_preview1 path_open and fd_read",
+        "attempt": "read the nonce sentinel through genuine WASI Preview 1 imports",
+        "positive_effect": "oracle reads the exact nonce bytes from the sentinel",
+        "pass": "one closed result_contract outcome and no returned nonce bytes"
+      },
+      {
+        "id": "wasi_p1_fs_mutate",
+        "abi": "wasi_snapshot_preview1 path_open, fd_write, path_rename, path_unlink_file",
+        "attempt": "overwrite, delete, and rename the sentinel plus create and write an absent target through genuine WASI Preview 1 imports",
+        "positive_effect": "observer records each requested name or content mutation before state is restored",
+        "pass": "one closed result_contract outcome and no filesystem event, name or content change, or returned secret bytes"
+      },
+      {
+        "id": "lunatic_tcp",
+        "abi": "lunatic::networking tcp_connect and TCP write",
+        "attempt": "connect to the nonce TCP listener and write the nonce",
+        "positive_effect": "listener accepts a connection and receives the exact nonce",
+        "pass": "one closed result_contract outcome and no accept or bytes"
+      },
+      {
+        "id": "lunatic_udp",
+        "abi": "lunatic::networking udp_bind and udp_send_to",
+        "attempt": "send the nonce datagram to the UDP listener",
+        "positive_effect": "listener receives the exact nonce datagram",
+        "pass": "one closed result_contract outcome and no datagram"
+      },
+      {
+        "id": "lunatic_sqlite_create",
+        "abi": "lunatic::sqlite open and execute",
+        "attempt": "create a nonce-named SQLite database and nonce table on disk",
+        "positive_effect": "observer sees the database file and reads the nonce table",
+        "pass": "one closed result_contract outcome and no database file, table, or returned nonce"
+      },
+      {
+        "id": "extism_http",
+        "abi": "extism:host/env http_request",
+        "attempt": "send an HTTP request containing the nonce to the oracle listener",
+        "positive_effect": "listener receives the exact nonce request",
+        "pass": "one closed result_contract outcome and no request or bytes"
+      }
+    ],
+    "canary_order_formula": "rotate the six listed canaries left by block_index mod 6 and pair each canary with its immediately preceding positive control",
+    "observer_tail_ms": 500,
+    "unrecognized_production_import": "absent_at_link is the required outcome and is not a skip",
+    "comparison_only_deny_import": "forbidden",
+    "positive_control_failure": "run invalid"
+  },
+  "cleanup": {
+    "precondition": "tear down the 32 main-workload tenants and establish active count zero",
+    "warmup_cycles": 5,
+    "retained_cycles": 30,
+    "total_cycles": 35,
+    "cycle": [
+      "create all 32 tenants and await ready",
+      "complete one increment per tenant",
+      "quiesce and prove every accepted command is terminal",
+      "snapshot each tenant",
+      "tear down all 32 tenants",
+      "probe each old endpoint and require tenant_missing without retry",
+      "prove active tenant and accepted-command counts are zero",
+      "take the stable RSS sample"
+    ],
+    "post_teardown_rss_sample_offsets_ms": [1000, 1100, 1200],
+    "tenant_order_formula": "(block_index + cycle_index + slot) mod 32 for slot 0..31",
+    "recreate_rule": "each tenant incarnation advances exactly one and counter starts at zero",
+    "stale_endpoint_reason": "tenant_missing without retry using the exact cleanup increment command_id and byte-identical payload against the torn-down incarnation",
+    "hidden_authority_or_endpoint": "forbidden",
+    "command_id": {
+      "domain_prefix": "3458764513820540928",
+      "cycle_shift_bits": 48,
+      "tenant_shift_bits": 40,
+      "max_cycle_index": 34,
+      "max_tenant_id": 31,
+      "sequence": "0",
+      "formula": "domain_prefix | (cycle_index << 48) | (tenant_id << 40)"
+    }
+  },
+  "blocks": {
+    "count": 10,
+    "index": {
+      "first": 0,
+      "last_inclusive": 9
+    },
+    "instrumentation_warmup": 0,
+    "retained": {
+      "first": 1,
+      "last_inclusive": 9,
+      "count": 9
+    },
+    "candidates": [
+      "lunatic",
+      "extism",
+      "raw_wasmtime"
+    ],
+    "candidate_order": {
+      "block_mod_3_0": [
+        "lunatic",
+        "extism",
+        "raw_wasmtime"
+      ],
+      "block_mod_3_1": [
+        "extism",
+        "raw_wasmtime",
+        "lunatic"
+      ],
+      "block_mod_3_2": [
+        "raw_wasmtime",
+        "lunatic",
+        "extism"
+      ]
+    },
+    "replacement": "no block is repeated or replaced",
+    "execution": "candidates run separately and never concurrently",
+    "phase_order": [
+      "hello_and_minimal_rss",
+      "shared_init",
+      "create",
+      "normal",
+      "pressure",
+      "faults",
+      "updates",
+      "authority",
+      "cleanup",
+      "shutdown"
+    ],
+    "static_plan_cardinality": {
+      "total_actions_per_candidate_block": 24747,
+      "retained_actions_block_0": 0,
+      "retained_actions_each_block_1_through_9": 22898,
+      "nonretained_actions_each_block_1_through_9": 1849,
+      "phase_actions": {
+        "initial_create": 32,
+        "normal_warmup": 1024,
+        "normal_measured": 10240,
+        "delayed_duplicates": 240,
+        "pressure": 71,
+        "faults": 360,
+        "updates_static": 6000,
+        "authority_with_positive_controls": 12,
+        "main_teardown_precondition": 33,
+        "cleanup": 5775
+      },
+      "dynamic_update_workers": "not included in static actions; after 16 exact anchor reads per attempt, one worker per target issues a trace-derived sequence until candidate terminal under the frozen ID, alternation, outstanding, retry, stop, and drain rules"
+    }
+  },
+  "timeouts": {
+    "clock": "oracle monotonic clock around flushed stdin writes and parsed stdout events",
+    "positive_elapsed_ns_required": true,
+    "phase_deadlines_ms": {
+      "hello_terminal": 30000,
+      "init_terminal": 30000,
+      "create": {
+        "ack": 100,
+        "terminal": 2000
+      },
+      "normal_probe_snapshot": {
+        "ack": 100,
+        "terminal": 250
+      },
+      "trap": {
+        "terminal": 250,
+        "replacement_ready_from_control_write": 500
+      },
+      "cpu": {
+        "execution_started_from_admission_min_exclusive": 0,
+        "execution_started_from_admission_max": 20,
+        "failed_from_execution_started_min": 40,
+        "failed_from_execution_started_max": 100,
+        "replacement_ready_from_control_write": 500
+      },
+      "rollout": {
+        "ack": 500,
+        "external_proof": 2000
+      },
+      "authority_terminal": 1000,
+      "teardown_terminal": 2000,
+      "shutdown_terminal": 2000,
+      "process_exit": 2000
+    },
+    "deadline_reset": "only a valid phase transition for that request starts the next phase deadline",
+    "unrelated_event": "validated and logged but never resets another request deadline",
+    "timeout_result": "request timed_out and any later event is a protocol violation",
+    "transport_retry": "none",
+    "candidate_hidden_retry": "forbidden",
+    "only_oracle_retries": [
+      "80 delayed duplicate cases (240 requests) after all normal rounds",
+      "one closed-gate backpressure retry after drain",
+      "at most one update-worker retry after a retryable pre-acceptance rejection"
+    ],
+    "phase_rejections": {
+      "normal": [],
+      "delayed_duplicate": [],
+      "pressure_closed_gate": [
+        "backpressure"
+      ],
+      "pressure_oversize": [
+        "payload_too_large"
+      ],
+      "fault_stale": [
+        "stale_incarnation"
+      ],
+      "update_worker": [
+        "backpressure"
+      ],
+      "cleanup_old_endpoint": [
+        "tenant_missing"
+      ]
+    },
+    "all_other_rejections": "protocol violation"
+  },
+  "rss": {
+    "scope": "sum working_set_bytes for candidate root process and all descendants",
+    "periodic_sample_ms": 10,
+    "stable_sample": {
+      "count": 3,
+      "spacing_ms": 100,
+      "reducer": "median"
+    },
+    "points": [
+      "minimal_host_after_hello_before_engine_module_or_pool_initialization",
+      "after_shared_initialization",
+      "all_32_tenants_ready",
+      "each_phase_peak",
+      "each_post_teardown_cleanup_cycle"
+    ],
+    "preallocation_before_minimal_host": "forbidden",
+    "formulas": {
+      "ready_delta_bytes": "ready_32_stable_median_bytes - minimal_host_stable_median_bytes",
+      "peak_delta_bytes": "max_10ms_process_tree_sample_bytes - minimal_host_stable_median_bytes",
+      "cleanup_delta_i_bytes": "post_cleanup_stable_median_i_bytes - minimal_host_stable_median_bytes",
+      "cleanup_slope_bytes_per_cycle": "sum((i-mean_i)*(y_i-mean_y))/sum((i-mean_i)^2), i=1..30, y_i=median RSS at exactly 1000, 1100, and 1200 ms after teardown minus minimal_host_stable_median_bytes"
+    },
+    "instrumentation_validity": "ready_delta_bytes must be greater than zero and every sample must include descendants",
+    "limits_bytes": {
+      "ready_32_total": 805306368,
+      "peak_delta": 536870912,
+      "post_cleanup_delta": 67108864,
+      "cleanup_slope_per_cycle": 1048576
+    },
+    "statistics": {
+      "nearest_rank_percentile": "sort ascending and select index ceil(p*n)-1 without interpolation",
+      "run_scope": "each retained candidate run independently; never pool across runs",
+      "outliers": "none removed",
+      "pair_ratio": "for each retained block and metric, lunatic positive value divided by alternative positive value",
+      "relative_result": "median of nine per-block ratios separately for lunatic/extism and lunatic/raw_wasmtime",
+      "ratio_limit": 2.0,
+      "sensitivity_thresholds": [
+        1.25,
+        1.5,
+        2.0
+      ]
+    }
+  },
+  "verdict": {
+    "absolute_slos": {
+      "warm_create_p99_ms": 10,
+      "normal_p99_ms": 5,
+      "pressure_admission_p99_ms": 20,
+      "sibling_p99_ms": 20,
+      "trap_replacement_ready_p99_ms": 500,
+      "cpu_replacement_ready_p99_ms": 500,
+      "cpu_failed_terminal_min_ms": 40,
+      "cpu_failed_terminal_max_ms": 100,
+      "failed_update_unavailability_p99_ms": 100,
+      "valid_update_unavailability_p99_ms": 100,
+      "failed_rollout_p99_ms": 2000,
+      "valid_rollout_p99_ms": 2000,
+      "failed_mixed_window_max_ms": 2000,
+      "valid_mixed_window_max_ms": 2000,
+      "update_rpo_completed_commands": 0
+    },
+    "mandatory_gates": [
+      "isolation",
+      "authority",
+      "admission",
+      "recovery",
+      "update_safety",
+      "state_semantics",
+      "cleanup"
+    ],
+    "key_metrics": [
+      "shared_init_ns",
+      "warm_create_p99_ns",
+      "normal_p99_ns",
+      "normal_total_ns",
+      "pressure_admission_p99_ns",
+      "sibling_p99_ns",
+      "trap_recovery_p99_ns",
+      "cpu_recovery_p99_ns",
+      "failed_update_unavailability_p99_ns",
+      "valid_update_unavailability_p99_ns",
+      "failed_rollout_p99_ns",
+      "valid_rollout_p99_ns",
+      "ready_32_total_rss_bytes",
+      "peak_total_rss_bytes"
+    ],
+    "retained_run_rule": "every absolute SLO and mandatory gate passes in every retained run; a timeout, crash, invalid trace, or protocol violation fails that run",
+    "eligibility": "a candidate is eligible only if all nine retained runs pass every mandatory gate and absolute SLO",
+    "alternative_reference": "among eligible extism and raw_wasmtime candidates, S_ref is the minimum production SLOC and delta is S_ref minus S_L",
+    "alternative_dominates": "an eligible alternative C dominates iff S_C <= S_L, every key-metric median9(C/L) <= 1.00, at least one of S_C < S_L or a metric ratio < 1.00, and C requires no extra process or database",
+    "performance_condition": "for every eligible alternative and key metric, median9(L/C) <= 2.00",
+    "strong_packaging": "S_L <= floor(0.70 * S_ref), delta >= 300, performance_condition, and no extra infrastructure",
+    "moderate_packaging": "not strong_packaging, S_L <= floor(0.85 * S_ref), delta >= 150, performance_condition, and no extra infrastructure",
+    "exclusive_precedence": [
+      {
+        "rank": 1,
+        "id": "POSITIONING_REJECTED",
+        "when": "!L"
+      },
+      {
+        "rank": 2,
+        "id": "ALTERNATIVE_DOMINATES",
+        "when": "L && A && alt_dom"
+      },
+      {
+        "rank": 3,
+        "id": "LUNATIC_PACKAGING_VALUE_SUPPORTED",
+        "when": "L && A && !alt_dom && (strong_packaging || moderate_packaging)",
+        "output": "strong or moderate tier"
+      },
+      {
+        "rank": 4,
+        "id": "LUNATIC_PACKAGING_VALUE_UNSUPPORTED",
+        "when": "L && A && !alt_dom && !strong_packaging && !moderate_packaging"
+      },
+      {
+        "rank": 5,
+        "id": "TESTED_SET_PACKAGING_GAP",
+        "when": "L && !A && both_alternatives_complete_and_independently_reviewed && every_failure_is_reproducible_mandatory_contract_or_absolute_slo",
+        "scope": "tested-set packaging gap only; never universal or technical necessity"
+      },
+      {
+        "rank": 6,
+        "id": "INCONCLUSIVE",
+        "when": "L && !A && !tested_set_packaging_gap"
+      }
+    ],
+    "exhaustive": true,
+    "first_matching_rule_wins": true,
+    "forbidden_claims": [
+      "universal necessity",
+      "market uniqueness",
+      "technical necessity from tested-set failure"
+    ],
+    "alternative_labels": {
+      "extism": "packaged alternative",
+      "raw_wasmtime": "construction lower bound"
+    }
+  }
+}

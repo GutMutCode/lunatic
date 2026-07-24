@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "config_count": 30,
+  "canonical_bundle_sha256": "23eac1fd06a241082b136bcc6f36f68e04a0aad4712ca46a12c047e157f8c88f",
+  "entries": [
+    {
+      "file": "b00-p0-lunatic.json",
+      "bytes": 3195,
+      "sha256": "13aa7f6c7e54d9af99bc05fc19411652f6f30039f75170d501f741455aa66cf0"
+    },
+    {
+      "file": "b00-p1-extism.json",
+      "bytes": 3185,
+      "sha256": "19830f93e63619ce3ea745d054dcccc58f9e23b362f28da1e026b41401252992"
+    },
+    {
+      "file": "b00-p2-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "2b11a01eb8811cc429ae7d30feeac3a0ea43d5971dcdb6f9db394d59d848dfc5"
+    },
+    {
+      "file": "b01-p0-extism.json",
+      "bytes": 3185,
+      "sha256": "446aadeea383b2bcaf1991bd547fa5bcf5395c7b83f6c2600d6e65d89e8882db"
+    },
+    {
+      "file": "b01-p1-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "e2ebf5929b148a2d244389ba062e939e38245fcf46517621b77f16bdcd4cdeec"
+    },
+    {
+      "file": "b01-p2-lunatic.json",
+      "bytes": 3195,
+      "sha256": "530413ff564a11cfb319aa500e05e09c0f961ebd3cc5d0067ff1c9b1761f2668"
+    },
+    {
+      "file": "b02-p0-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "b6f41f516541bea261291680c56e777db0a16b8fa1c507e1f00047f033db6e7c"
+    },
+    {
+      "file": "b02-p1-lunatic.json",
+      "bytes": 3195,
+      "sha256": "230e8fe15cc3aaa5d01c8debe9d3502a4b6030ee99376eaa4f8dc72870deb892"
+    },
+    {
+      "file": "b02-p2-extism.json",
+      "bytes": 3185,
+      "sha256": "e188a90c228c638d49c55ae8a04bb6f1008b92d0d38b862a1b9b57ba9f1910e2"
+    },
+    {
+      "file": "b03-p0-lunatic.json",
+      "bytes": 3195,
+      "sha256": "f9e906cb3a8f5868c913b456292d049a3e64da5cd0b3d0470435eb13ab02b4cb"
+    },
+    {
+      "file": "b03-p1-extism.json",
+      "bytes": 3185,
+      "sha256": "c3e02ad85305359bf7250ef921a84fc890f7f0336559e9d73409f8239b494193"
+    },
+    {
+      "file": "b03-p2-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "ac0fd3eda7ab74d9d91cd861252b7374db77f51222945791ad36a2cf20e4cd25"
+    },
+    {
+      "file": "b04-p0-extism.json",
+      "bytes": 3185,
+      "sha256": "0fa5491daf0f8723a74b7634aa30214ee56b78dddcc2aec4632c63c258e5ba62"
+    },
+    {
+      "file": "b04-p1-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "5461c26c8e8caa13966df300f6731267a819a0fc4ce87e3c5d0a5cb0fff9e693"
+    },
+    {
+      "file": "b04-p2-lunatic.json",
+      "bytes": 3195,
+      "sha256": "b1741696724ccb491fd98e43de140040d284c350acddbe25879cff2ca5d3e6d6"
+    },
+    {
+      "file": "b05-p0-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "fec1761cbe116e26da308f4e4baab088cbeee14b072295805f637d30d3e5ef46"
+    },
+    {
+      "file": "b05-p1-lunatic.json",
+      "bytes": 3195,
+      "sha256": "6cb89b365837a4f565634f31c3a1b209dfea9ba8e6153be0520ce5c6e41b2bc8"
+    },
+    {
+      "file": "b05-p2-extism.json",
+      "bytes": 3185,
+      "sha256": "23cd2747004a1c1391b34b61ea464d741aed99df5c4a576d0a14caa3c2f4866f"
+    },
+    {
+      "file": "b06-p0-lunatic.json",
+      "bytes": 3195,
+      "sha256": "82a2d2d507bb3bb81bac9719e93b75451d2e00a9cdab585c4b8e63eb3a74cf04"
+    },
+    {
+      "file": "b06-p1-extism.json",
+      "bytes": 3185,
+      "sha256": "73e29d55d7c8c273b089bae434518f250d0102f71819171eb70c664f401645d7"
+    },
+    {
+      "file": "b06-p2-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "d67184fc250247ec58a8d036c4efe89ae59b10f5ade7afad2505c136fb4e1bac"
+    },
+    {
+      "file": "b07-p0-extism.json",
+      "bytes": 3185,
+      "sha256": "104c745893401d28b161bcfb5e1de300daeb5a6f19b157e84147772457db3d76"
+    },
+    {
+      "file": "b07-p1-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "13088c1e30ab1dd6ea057b9131efba422818a493b900bfa5e18ce4655b20be2a"
+    },
+    {
+      "file": "b07-p2-lunatic.json",
+      "bytes": 3195,
+      "sha256": "acb72ef1f427d144984af7feb76a2a709c5b307c0e2cea3223006fa552d93bdd"
+    },
+    {
+      "file": "b08-p0-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "30d16ffd16d770bd6c67c6da75e7b5a243dae0d2b51d3f0bc0c54e1fec1d5361"
+    },
+    {
+      "file": "b08-p1-lunatic.json",
+      "bytes": 3195,
+      "sha256": "813c322fb81a0f719166557960b9499db5f09c2c830fb6781debf4282c68949a"
+    },
+    {
+      "file": "b08-p2-extism.json",
+      "bytes": 3185,
+      "sha256": "08f518b444c657c14b7c59e06341e6bec573fbdf3940341706c8a1c7775b7e6c"
+    },
+    {
+      "file": "b09-p0-lunatic.json",
+      "bytes": 3195,
+      "sha256": "a172682d5f830f397adf7bd80892f9a93f48de237b657886af196cf99a70d7c7"
+    },
+    {
+      "file": "b09-p1-extism.json",
+      "bytes": 3185,
+      "sha256": "b78a53b652f81b67cee38e997be37db26901a7b461e8068c7e25ba1674ce7035"
+    },
+    {
+      "file": "b09-p2-raw-wasmtime.json",
+      "bytes": 3263,
+      "sha256": "fb66bdc3030f3d190e3be5711b844e61bf45e28a5e4f07b0397b6f023b4f920b"
+    },
+    {
+      "file": "freeze-manifest.json",
+      "bytes": 4356,
+      "sha256": "6eb500e01eee1cb49152c6a2d59179a499e180746aa47639cbbcd59c682bc986"
+    }
+  ]
+}

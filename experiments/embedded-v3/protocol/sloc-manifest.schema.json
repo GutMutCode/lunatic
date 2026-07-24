@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://lunatic.solutions/experiments/embedded-v3/sloc-manifest.schema.json",
+  "title": "Embedded v3 candidate SLOC attribution",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "candidate", "entries"],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "candidate": {
+      "enum": ["lunatic", "direct-wasmtime", "extism"]
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "role", "category"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?($|/)).*[^/]$"
+          },
+          "role": {
+            "enum": ["production", "test", "generated", "lockfile"]
+          },
+          "category": { "type": "string", "minLength": 1 },
+          "reason": { "type": "string", "minLength": 1 },
+          "generator": { "type": "string", "minLength": 1 },
+          "source": { "type": "string", "minLength": 1 }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "role": { "enum": ["generated", "lockfile"] }
+              },
+              "required": ["role"]
+            },
+            "then": {
+              "required": ["reason", "generator", "source"]
+            }
+          }
+        ]
+      }
+    }
+  }
+}
